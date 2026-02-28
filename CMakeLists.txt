@@ -28,6 +28,10 @@ find_package(OpenCV REQUIRED QUIET)
 find_package(GTSAM REQUIRED QUIET)
 find_package(Boost REQUIRED COMPONENTS timer)
 
+# --- Make catkin_package(DEPENDS GTSAM) happy ---
+set(GTSAM_INCLUDE_DIRS ${GTSAM_INCLUDE_DIR})
+set(GTSAM_LIBRARIES gtsam)
+
 set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "/usr/share/cmake/geographiclib/")
 find_package(GeographicLib REQUIRED)
 
@@ -72,7 +76,7 @@ include_directories(
 	${catkin_INCLUDE_DIRS}
 	${PCL_INCLUDE_DIRS}
   ${OpenCV_INCLUDE_DIRS}
-	${GTSAM_INCLUDE_DIR}
+	${GTSAM_INCLUDE_DIRS}
 )
 
 # link directories
