@@ -2,8 +2,10 @@ cmake_minimum_required(VERSION 2.8.3)
 project(liorf)
 
 set(CMAKE_BUILD_TYPE "Release")
-# set(CMAKE_CXX_FLAGS "-std=c++11")
-set(CMAKE_CXX_STANDARD 14)
+# zy Step 2_fix_a
+# CBS and aria_common use C++17 APIs, so LIORF must compile in C++17 mode.
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -Wall -g -pthread")
 
 find_package(catkin REQUIRED COMPONENTS
@@ -26,6 +28,17 @@ find_package(OpenMP REQUIRED)
 find_package(PCL REQUIRED QUIET)
 find_package(OpenCV REQUIRED QUIET)
 find_package(GTSAM REQUIRED QUIET)
+# zy Step 1_a
+# Intuition: add an optional CBS build switch so LIORF can keep legacy behavior while we integrate incrementally.
+option(LIORF_USE_CBS "Build LIORF with CBS/BPSAM integration hooks" OFF)
+if(LIORF_USE_CBS)
+  set(_CBS_SRC_HINT "${CMAKE_CURRENT_SOURCE_DIR}/../cbs")
+  if(NOT cbs_DIR AND EXISTS "${_CBS_SRC_HINT}/build/cbsConfig.cmake")
+    set(cbs_DIR "${_CBS_SRC_HINT}/build" CACHE PATH
+        "Directory containing cbsConfig.cmake")
+  endif()
+  find_package(cbs REQUIRED CONFIG)
+endif()
 find_package(Boost REQUIRED COMPONENTS timer)
 
 # --- Make catkin_package(DEPENDS GTSAM) happy ---
@@ -104,6 +117,14 @@ add_executable(${PROJECT_NAME}_mapOptmization src/mapOptmization.cpp ${common_li
 add_dependencies(${PROJECT_NAME}_mapOptmization ${catkin_EXPORTED_TARGETS} ${PROJECT_NAME}_generate_messages_cpp)
 target_compile_options(${PROJECT_NAME}_mapOptmization PRIVATE ${OpenMP_CXX_FLAGS})
 target_link_libraries(${PROJECT_NAME}_mapOptmization Boost::timer ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${OpenCV_LIBRARIES} ${OpenMP_CXX_FLAGS} ${GeographicLib_LIBRARIES} gtsam)
+# zy Step 1_b
+# Intuition: only mapOptimization needs CBS first, because it is LIORF's global optimization heart.
+if(LIORF_USE_CBS)
+  target_link_libraries(${PROJECT_NAME}_mapOptmization cbs)
+  target_compile_definitions(${PROJECT_NAME}_mapOptmization PRIVATE LIORF_USE_CBS=1)
+endif()
+
+
 
 # IMU Preintegration
 add_executable(${PROJECT_NAME}_imuPreintegration src/imuPreintegration.cpp ${common_lib})

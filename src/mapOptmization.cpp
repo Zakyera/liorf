@@ -17,6 +17,31 @@
 #include <gtsam/inference/Symbol.h>
 
 #include <gtsam/nonlinear/ISAM2.h>
+// zy Step 1_c
+// Intuition: keep CBS dependency optional at compile time.
+#ifdef LIORF_USE_CBS
+#include <cbs/bpsam/bpsam.h>
+#endif
+// zy Step 5_a
+// Adds fixed-width timestamp/source types for external belief bookkeeping.
+#include <cstdint>
+#include <string>
+// zy Step 6_a
+// Adds numeric helpers for nearest-timestamp matching and bounded comparisons.
+#include <cstdlib>
+#include <limits>
+// zy Step 12_a
+// Adds source-tag normalization helpers for robust external-prior routing.
+#include <algorithm>
+#include <cctype>
+// zy Step 13_a
+// Enables eigenvalue-based covariance conditioning for robust external prior ingestion.
+#include <Eigen/Eigenvalues>
+// zy Step 16_a
+// Enables SVD-based projection of calibration rotation to a valid SO(3) matrix.
+#include <Eigen/SVD>
+
+
 
 #include <GeographicLib/Geocentric.hpp>
 #include <GeographicLib/LocalCartesian.hpp>
@@ -29,6 +54,20 @@ using symbol_shorthand::X; // Pose3 (x,y,z,r,p,y)
 using symbol_shorthand::V; // Vel   (xdot,ydot,zdot)
 using symbol_shorthand::B; // Bias  (ax,ay,az,gx,gy,gz)
 using symbol_shorthand::G; // GPS pose
+// zy Step 2_a
+// Runtime optimizer selector used by the mapping backend.
+inline bool UseCbsOptimizer(const bool use_cbs_optimizer_flag
+#ifdef LIORF_USE_CBS
+                            , const std::shared_ptr<cbs::BPSAM>& cbs_optimizer
+#endif
+                            ) {
+#ifdef LIORF_USE_CBS
+    return use_cbs_optimizer_flag && static_cast<bool>(cbs_optimizer);
+#else
+    (void)use_cbs_optimizer_flag;
+    return false;
+#endif
+}
 
 /*
     * A point cloud type that has 6D pose info ([x,y,z,roll,pitch,yaw] intensity is time stamp)
@@ -71,6 +110,74 @@ public:
     ISAM2 *isam;
     Values isamCurrentEstimate;
     Eigen::MatrixXd poseCovariance;
+    // zy Step 2_b
+    // Store the active estimate independently from legacy isamCurrentEstimate for unified access.
+    Values optimizerCurrentEstimate;
+
+    // zy Step 1_d
+    // runtime switch lets us compare legacy ISAM2 and CBS on the same node.
+    bool use_cbs_optimizer_ = false;
+
+#ifdef LIORF_USE_CBS
+    // zy Step 1_e
+    // initialize CBS object now; full update-path substitution comes in next steps.
+    std::shared_ptr<cbs::BPSAM> cbs_optimizer_;
+#endif
+
+    // zy Step 5_b
+    // Holds the latest LIORF pose belief that can be shared with an external fusion bridge.
+    struct ExternalPoseBelief
+    {
+        int64_t timestamp_kf_nsec_ = -1;
+        size_t pose_index_ = 0;
+        gtsam::Pose3 W_Pose_L_ = gtsam::Pose3();
+        Eigen::Matrix<double, 6, 6> covariance_ =
+            Eigen::Matrix<double, 6, 6>::Identity();
+        std::string source_ = "liorf";
+    };
+
+    // zy Step 5_c
+    // Buffers incoming external pose priors until they are matched/injected in optimize flow.
+    struct ExternalPosePrior
+    {
+        int64_t timestamp_kf_nsec_ = -1;
+        gtsam::Pose3 W_Pose_L_ = gtsam::Pose3();
+        Eigen::Matrix<double, 6, 6> covariance_ =
+            Eigen::Matrix<double, 6, 6>::Identity();
+        std::string source_ = "unknown";
+        uint64_t source_seq_ = 0;
+    };
+
+    // zy Step 5_d
+    // Keeps exchange-related state bounded and thread-safe for async bridge I/O.
+    mutable std::mutex external_pose_priors_queue_mutex_;
+    std::deque<ExternalPosePrior> external_pose_priors_queue_;
+    size_t max_external_pose_priors_queue_size_ = 5000;
+
+    mutable std::mutex timestamp_to_pose_idx_map_mutex_;
+    std::map<int64_t, size_t> timestamp_to_pose_idx_map_;
+    size_t max_timestamp_to_pose_idx_map_size_ = 20000;
+    int64_t external_prior_timestamp_tolerance_ns_ = 2000000;  // 2 ms
+    // zy Step 21_a
+    // Mirrors timestamp tolerance in seconds so launch/yaml tuning is easier than nanosecond literals.
+    double external_prior_timestamp_tolerance_sec_ = 0.002;
+    // zy Step 10_a
+    // Bounds external-prior freshness and per-cycle ingestion to keep optimization stable under bursty inputs.
+    double max_external_prior_age_sec_ = 2.0;
+    double max_external_prior_future_lead_sec_ = 0.05;
+    size_t max_external_priors_per_optimize_ = 200;
+    // zy Step 20_a
+    // Prevents unintended external-prior fusion when running legacy optimizer unless explicitly enabled.
+    bool allow_external_priors_in_legacy_mode_ = false;
+    // zy Step 13_b
+    // Sets minimum and maximum confidence bounds for external pose-prior covariance.
+    double external_prior_min_variance_ = 1e-6;
+    double external_prior_max_variance_ = 1e2;
+
+    mutable std::mutex latest_external_pose_belief_mutex_;
+    ExternalPoseBelief latest_external_pose_belief_;
+    bool has_latest_external_pose_belief_ = false;
+
 
     ros::Publisher pubLaserCloudSurround;
     ros::Publisher pubLaserOdometryGlobal;
@@ -91,6 +198,39 @@ public:
     ros::Subscriber subCloud;
     ros::Subscriber subGPS;
     ros::Subscriber subLoop;
+
+    // zy Step 7_a
+    // ROS bridge endpoints for exchanging external pose beliefs and priors.
+    ros::Publisher pubExternalPoseBelief_;
+    ros::Subscriber subExternalPosePrior_;
+
+    // zy Step 7_b
+    // Topic and source settings are configurable so bridge wiring does not require recompiling LIORF.
+    std::string external_pose_belief_topic_ = "liorf/cbs/external_pose_belief";
+    std::string external_pose_prior_topic_ = "liorf/cbs/external_pose_prior";
+    std::string external_prior_default_source_ = "kimera";
+    // zy Step 17_a
+    // Publishes explicit source identity and monotonic sequence for downstream dedup/reordering.
+    std::string external_pose_belief_source_ = "liorf";
+    uint32_t external_pose_belief_seq_counter_ = 0;
+    // zy Step 18_a
+    // Defines the global frame contract for all incoming/outgoing external pose exchange messages.
+    std::string external_exchange_frame_id_ = "";
+    // zy Step 9_a
+    // Controls whether external exchange uses IMU/body frame (true) or lidar frame (false).
+    bool external_exchange_in_body_frame_ = false;
+    // zy Step 15_a
+    // Keeps legacy behavior by default while allowing full lidar->body rotation+translation conversion.
+    bool external_exchange_use_full_lidar_body_extrinsic_ = false;
+    // zy Step 16_b
+    // Selects which LIORF calibration rotation source is used for exchange-frame conversion.
+    std::string external_exchange_extrinsic_rotation_source_ = "extRPY";
+    // zy Step 12_b
+    // Tracks last seen sequence per source to drop replayed/out-of-order external priors.
+    mutable std::mutex external_source_seq_mutex_;
+    std::map<std::string, uint64_t> last_external_source_seq_by_source_;
+
+
 
     ros::ServiceServer srvSaveMap;
 
@@ -167,6 +307,153 @@ public:
         parameters.relinearizeThreshold = 0.1;
         parameters.relinearizeSkip = 1;
         isam = new ISAM2(parameters);
+        // zy Step 1_f
+        // runtime ROS param controls whether this node should attempt CBS mode.
+        nh.param<bool>("liorf/use_cbs_optimizer", use_cbs_optimizer_, false);
+
+        // zy Step 7_c
+        // Loads bridge-facing topics and default source tag for incoming external priors.
+        nh.param<std::string>("liorf/external_pose_belief_topic",
+                              external_pose_belief_topic_,
+                              "liorf/cbs/external_pose_belief");
+        nh.param<std::string>("liorf/external_pose_prior_topic",
+                              external_pose_prior_topic_,
+                              "liorf/cbs/external_pose_prior");
+        nh.param<std::string>("liorf/external_prior_default_source",
+                              external_prior_default_source_,
+                              "kimera");
+        // zy Step 17_b
+        // Makes outgoing belief source tag configurable so integration wiring does not depend on hardcoded strings.
+        nh.param<std::string>("liorf/external_pose_belief_source",
+                              external_pose_belief_source_,
+                              "liorf");
+        std::transform(external_pose_belief_source_.begin(),
+                       external_pose_belief_source_.end(),
+                       external_pose_belief_source_.begin(),
+                       [](unsigned char c) {
+                           return static_cast<char>(std::tolower(c));
+                       });
+        // zy Step 18_b
+        // Makes exchange frame explicit so LIORF never fuses priors from a different world frame.
+        nh.param<std::string>("liorf/external_exchange_frame_id",
+                              external_exchange_frame_id_,
+                              odometryFrame);
+        if (external_exchange_frame_id_.empty()) {
+            external_exchange_frame_id_ = odometryFrame;
+        }
+        while (!external_exchange_frame_id_.empty() &&
+               external_exchange_frame_id_.front() == '/') {
+            external_exchange_frame_id_.erase(external_exchange_frame_id_.begin());
+        }
+        // zy Step 10_b
+        // Makes prior-aging/budget limits configurable from launch without code edits.
+        nh.param<double>("liorf/max_external_prior_age_sec",
+                         max_external_prior_age_sec_,
+                         2.0);
+        nh.param<double>("liorf/max_external_prior_future_lead_sec",
+                         max_external_prior_future_lead_sec_,
+                         0.05);
+
+        int max_external_priors_per_optimize_tmp =
+            static_cast<int>(max_external_priors_per_optimize_);
+        nh.param<int>("liorf/max_external_priors_per_optimize",
+                      max_external_priors_per_optimize_tmp,
+                      200);
+        max_external_priors_per_optimize_ =
+            static_cast<size_t>(std::max(1, max_external_priors_per_optimize_tmp));
+        // zy Step 21_b
+        // Exposes queue/map/timestamp matching limits to runtime config for dataset-dependent tuning.
+        int max_external_pose_priors_queue_size_tmp =
+            static_cast<int>(max_external_pose_priors_queue_size_);
+        nh.param<int>("liorf/max_external_pose_priors_queue_size",
+                      max_external_pose_priors_queue_size_tmp,
+                      5000);
+        max_external_pose_priors_queue_size_ =
+            static_cast<size_t>(std::max(1, max_external_pose_priors_queue_size_tmp));
+
+        int max_timestamp_to_pose_idx_map_size_tmp =
+            static_cast<int>(max_timestamp_to_pose_idx_map_size_);
+        nh.param<int>("liorf/max_timestamp_to_pose_idx_map_size",
+                      max_timestamp_to_pose_idx_map_size_tmp,
+                      20000);
+        max_timestamp_to_pose_idx_map_size_ =
+            static_cast<size_t>(std::max(1, max_timestamp_to_pose_idx_map_size_tmp));
+
+        nh.param<double>("liorf/external_prior_timestamp_tolerance_sec",
+                         external_prior_timestamp_tolerance_sec_,
+                         0.002);
+        external_prior_timestamp_tolerance_ns_ = static_cast<int64_t>(
+            std::max(0.0, external_prior_timestamp_tolerance_sec_) * 1e9);
+        // zy Step 21_c
+        // Prints active matching/queue limits so runtime behavior is easy to audit from logs.
+        ROS_INFO_STREAM("External prior tuning: tolerance_ns="
+                        << external_prior_timestamp_tolerance_ns_
+                        << ", queue_cap=" << max_external_pose_priors_queue_size_
+                        << ", ts_map_cap=" << max_timestamp_to_pose_idx_map_size_);
+        // zy Step 20_b
+        // Makes legacy-mode external-prior fusion an explicit runtime choice.
+        nh.param<bool>("liorf/allow_external_priors_in_legacy_mode",
+                       allow_external_priors_in_legacy_mode_,
+                       false);
+        // zy Step 13_c
+        // Makes covariance confidence bounds configurable without recompiling.
+        nh.param<double>("liorf/external_prior_min_variance",
+                         external_prior_min_variance_,
+                         1e-6);
+        nh.param<double>("liorf/external_prior_max_variance",
+                         external_prior_max_variance_,
+                         1e2);
+        if (external_prior_max_variance_ < external_prior_min_variance_) {
+            std::swap(external_prior_max_variance_, external_prior_min_variance_);
+        }
+        
+        // zy Step 9_b
+        // Keeps old behavior by default, while allowing body-frame exchange when wiring with Kimera.
+        nh.param<bool>("liorf/external_exchange_in_body_frame",
+                       external_exchange_in_body_frame_,
+                       false);
+        // zy Step 15_b
+        // Lets launch files enable full extrinsic conversion when camera/lidar/body are not axis-aligned.
+        nh.param<bool>("liorf/external_exchange_use_full_lidar_body_extrinsic",
+                       external_exchange_use_full_lidar_body_extrinsic_,
+                       false);
+        // zy Step 16_c
+        // Normalizes rotation-source selection so exchange conversion behavior is explicit and stable.
+        nh.param<std::string>("liorf/external_exchange_extrinsic_rotation_source",
+                              external_exchange_extrinsic_rotation_source_,
+                              "extRPY");
+        std::transform(external_exchange_extrinsic_rotation_source_.begin(),
+                       external_exchange_extrinsic_rotation_source_.end(),
+                       external_exchange_extrinsic_rotation_source_.begin(),
+                       [](unsigned char c) {
+                           return static_cast<char>(std::tolower(c));
+                       });
+        if (external_exchange_extrinsic_rotation_source_ != "extrpy" &&
+            external_exchange_extrinsic_rotation_source_ != "extrot") {
+            ROS_WARN_STREAM("Invalid liorf/external_exchange_extrinsic_rotation_source="
+                            << external_exchange_extrinsic_rotation_source_
+                            << ", falling back to extRPY.");
+            external_exchange_extrinsic_rotation_source_ = "extrpy";
+        }
+
+
+
+#ifdef LIORF_USE_CBS
+        if (use_cbs_optimizer_) {
+            cbs::BPSAM::Params cbs_params;
+            cbs_params.sam_params_ = parameters;
+            cbs_params.enable_gkcm = false;
+            cbs_params.robot_id = static_cast<cbs::AgentId>('b');  // LIORF agent id.
+            cbs_optimizer_ = std::make_shared<cbs::BPSAM>(cbs_params);
+            ROS_INFO_STREAM("LIORF CBS BPSAM initialized. use_cbs_optimizer=true");
+        }
+#else
+        if (use_cbs_optimizer_) {
+            ROS_WARN_STREAM("liorf/use_cbs_optimizer=true but LIORF was built without LIORF_USE_CBS. Falling back to legacy ISAM2.");
+            use_cbs_optimizer_ = false;
+        }
+#endif
+
 
         pubKeyPoses                 = nh.advertise<sensor_msgs::PointCloud2>("liorf/mapping/trajectory", 1);
         pubLaserCloudSurround       = nh.advertise<sensor_msgs::PointCloud2>("liorf/mapping/map_global", 1);
@@ -191,12 +478,872 @@ public:
         pubSLAMInfo           = nh.advertise<liorf::cloud_info>("liorf/mapping/slam_info", 1);
         pubGpsOdom            = nh.advertise<nav_msgs::Odometry> ("liorf/mapping/gps_odom", 1);
 
+        // zy Step 7_d
+        // Publishes LIORF beliefs and receives external priors over ROS for cross-estimator fusion.
+        pubExternalPoseBelief_ =
+            nh.advertise<nav_msgs::Odometry>(external_pose_belief_topic_, 10);
+        subExternalPosePrior_ = nh.subscribe<nav_msgs::Odometry>(
+            external_pose_prior_topic_,
+            200,
+            &mapOptimization::externalPosePriorHandler,
+            this,
+            ros::TransportHints().tcpNoDelay());
+
+
         downSizeFilterSurf.setLeafSize(mappingSurfLeafSize, mappingSurfLeafSize, mappingSurfLeafSize);
         downSizeFilterLocalMapSurf.setLeafSize(surroundingKeyframeMapLeafSize, surroundingKeyframeMapLeafSize, surroundingKeyframeMapLeafSize);
         downSizeFilterICP.setLeafSize(loopClosureICPSurfLeafSize, loopClosureICPSurfLeafSize, loopClosureICPSurfLeafSize);
         downSizeFilterSurroundingKeyPoses.setLeafSize(surroundingKeyframeDensity, surroundingKeyframeDensity, surroundingKeyframeDensity); // for surrounding key poses of scan-to-map optimization
 
         allocateMemory();
+    }
+    // zy Step 2_c
+    // Returns whether CBS is currently the active optimization heart.
+    bool usingCbs() const
+    {
+#ifdef LIORF_USE_CBS
+        return UseCbsOptimizer(use_cbs_optimizer_, cbs_optimizer_);
+#else
+        return false;
+#endif
+    }
+
+    // zy Step 2_d
+    // Returns the latest estimate from whichever optimizer is active.
+    Values computeActiveEstimate() const
+    {
+        if (usingCbs()) {
+#ifdef LIORF_USE_CBS
+            return cbs_optimizer_->calculateEstimate();
+#endif
+        }
+        return isam->calculateEstimate();
+    }
+
+    // zy Step 2_e
+    // Unified marginal covariance query for the last pose key.
+    gtsam::Matrix activePoseMarginalCovariance(const gtsam::Key& key) const
+    {
+        if (usingCbs()) {
+#ifdef LIORF_USE_CBS
+            return cbs_optimizer_->marginalCovariance(key);
+#endif
+        }
+        return isam->marginalCovariance(key);
+    }
+
+    // zy Step 2_f
+    // Unified value-existence check used before querying estimate/covariance.
+    bool activeValueExists(const gtsam::Key& key) const
+    {
+        if (usingCbs()) {
+#ifdef LIORF_USE_CBS
+            return cbs_optimizer_->valueExists(key);
+#endif
+        }
+        return isamCurrentEstimate.exists(key);
+    }
+    
+    // zy Step 4_a
+    // Aligns LIORF pose keys with Kimera/CBS (`x(index)`) so exchanged beliefs hit the same variable IDs.
+    gtsam::Key poseKeyFromIndex(const size_t idx) const
+    {
+        return X(static_cast<uint64_t>(idx));
+    }
+
+    // zy Step 5_e
+    // Converts ROS timestamp to integer nanoseconds so cross-system matching uses one time domain.
+    int64_t toTimestampNsec(const ros::Time& stamp) const
+    {
+        return static_cast<int64_t>(stamp.sec) * 1000000000LL +
+               static_cast<int64_t>(stamp.nsec);
+    }
+
+    // zy Step 12_c
+    // Normalizes incoming source tags so routing logic is case-insensitive and consistent.
+    std::string normalizeExternalSourceTag(const std::string& raw_source) const
+    {
+        std::string source =
+            raw_source.empty() ? external_prior_default_source_ : raw_source;
+        std::transform(source.begin(), source.end(), source.begin(),
+                    [](unsigned char c) {
+                        return static_cast<char>(std::tolower(c));
+                    });
+        return source;
+    }
+
+    // zy Step 12_d
+    // Identifies tags that refer to LIORF itself to prevent local self-feedback loops.
+    bool isSelfExternalSourceTag(const std::string& source) const
+    {
+        return source == "liorf" || source == "liosam" || source == "self";
+    }
+
+    // zy Step 12_e
+    // Accepts only strictly newer sequence numbers per source to suppress replay duplicates.
+    bool shouldAcceptExternalSourceSeq(const std::string& source,
+                                    const uint64_t source_seq)
+    {
+        if (source_seq == 0) {
+            return true;
+        }
+
+        std::lock_guard<std::mutex> lock(external_source_seq_mutex_);
+        auto it = last_external_source_seq_by_source_.find(source);
+        if (it != last_external_source_seq_by_source_.end() &&
+            source_seq <= it->second) {
+            return false;
+        }
+
+        last_external_source_seq_by_source_[source] = source_seq;
+        return true;
+    }
+
+    // zy Step 18_c
+    // Canonicalizes ROS frame ids by removing optional leading '/' for stable comparisons.
+    std::string canonicalizeFrameId(const std::string& frame_id) const
+    {
+        std::string out = frame_id;
+        while (!out.empty() && out.front() == '/') {
+            out.erase(out.begin());
+        }
+        return out;
+    }
+
+    // zy Step 18_d
+    // Enforces that incoming exchange messages use the configured global frame id.
+    bool matchesExternalExchangeFrame(const std::string& frame_id) const
+    {
+        const std::string expected = canonicalizeFrameId(external_exchange_frame_id_);
+        if (expected.empty()) {
+            return true;
+        }
+        const std::string incoming = canonicalizeFrameId(frame_id);
+        return !incoming.empty() && incoming == expected;
+    }
+
+    // zy Step 19_a
+    // Centralizes exchange-frame prior validation and conversion so all ingress paths behave consistently.
+    bool enqueueExternalPosePriorFromExchangeCovariance(
+        const int64_t timestamp_kf_nsec,
+        const gtsam::Pose3& W_Pose_exchange,
+        const Eigen::Matrix<double, 6, 6>& covariance_exchange,
+        const std::string& source_raw = "unknown",
+        const uint64_t source_seq = 0,
+        const std::string& frame_id = "")
+    {
+        const std::string effective_frame =
+            frame_id.empty() ? external_exchange_frame_id_ : frame_id;
+        if (!matchesExternalExchangeFrame(effective_frame)) {
+            ROS_WARN_STREAM_THROTTLE(
+                2.0,
+                "Dropped external prior with mismatched frame_id='"
+                << frame_id << "', expected='"
+                << external_exchange_frame_id_ << "'.");
+            return false;
+        }
+
+        const std::string source = normalizeExternalSourceTag(source_raw);
+
+        if (isSelfExternalSourceTag(source)) {
+            ROS_WARN_STREAM_THROTTLE(
+                2.0,
+                "Dropped external prior from self source tag: " << source);
+            return false;
+        }
+
+        if (!shouldAcceptExternalSourceSeq(source, source_seq)) {
+            ROS_WARN_STREAM_THROTTLE(
+                2.0,
+                "Dropped replay/out-of-order external prior. source=" << source
+                << ", seq=" << source_seq);
+            return false;
+        }
+
+        // zy Step 22_a
+        // In CBS mode, rejects unmapped source tags at ingress so invalid priors never enter the queue.
+#ifdef LIORF_USE_CBS
+        if (usingCbs()) {
+            cbs::AgentId sender_id = static_cast<cbs::AgentId>('a');
+            if (!mapSourceToCbsAgent(source, &sender_id)) {
+                ROS_WARN_STREAM_THROTTLE(
+                    2.0,
+                    "Dropped external prior with unmapped CBS source='" << source << "'.");
+                return false;
+            }
+        }
+#endif
+
+        const gtsam::Pose3 W_Pose_L = exchangePoseToLidarPose(W_Pose_exchange);
+        const Eigen::Matrix<double, 6, 6> covariance_lidar =
+            exchangeCovarianceToLidarCovariance(covariance_exchange);
+
+        return enqueueExternalPosePriorFromCovariance(
+            timestamp_kf_nsec, W_Pose_L, covariance_lidar, source, source_seq);
+    }
+
+
+    // zy Step 5_f
+    // Tracks local keyframe timestamp -> pose index for future external prior matching.
+    void rememberPoseIndexForTimestamp(const ros::Time& stamp, const size_t pose_idx)
+    {
+        const int64_t ts_nsec = toTimestampNsec(stamp);
+        std::lock_guard<std::mutex> lock(timestamp_to_pose_idx_map_mutex_);
+        timestamp_to_pose_idx_map_[ts_nsec] = pose_idx;
+
+        while (timestamp_to_pose_idx_map_.size() > max_timestamp_to_pose_idx_map_size_) {
+            timestamp_to_pose_idx_map_.erase(timestamp_to_pose_idx_map_.begin());
+        }
+    }
+
+    // zy Step 5_g
+    // Caches the latest LIORF belief snapshot for external bridge publication.
+    void updateLatestExternalPoseBelief(
+        const ros::Time& stamp,
+        const size_t pose_idx,
+        const gtsam::Pose3& W_Pose_L,
+        const Eigen::Matrix<double, 6, 6>& covariance)
+    {
+        ExternalPoseBelief belief;
+        belief.timestamp_kf_nsec_ = toTimestampNsec(stamp);
+        belief.pose_index_ = pose_idx;
+        belief.W_Pose_L_ = W_Pose_L;
+        belief.covariance_ = covariance;
+        // zy Step 17_c
+        // Keeps cached outgoing belief source aligned with configured publisher identity.
+        belief.source_ = external_pose_belief_source_;
+
+        std::lock_guard<std::mutex> lock(latest_external_pose_belief_mutex_);
+        latest_external_pose_belief_ = belief;
+        has_latest_external_pose_belief_ = true;
+    }
+
+    // zy Step 5_h
+    // Exposes the latest LIORF belief to bridge code without touching optimizer internals.
+    bool getLatestExternalPoseBelief(ExternalPoseBelief* belief) const
+    {
+        if (!belief) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(latest_external_pose_belief_mutex_);
+        if (!has_latest_external_pose_belief_) {
+            return false;
+        }
+        *belief = latest_external_pose_belief_;
+        return true;
+    }
+
+    // zy Step 16_d
+    // Picks configured calibration rotation and projects it to nearest valid SO(3) matrix.
+    Eigen::Matrix3d exchangeLidarToBodyRotation() const
+    {
+        Eigen::Matrix3d R =
+            (external_exchange_extrinsic_rotation_source_ == "extrot") ? extRot : extRPY;
+
+        if (!R.allFinite()) {
+            ROS_WARN_STREAM_THROTTLE(
+                2.0,
+                "Non-finite exchange rotation matrix, falling back to identity.");
+            return Eigen::Matrix3d::Identity();
+        }
+
+        Eigen::JacobiSVD<Eigen::Matrix3d> svd(
+            R, Eigen::ComputeFullU | Eigen::ComputeFullV);
+        Eigen::Matrix3d U = svd.matrixU();
+        Eigen::Matrix3d V = svd.matrixV();
+        Eigen::Matrix3d R_ortho = U * V.transpose();
+
+        if (R_ortho.determinant() < 0.0) {
+            U.col(2) *= -1.0;
+            R_ortho = U * V.transpose();
+        }
+
+        return R_ortho;
+    }
+
+    // zy Step 15_c
+    // Builds lidar->body extrinsic in legacy translation-only mode or full rotation+translation mode.
+    gtsam::Pose3 lidarToBodyExtrinsic() const
+    {
+        const gtsam::Point3 t_lb(extTrans.x(), extTrans.y(), extTrans.z());
+        if (!external_exchange_use_full_lidar_body_extrinsic_) {
+            return gtsam::Pose3(gtsam::Rot3(1, 0, 0, 0), t_lb);
+        }
+
+        // zy Step 16_e
+        // Uses configured and orthonormalized calibration rotation for full exchange transform.
+        const Eigen::Matrix3d R_lb_mat = exchangeLidarToBodyRotation();
+        return gtsam::Pose3(gtsam::Rot3(R_lb_mat), t_lb);
+    }
+
+    // zy Step 9_d
+    // Converts incoming exchange-frame pose into LIORF internal lidar frame.
+    gtsam::Pose3 exchangePoseToLidarPose(const gtsam::Pose3& W_Pose_exchange) const
+    {
+        if (!external_exchange_in_body_frame_) {
+            return W_Pose_exchange;
+        }
+        const gtsam::Pose3 B_Pose_L = lidarToBodyExtrinsic().inverse();
+        return W_Pose_exchange.compose(B_Pose_L);
+    }
+
+    // zy Step 9_e
+    // Converts internal lidar-frame pose into configured exchange frame before publication.
+    gtsam::Pose3 lidarPoseToExchangePose(const gtsam::Pose3& W_Pose_L) const
+    {
+        if (!external_exchange_in_body_frame_) {
+            return W_Pose_L;
+        }
+        const gtsam::Pose3 L_Pose_B = lidarToBodyExtrinsic();
+        return W_Pose_L.compose(L_Pose_B);
+    }
+
+    // zy Step 11_a
+    // Converts exchange-frame pose covariance into LIORF lidar-frame covariance using adjoint mapping.
+    Eigen::Matrix<double, 6, 6> exchangeCovarianceToLidarCovariance(
+        const Eigen::Matrix<double, 6, 6>& covariance_exchange) const
+    {
+        if (!external_exchange_in_body_frame_) {
+            return covariance_exchange;
+        }
+        const gtsam::Pose3 B_Pose_L = lidarToBodyExtrinsic().inverse();
+        const gtsam::Matrix66 adj = B_Pose_L.AdjointMap();
+        return adj * covariance_exchange * adj.transpose();
+    }
+
+    // zy Step 11_b
+    // Converts LIORF lidar-frame pose covariance into configured exchange-frame covariance.
+    Eigen::Matrix<double, 6, 6> lidarCovarianceToExchangeCovariance(
+        const Eigen::Matrix<double, 6, 6>& covariance_lidar) const
+    {
+        if (!external_exchange_in_body_frame_) {
+            return covariance_lidar;
+        }
+        const gtsam::Pose3 L_Pose_B = lidarToBodyExtrinsic();
+        const gtsam::Matrix66 adj = L_Pose_B.AdjointMap();
+        return adj * covariance_lidar * adj.transpose();
+    }
+
+    // zy Step 13_d
+    // Converts raw external covariance into a symmetric PSD matrix with bounded confidence.
+    bool conditionExternalPoseCovariance(
+        const Eigen::Matrix<double, 6, 6>& covariance_in,
+        Eigen::Matrix<double, 6, 6>* covariance_out) const
+    {
+        if (!covariance_out) {
+            return false;
+        }
+        if (!covariance_in.allFinite()) {
+            return false;
+        }
+
+        const Eigen::Matrix<double, 6, 6> sym_cov =
+            0.5 * (covariance_in + covariance_in.transpose());
+
+        Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 6, 6>> eig(sym_cov);
+        if (eig.info() != Eigen::Success || !eig.eigenvalues().allFinite()) {
+            return false;
+        }
+
+        Eigen::Matrix<double, 6, 1> clamped = eig.eigenvalues();
+        const double min_var = std::max(1e-12, external_prior_min_variance_);
+        const double max_var = std::max(min_var, external_prior_max_variance_);
+        for (int i = 0; i < 6; ++i) {
+            clamped(i) = std::min(max_var, std::max(min_var, clamped(i)));
+        }
+
+        *covariance_out =
+            eig.eigenvectors() * clamped.asDiagonal() * eig.eigenvectors().transpose();
+        *covariance_out = 0.5 * (*covariance_out + covariance_out->transpose());
+        return covariance_out->allFinite();
+    }
+
+    // zy Step 6_b
+    // Finds the closest local keyframe index to an external timestamp within configured tolerance.
+    bool findNearestPoseIndexForTimestamp(
+        const int64_t timestamp_kf_nsec,
+        size_t* pose_idx,
+        int64_t* matched_timestamp_kf_nsec = nullptr,
+        const int64_t tolerance_nsec = -1) const
+    {
+        if (!pose_idx) {
+            return false;
+        }
+
+        const int64_t effective_tolerance =
+            (tolerance_nsec >= 0) ? tolerance_nsec : external_prior_timestamp_tolerance_ns_;
+
+        std::lock_guard<std::mutex> lock(timestamp_to_pose_idx_map_mutex_);
+        if (timestamp_to_pose_idx_map_.empty()) {
+            return false;
+        }
+
+        auto lower = timestamp_to_pose_idx_map_.lower_bound(timestamp_kf_nsec);
+        auto best = timestamp_to_pose_idx_map_.end();
+        int64_t best_abs_dt = std::numeric_limits<int64_t>::max();
+
+        const auto consider =
+            [&](const std::map<int64_t, size_t>::const_iterator& it) {
+                if (it == timestamp_to_pose_idx_map_.end()) {
+                    return;
+                }
+                const int64_t abs_dt = std::llabs(it->first - timestamp_kf_nsec);
+                if (abs_dt < best_abs_dt) {
+                    best_abs_dt = abs_dt;
+                    best = it;
+                }
+            };
+
+        consider(lower);
+        if (lower != timestamp_to_pose_idx_map_.begin()) {
+            consider(std::prev(lower));
+        }
+
+        if (best == timestamp_to_pose_idx_map_.end() ||
+            best_abs_dt > effective_tolerance) {
+            return false;
+        }
+
+        *pose_idx = best->second;
+        if (matched_timestamp_kf_nsec) {
+            *matched_timestamp_kf_nsec = best->first;
+        }
+        return true;
+    }
+
+    // zy Step 6_c
+    // Queues an external pose prior so it can be injected during the next graph update.
+    bool enqueueExternalPosePriorFromCovariance(
+        const int64_t timestamp_kf_nsec,
+        const gtsam::Pose3& W_Pose_L,
+        const Eigen::Matrix<double, 6, 6>& covariance,
+        const std::string& source = "unknown",
+        const uint64_t source_seq = 0)
+    {
+        // zy Step 13_e
+        // Conditions incoming covariance once at ingress so downstream optimizer paths see valid noise.
+        Eigen::Matrix<double, 6, 6> conditioned_cov;
+        if (!conditionExternalPoseCovariance(covariance, &conditioned_cov)) {
+            ROS_WARN_STREAM("Dropped external prior: covariance conditioning failed.");
+            return false;
+        }
+
+        ExternalPosePrior prior;
+        prior.timestamp_kf_nsec_ = timestamp_kf_nsec;
+        prior.W_Pose_L_ = W_Pose_L;
+        // zy Step 13_f
+        // Stores the validated covariance used later for both CBS beliefs and legacy priors.
+        prior.covariance_ = conditioned_cov;
+        prior.source_ = source;
+        prior.source_seq_ = source_seq;
+
+        std::lock_guard<std::mutex> lock(external_pose_priors_queue_mutex_);
+        external_pose_priors_queue_.push_back(prior);
+        while (external_pose_priors_queue_.size() > max_external_pose_priors_queue_size_) {
+            external_pose_priors_queue_.pop_front();
+        }
+        return true;
+    }
+
+    // zy Step 6_d
+    // Returns a LIORF belief at a requested timestamp by querying active optimizer state at the matched keyframe.
+    bool getExternalPoseBeliefAtTimestamp(
+        const int64_t timestamp_kf_nsec,
+        ExternalPoseBelief* belief,
+        const int64_t tolerance_nsec = 2000000) const
+    {
+        if (!belief) {
+            return false;
+        }
+
+        size_t pose_idx = 0;
+        int64_t matched_ts_nsec = -1;
+        if (!findNearestPoseIndexForTimestamp(
+                timestamp_kf_nsec, &pose_idx, &matched_ts_nsec, tolerance_nsec)) {
+            return false;
+        }
+
+        const gtsam::Key pose_key = poseKeyFromIndex(pose_idx);
+        if (!activeValueExists(pose_key)) {
+            return false;
+        }
+
+        const gtsam::Values estimate = computeActiveEstimate();
+        if (!estimate.exists(pose_key)) {
+            return false;
+        }
+
+        const gtsam::Matrix cov = activePoseMarginalCovariance(pose_key);
+        if (cov.rows() < 6 || cov.cols() < 6) {
+            return false;
+        }
+
+        ExternalPoseBelief out;
+        out.timestamp_kf_nsec_ = matched_ts_nsec;
+        out.pose_index_ = pose_idx;
+        out.W_Pose_L_ = estimate.at<gtsam::Pose3>(pose_key);
+        out.covariance_ = cov.block<6, 6>(0, 0);
+        out.source_ = "liorf";
+
+        *belief = out;
+        return true;
+    }
+
+    // zy Step 7_e
+    // Converts inbound ROS prior messages into LIORF external-prior queue entries.
+    void externalPosePriorHandler(const nav_msgs::OdometryConstPtr& msg)
+    {
+        if (!msg) {
+            return;
+        }
+
+        const auto& q = msg->pose.pose.orientation;
+        const double q_norm =
+            std::sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
+        if (q_norm < 1e-9) {
+            ROS_WARN_STREAM("Dropped external prior: invalid zero-norm quaternion.");
+            return;
+        }
+
+        Eigen::Matrix<double, 6, 6> covariance =
+            Eigen::Matrix<double, 6, 6>::Zero();
+        for (int r = 0; r < 6; ++r) {
+            for (int c = 0; c < 6; ++c) {
+                covariance(r, c) = msg->pose.covariance[r * 6 + c];
+            }
+        }
+
+        const gtsam::Pose3 W_Pose_exchange(
+            gtsam::Rot3::Quaternion(q.w, q.x, q.y, q.z),
+            gtsam::Point3(msg->pose.pose.position.x,
+                          msg->pose.pose.position.y,
+                          msg->pose.pose.position.z));
+
+        // zy Step 19_b
+        // Routes ROS priors through the shared ingress function to avoid duplicated validation logic.
+        const int64_t ts_nsec = toTimestampNsec(msg->header.stamp);
+        const uint64_t source_seq = static_cast<uint64_t>(msg->header.seq);
+
+        const bool queued = enqueueExternalPosePriorFromExchangeCovariance(
+            ts_nsec,
+            W_Pose_exchange,
+            covariance,
+            msg->child_frame_id,
+            source_seq,
+            msg->header.frame_id);
+
+
+        // zy Step 22_b
+        // Avoids duplicate warning spam because ingress helper already logs exact rejection reasons.
+        if (!queued) {
+            ROS_DEBUG_STREAM_THROTTLE(
+                2.0,
+                "External prior was not queued. ts_nsec=" << ts_nsec
+                << ", source=" << normalizeExternalSourceTag(msg->child_frame_id)
+                << ", seq=" << source_seq);
+        }
+    }
+
+    // zy Step 7_f
+    // Publishes latest LIORF belief as ROS odometry so bridge nodes can forward it to Kimera.
+    void publishLatestExternalPoseBelief()
+    {
+        if (pubExternalPoseBelief_.getNumSubscribers() == 0) {
+            return;
+        }
+
+        ExternalPoseBelief belief;
+        if (!getLatestExternalPoseBelief(&belief)) {
+            return;
+        }
+        if (belief.timestamp_kf_nsec_ < 0) {
+            return;
+        }
+
+        nav_msgs::Odometry msg;
+        msg.header.stamp.fromNSec(
+            static_cast<uint64_t>(belief.timestamp_kf_nsec_));
+        // zy Step 17_d
+        // Emits monotonic message sequence so receivers can detect replay/out-of-order deliveries.
+        msg.header.seq = external_pose_belief_seq_counter_++;
+        // zy Step 18_f
+        // Publishes beliefs in the configured exchange frame so receivers can enforce the same contract.
+        msg.header.frame_id = external_exchange_frame_id_;
+        msg.child_frame_id = belief.source_;
+
+        // zy Step 9_g
+        // Publishes in configured exchange frame while keeping LIORF internals in lidar frame.
+        const gtsam::Pose3 W_Pose_exchange =
+            lidarPoseToExchangePose(belief.W_Pose_L_);
+
+        msg.pose.pose.position.x = W_Pose_exchange.translation().x();
+        msg.pose.pose.position.y = W_Pose_exchange.translation().y();
+        msg.pose.pose.position.z = W_Pose_exchange.translation().z();
+
+        const Eigen::Quaterniond q_belief(W_Pose_exchange.rotation().matrix());
+        msg.pose.pose.orientation.x = q_belief.x();
+        msg.pose.pose.orientation.y = q_belief.y();
+        msg.pose.pose.orientation.z = q_belief.z();
+        msg.pose.pose.orientation.w = q_belief.w();
+
+        // zy Step 11_d
+        // Publishes covariance in the same exchange frame as the outgoing pose.
+        const Eigen::Matrix<double, 6, 6> covariance_exchange =
+            lidarCovarianceToExchangeCovariance(belief.covariance_);
+
+        for (int r = 0; r < 6; ++r) {
+            for (int c = 0; c < 6; ++c) {
+                msg.pose.covariance[r * 6 + c] = covariance_exchange(r, c);
+            }
+        }
+
+        pubExternalPoseBelief_.publish(msg);
+    }
+
+#ifdef LIORF_USE_CBS
+    // zy Step 8_a
+    // Maps source tags to stable CBS agent IDs so beliefs keep correct sender ownership.
+    bool mapSourceToCbsAgent(const std::string& source,
+                             cbs::AgentId* agent_id) const
+    {
+        if (!agent_id) {
+            return false;
+        }
+
+        if (source == "kimera" || source == "kimera_vio" || source == "vio") {
+            *agent_id = static_cast<cbs::AgentId>('a');
+            return true;
+        }
+
+        if (source == "liorf" || source == "liosam" || source == "self") {
+            *agent_id = static_cast<cbs::AgentId>('b');
+            return true;
+        }
+
+        return false;
+    }
+#endif
+
+    // zy Step 10_c
+    // Applies time-window and per-cycle budget guards so external fusion remains real-time and stable.
+    void injectQueuedExternalPosePriors()
+    {
+        std::deque<ExternalPosePrior> incoming_priors;
+        {
+            std::lock_guard<std::mutex> lock(external_pose_priors_queue_mutex_);
+            if (external_pose_priors_queue_.empty()) {
+                return;
+            }
+            incoming_priors.swap(external_pose_priors_queue_);
+        }
+
+        // zy Step 20_c
+        // Drops queued external priors in legacy mode when legacy fusion is disabled.
+        if (!usingCbs() && !allow_external_priors_in_legacy_mode_) {
+            const size_t dropped_legacy_disabled = incoming_priors.size();
+            if (dropped_legacy_disabled > 0) {
+                ROS_WARN_STREAM_THROTTLE(
+                    2.0,
+                    "Dropped " << dropped_legacy_disabled
+                    << " external priors because legacy fusion is disabled "
+                    << "(liorf/allow_external_priors_in_legacy_mode=false).");
+            }
+            return;
+        }
+
+        const int64_t current_ts_nsec = toTimestampNsec(timeLaserInfoStamp);
+        const int64_t max_prior_age_ns = static_cast<int64_t>(
+            std::max(0.0, max_external_prior_age_sec_) * 1e9);
+        const int64_t max_future_lead_ns = static_cast<int64_t>(
+            std::max(0.0, max_external_prior_future_lead_sec_) * 1e9);
+
+        int64_t newest_local_ts_nsec = -1;
+        {
+            std::lock_guard<std::mutex> lock(timestamp_to_pose_idx_map_mutex_);
+            if (!timestamp_to_pose_idx_map_.empty()) {
+                newest_local_ts_nsec = timestamp_to_pose_idx_map_.rbegin()->first;
+            }
+        }
+
+        size_t injected = 0;
+        size_t deferred = 0;
+        size_t dropped_old = 0;
+        size_t dropped_bad_noise = 0;
+        size_t dropped_self_source = 0;
+        size_t dropped_unknown_source = 0;
+        size_t deferred_budget = 0;
+
+#ifdef LIORF_USE_CBS
+        std::map<gtsam::Key, std::vector<std::pair<cbs::AgentId, gbp::Gaussian>>>
+            cbs_incoming_beliefs;
+        size_t num_external_beliefs_staged = 0;
+        size_t num_external_beliefs_rejected = 0;
+        constexpr cbs::AgentId kLiorfAgentId = static_cast<cbs::AgentId>('b');
+#endif
+
+        std::deque<ExternalPosePrior> deferred_priors;
+
+        for (const auto& prior : incoming_priors) {
+            if (max_prior_age_ns > 0 &&
+                prior.timestamp_kf_nsec_ + max_prior_age_ns < current_ts_nsec) {
+                ++dropped_old;
+                continue;
+            }
+
+            if (max_future_lead_ns > 0 &&
+                prior.timestamp_kf_nsec_ > current_ts_nsec + max_future_lead_ns) {
+                deferred_priors.push_back(prior);
+                ++deferred;
+                continue;
+            }
+
+            if (!prior.covariance_.allFinite() ||
+                (prior.covariance_.diagonal().array() <= 0.0).any()) {
+                ++dropped_bad_noise;
+                continue;
+            }
+
+            if (injected >= max_external_priors_per_optimize_) {
+                deferred_priors.push_back(prior);
+                ++deferred_budget;
+                continue;
+            }
+
+            size_t matched_pose_idx = 0;
+            int64_t matched_ts_nsec = -1;
+            if (!findNearestPoseIndexForTimestamp(
+                    prior.timestamp_kf_nsec_, &matched_pose_idx, &matched_ts_nsec)) {
+                const bool could_match_future =
+                    (newest_local_ts_nsec >= 0) &&
+                    (prior.timestamp_kf_nsec_ >
+                     newest_local_ts_nsec + external_prior_timestamp_tolerance_ns_);
+                if (could_match_future) {
+                    deferred_priors.push_back(prior);
+                    ++deferred;
+                } else {
+                    ++dropped_old;
+                }
+                continue;
+            }
+
+            const gtsam::Key pose_key = poseKeyFromIndex(matched_pose_idx);
+
+#ifdef LIORF_USE_CBS
+            if (usingCbs()) {
+                if (!cbs_optimizer_) {
+                    ++dropped_bad_noise;
+                    continue;
+                }
+
+                cbs::AgentId sender_id = static_cast<cbs::AgentId>('a');
+                if (!mapSourceToCbsAgent(prior.source_, &sender_id)) {
+                    ++dropped_unknown_source;
+                    continue;
+                }
+
+                if (sender_id == kLiorfAgentId) {
+                    ++dropped_self_source;
+                    continue;
+                }
+
+                const gtsam::Vector6 mu =
+                    gtsam::traits<gtsam::Pose3>::Logmap(prior.W_Pose_L_);
+                const gtsam::Matrix66 cov = prior.covariance_;
+                gbp::Gaussian belief(pose_key, mu, cov, 1);
+
+                cbs_incoming_beliefs[pose_key].emplace_back(sender_id, belief);
+                ++num_external_beliefs_staged;
+                ++injected;
+                continue;
+            }
+#endif
+
+                if (isSelfExternalSourceTag(prior.source_)) {
+                ++dropped_self_source;
+                continue;
+            }
+
+            const gtsam::SharedNoiseModel prior_noise =
+                gtsam::noiseModel::Gaussian::Covariance(prior.covariance_);
+            gtSAMgraph.add(gtsam::PriorFactor<gtsam::Pose3>(
+                pose_key, prior.W_Pose_L_, prior_noise));
+            ++injected;
+        }
+
+        size_t queue_size_now = 0;
+        {
+            std::lock_guard<std::mutex> lock(external_pose_priors_queue_mutex_);
+            for (const auto& prior : deferred_priors) {
+                external_pose_priors_queue_.push_back(prior);
+                while (external_pose_priors_queue_.size() >
+                       max_external_pose_priors_queue_size_) {
+                    external_pose_priors_queue_.pop_front();
+                }
+            }
+            queue_size_now = external_pose_priors_queue_.size();
+        }
+
+#ifdef LIORF_USE_CBS
+        if (usingCbs() && !cbs_incoming_beliefs.empty()) {
+            num_external_beliefs_rejected =
+                cbs_optimizer_->addBeliefs(cbs_incoming_beliefs);
+
+            ROS_INFO_STREAM("CBS addBeliefs: staged=" << num_external_beliefs_staged
+                            << ", rejected=" << num_external_beliefs_rejected
+                            << ", unknown_source=" << dropped_unknown_source
+                            << ", self_source=" << dropped_self_source);
+        }
+#endif
+
+        if (injected > 0) {
+            aLoopIsClosed = true;
+        }
+
+        ROS_INFO_STREAM_COND(
+            (injected + deferred + dropped_old + dropped_bad_noise +
+             dropped_self_source + dropped_unknown_source + deferred_budget) > 0,
+            "External prior stats: injected=" << injected
+            << ", deferred=" << deferred
+            << ", dropped_old=" << dropped_old
+            << ", dropped_bad_noise=" << dropped_bad_noise
+            << ", dropped_self_source=" << dropped_self_source
+            << ", dropped_unknown_source=" << dropped_unknown_source
+            << ", deferred_budget=" << deferred_budget
+            << ", queue_size_now=" << queue_size_now
+            << ", per_optimize_budget=" << max_external_priors_per_optimize_);
+    }
+
+
+    // zy Step 3_a
+    // Routes factor-graph updates through whichever optimizer is active and preserves loop-closure extra iterations.
+    void updateActiveOptimizer(const gtsam::NonlinearFactorGraph& factors,
+                               const gtsam::Values& values,
+                               const bool run_extra_updates)
+    {
+        if (usingCbs()) {
+#ifdef LIORF_USE_CBS
+            cbs::BPSAM::UpdateParams update_params;
+            cbs_optimizer_->update(factors, values, update_params);
+
+            if (run_extra_updates) {
+                for (int i = 0; i < 5; ++i) {
+                    cbs_optimizer_->update(gtsam::NonlinearFactorGraph(),
+                                           gtsam::Values(),
+                                           update_params);
+                }
+            }
+            return;
+#endif
+        }
+
+        isam->update(factors, values);
+        isam->update();
+
+        if (run_extra_updates) {
+            for (int i = 0; i < 5; ++i) {
+                isam->update();
+            }
+        }
     }
 
     void allocateMemory()
@@ -1383,21 +2530,57 @@ public:
         return true;
     }
 
+    // void addOdomFactor()
+    // {
+    //     if (cloudKeyPoses3D->points.empty())
+    //     {
+    //         noiseModel::Diagonal::shared_ptr priorNoise = noiseModel::Diagonal::Variances((Vector(6) << 1e-2, 1e-2, M_PI*M_PI, 1e8, 1e8, 1e8).finished()); // rad*rad, meter*meter
+    //         gtSAMgraph.add(PriorFactor<Pose3>(0, trans2gtsamPose(transformTobeMapped), priorNoise));
+    //         initialEstimate.insert(0, trans2gtsamPose(transformTobeMapped));
+    //     }else{
+    //         noiseModel::Diagonal::shared_ptr odometryNoise = noiseModel::Diagonal::Variances((Vector(6) << 1e-6, 1e-6, 1e-6, 1e-4, 1e-4, 1e-4).finished());
+    //         gtsam::Pose3 poseFrom = pclPointTogtsamPose3(cloudKeyPoses6D->points.back());
+    //         gtsam::Pose3 poseTo   = trans2gtsamPose(transformTobeMapped);
+    //         gtSAMgraph.add(BetweenFactor<Pose3>(cloudKeyPoses3D->size()-1, cloudKeyPoses3D->size(), poseFrom.between(poseTo), odometryNoise));
+    //         initialEstimate.insert(cloudKeyPoses3D->size(), poseTo);
+    //     }
+    // } (zy cancelled it)
+
+    // zy Step 4_b
+    // Builds odometry constraints with shared symbolic pose keys instead of raw integer keys.
     void addOdomFactor()
     {
         if (cloudKeyPoses3D->points.empty())
         {
-            noiseModel::Diagonal::shared_ptr priorNoise = noiseModel::Diagonal::Variances((Vector(6) << 1e-2, 1e-2, M_PI*M_PI, 1e8, 1e8, 1e8).finished()); // rad*rad, meter*meter
-            gtSAMgraph.add(PriorFactor<Pose3>(0, trans2gtsamPose(transformTobeMapped), priorNoise));
-            initialEstimate.insert(0, trans2gtsamPose(transformTobeMapped));
-        }else{
-            noiseModel::Diagonal::shared_ptr odometryNoise = noiseModel::Diagonal::Variances((Vector(6) << 1e-6, 1e-6, 1e-6, 1e-4, 1e-4, 1e-4).finished());
+            noiseModel::Diagonal::shared_ptr priorNoise =
+                noiseModel::Diagonal::Variances(
+                    (Vector(6) << 1e-2, 1e-2, M_PI*M_PI, 1e8, 1e8, 1e8).finished());
+
+            const gtsam::Key first_key = poseKeyFromIndex(0);
+            gtSAMgraph.add(PriorFactor<Pose3>(
+                first_key, trans2gtsamPose(transformTobeMapped), priorNoise));
+            initialEstimate.insert(first_key, trans2gtsamPose(transformTobeMapped));
+        }
+        else
+        {
+            noiseModel::Diagonal::shared_ptr odometryNoise =
+                noiseModel::Diagonal::Variances(
+                    (Vector(6) << 1e-6, 1e-6, 1e-6, 1e-4, 1e-4, 1e-4).finished());
+
             gtsam::Pose3 poseFrom = pclPointTogtsamPose3(cloudKeyPoses6D->points.back());
             gtsam::Pose3 poseTo   = trans2gtsamPose(transformTobeMapped);
-            gtSAMgraph.add(BetweenFactor<Pose3>(cloudKeyPoses3D->size()-1, cloudKeyPoses3D->size(), poseFrom.between(poseTo), odometryNoise));
-            initialEstimate.insert(cloudKeyPoses3D->size(), poseTo);
+
+            const gtsam::Key prev_key =
+                poseKeyFromIndex(cloudKeyPoses3D->size() - 1);
+            const gtsam::Key curr_key =
+                poseKeyFromIndex(cloudKeyPoses3D->size());
+
+            gtSAMgraph.add(BetweenFactor<Pose3>(
+                prev_key, curr_key, poseFrom.between(poseTo), odometryNoise));
+            initialEstimate.insert(curr_key, poseTo);
         }
     }
+
 
     void addGPSFactor()
     {
@@ -1470,8 +2653,16 @@ public:
                 gtsam::Vector Vector3(3);
                 Vector3 << max(noise_x, 1.0f), max(noise_y, 1.0f), max(noise_z, 1.0f);
                 noiseModel::Diagonal::shared_ptr gps_noise = noiseModel::Diagonal::Variances(Vector3);
-                gtsam::GPSFactor gps_factor(cloudKeyPoses3D->size(), gtsam::Point3(gps_x, gps_y, gps_z), gps_noise);
+                // gtsam::GPSFactor gps_factor(cloudKeyPoses3D->size(), gtsam::Point3(gps_x, gps_y, gps_z), gps_noise);
+                // gtSAMgraph.add(gps_factor); (zy cancelled it)
+
+                // zy Step 4_c
+                // Anchors GPS to the same shared pose-key namespace used by odometry and CBS beliefs.
+                const gtsam::Key curr_key = poseKeyFromIndex(cloudKeyPoses3D->size());
+                gtsam::GPSFactor gps_factor(
+                    curr_key, gtsam::Point3(gps_x, gps_y, gps_z), gps_noise);
                 gtSAMgraph.add(gps_factor);
+
 
                 aLoopIsClosed = true;
                 break;
@@ -1491,7 +2682,16 @@ public:
             gtsam::Pose3 poseBetween = loopPoseQueue[i];
             // gtsam::noiseModel::Diagonal::shared_ptr noiseBetween = loopNoiseQueue[i];
             auto noiseBetween = loopNoiseQueue[i];
-            gtSAMgraph.add(BetweenFactor<Pose3>(indexFrom, indexTo, poseBetween, noiseBetween));
+            // gtSAMgraph.add(BetweenFactor<Pose3>(indexFrom, indexTo, poseBetween, noiseBetween)); (zy cancelled it)
+            // zy Step 4_d
+            // Converts loop-closure indices into shared symbolic pose keys.
+            const gtsam::Key key_from =
+                poseKeyFromIndex(static_cast<size_t>(indexFrom));
+            const gtsam::Key key_to =
+                poseKeyFromIndex(static_cast<size_t>(indexTo));
+            gtSAMgraph.add(BetweenFactor<Pose3>(
+                key_from, key_to, poseBetween, noiseBetween));
+
         }
 
         loopIndexQueue.clear();
@@ -1513,22 +2713,16 @@ public:
 
         // loop factor
         addLoopFactor();
+        // zy Step 6_f
+        // Injects matched external beliefs as pose priors before running the active optimizer update.
+        injectQueuedExternalPosePriors();
 
         // cout << "****************************************************" << endl;
         // gtSAMgraph.print("GTSAM Graph:\n");
 
-        // update iSAM
-        isam->update(gtSAMgraph, initialEstimate);
-        isam->update();
-
-        if (aLoopIsClosed == true)
-        {
-            isam->update();
-            isam->update();
-            isam->update();
-            isam->update();
-            isam->update();
-        }
+        // zy Step 3_b
+        // Keeps one update path for both ISAM2 and CBS so mapOptimization behavior stays consistent.
+        updateActiveOptimizer(gtSAMgraph, initialEstimate, aLoopIsClosed);
 
         gtSAMgraph.resize(0);
         initialEstimate.clear();
@@ -1538,8 +2732,18 @@ public:
         PointTypePose thisPose6D;
         Pose3 latestEstimate;
 
-        isamCurrentEstimate = isam->calculateEstimate();
-        latestEstimate = isamCurrentEstimate.at<Pose3>(isamCurrentEstimate.size()-1);
+        // isamCurrentEstimate = isam->calculateEstimate();
+        // latestEstimate = isamCurrentEstimate.at<Pose3>(isamCurrentEstimate.size()-1); (zy cancelled it)
+        
+        // zy Step 4_e
+        // Reads the newest optimized pose via shared symbolic key (`x(index)`), not raw key count.
+        optimizerCurrentEstimate = computeActiveEstimate();
+        isamCurrentEstimate = optimizerCurrentEstimate; // keep legacy variable updated for unchanged code paths.
+        const size_t latest_pose_idx = cloudKeyPoses3D->size();
+        const gtsam::Key latest_pose_key = poseKeyFromIndex(latest_pose_idx);
+        latestEstimate = optimizerCurrentEstimate.at<Pose3>(latest_pose_key);
+
+
         // cout << "****************************************************" << endl;
         // isamCurrentEstimate.print("Current estimate: ");
 
@@ -1558,11 +2762,34 @@ public:
         thisPose6D.yaw   = latestEstimate.rotation().yaw();
         thisPose6D.time = timeLaserInfoCur;
         cloudKeyPoses6D->push_back(thisPose6D);
+        // zy Step 5_i
+        // Saves timestamp->index alignment right when a new keyframe pose is committed.
+        const size_t new_pose_idx = cloudKeyPoses3D->size() - 1;
+        rememberPoseIndexForTimestamp(timeLaserInfoStamp, new_pose_idx);
+
+        // zy Step 7_g
+        // Emits one fresh LIORF belief per committed keyframe for external fusion consumers.
+        publishLatestExternalPoseBelief();
 
         // cout << "****************************************************" << endl;
         // cout << "Pose covariance:" << endl;
         // cout << isam->marginalCovariance(isamCurrentEstimate.size()-1) << endl << endl;
-        poseCovariance = isam->marginalCovariance(isamCurrentEstimate.size()-1);
+        // poseCovariance = isam->marginalCovariance(isamCurrentEstimate.size()-1); (zy cancelled it)
+        // zy Step 4_f
+        // Queries covariance of the latest saved pose using the shared symbolic key.
+        const gtsam::Key last_saved_pose_key =
+            poseKeyFromIndex(cloudKeyPoses3D->size() - 1);
+        poseCovariance = activePoseMarginalCovariance(last_saved_pose_key);
+        // zy Step 5_j
+        // Updates the outgoing LIORF belief snapshot (pose + covariance) for external fusion.
+        updateLatestExternalPoseBelief(
+            timeLaserInfoStamp,
+            cloudKeyPoses3D->size() - 1,
+            latestEstimate,
+            poseCovariance.block<6, 6>(0, 0));
+
+
+
 
         // save updated transform
         transformTobeMapped[0] = latestEstimate.rotation().roll();
@@ -1620,22 +2847,51 @@ public:
             // clear path
             globalPath.poses.clear();
             // update key poses
-            int numPoses = isamCurrentEstimate.size();
+            // int numPoses = isamCurrentEstimate.size(); (zy cancelled it)
+            // zy Step 2_i
+            // Use the active estimate container as the single source for pose correction after loop/CBS updates.
+            int numPoses = optimizerCurrentEstimate.size();
+
+            // for (int i = 0; i < numPoses; ++i)
+            // {   
+            //     // zy Step 2_j i replaced below all the isamCurrentEstimate with optimizerCurrentEstimate to make sure the corrected poses are from the currently active optimizer.
+            //     cloudKeyPoses3D->points[i].x = optimizerCurrentEstimate.at<Pose3>(i).translation().x();
+            //     cloudKeyPoses3D->points[i].y = optimizerCurrentEstimate.at<Pose3>(i).translation().y();
+            //     cloudKeyPoses3D->points[i].z = optimizerCurrentEstimate.at<Pose3>(i).translation().z();
+
+            //     cloudKeyPoses6D->points[i].x = cloudKeyPoses3D->points[i].x;
+            //     cloudKeyPoses6D->points[i].y = cloudKeyPoses3D->points[i].y;
+            //     cloudKeyPoses6D->points[i].z = cloudKeyPoses3D->points[i].z;
+            //     cloudKeyPoses6D->points[i].roll  = optimizerCurrentEstimate.at<Pose3>(i).rotation().roll();
+            //     cloudKeyPoses6D->points[i].pitch = optimizerCurrentEstimate.at<Pose3>(i).rotation().pitch();
+            //     cloudKeyPoses6D->points[i].yaw   = optimizerCurrentEstimate.at<Pose3>(i).rotation().yaw();
+
+            //     updatePath(cloudKeyPoses6D->points[i]);
+            // } (zy cancelled it)
+
             for (int i = 0; i < numPoses; ++i)
             {
-                cloudKeyPoses3D->points[i].x = isamCurrentEstimate.at<Pose3>(i).translation().x();
-                cloudKeyPoses3D->points[i].y = isamCurrentEstimate.at<Pose3>(i).translation().y();
-                cloudKeyPoses3D->points[i].z = isamCurrentEstimate.at<Pose3>(i).translation().z();
+                // zy Step 4_g
+                // Applies loop-corrected poses by symbolic key so map backfill matches optimizer key IDs.
+                const gtsam::Key pose_key =
+                    poseKeyFromIndex(static_cast<size_t>(i));
+                const gtsam::Pose3 pose_i =
+                    optimizerCurrentEstimate.at<Pose3>(pose_key);
+
+                cloudKeyPoses3D->points[i].x = pose_i.translation().x();
+                cloudKeyPoses3D->points[i].y = pose_i.translation().y();
+                cloudKeyPoses3D->points[i].z = pose_i.translation().z();
 
                 cloudKeyPoses6D->points[i].x = cloudKeyPoses3D->points[i].x;
                 cloudKeyPoses6D->points[i].y = cloudKeyPoses3D->points[i].y;
                 cloudKeyPoses6D->points[i].z = cloudKeyPoses3D->points[i].z;
-                cloudKeyPoses6D->points[i].roll  = isamCurrentEstimate.at<Pose3>(i).rotation().roll();
-                cloudKeyPoses6D->points[i].pitch = isamCurrentEstimate.at<Pose3>(i).rotation().pitch();
-                cloudKeyPoses6D->points[i].yaw   = isamCurrentEstimate.at<Pose3>(i).rotation().yaw();
+                cloudKeyPoses6D->points[i].roll  = pose_i.rotation().roll();
+                cloudKeyPoses6D->points[i].pitch = pose_i.rotation().pitch();
+                cloudKeyPoses6D->points[i].yaw   = pose_i.rotation().yaw();
 
                 updatePath(cloudKeyPoses6D->points[i]);
             }
+
 
             aLoopIsClosed = false;
         }
