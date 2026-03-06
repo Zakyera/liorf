@@ -37,9 +37,6 @@
 // zy Step 13_a
 // Enables eigenvalue-based covariance conditioning for robust external prior ingestion.
 #include <Eigen/Eigenvalues>
-// zy Step 16_a
-// Enables SVD-based projection of calibration rotation to a valid SO(3) matrix.
-#include <Eigen/SVD>
 
 
 
@@ -158,21 +155,16 @@ public:
     std::map<int64_t, size_t> timestamp_to_pose_idx_map_;
     size_t max_timestamp_to_pose_idx_map_size_ = 20000;
     int64_t external_prior_timestamp_tolerance_ns_ = 2000000;  // 2 ms
-    // zy Step 21_a
-    // Mirrors timestamp tolerance in seconds so launch/yaml tuning is easier than nanosecond literals.
-    double external_prior_timestamp_tolerance_sec_ = 0.002;
     // zy Step 10_a
     // Bounds external-prior freshness and per-cycle ingestion to keep optimization stable under bursty inputs.
     double max_external_prior_age_sec_ = 2.0;
     double max_external_prior_future_lead_sec_ = 0.05;
     size_t max_external_priors_per_optimize_ = 200;
-    // zy Step 20_a
-    // Prevents unintended external-prior fusion when running legacy optimizer unless explicitly enabled.
-    bool allow_external_priors_in_legacy_mode_ = false;
     // zy Step 13_b
     // Sets minimum and maximum confidence bounds for external pose-prior covariance.
     double external_prior_min_variance_ = 1e-6;
     double external_prior_max_variance_ = 1e2;
+
 
     mutable std::mutex latest_external_pose_belief_mutex_;
     ExternalPoseBelief latest_external_pose_belief_;
@@ -209,22 +201,9 @@ public:
     std::string external_pose_belief_topic_ = "liorf/cbs/external_pose_belief";
     std::string external_pose_prior_topic_ = "liorf/cbs/external_pose_prior";
     std::string external_prior_default_source_ = "kimera";
-    // zy Step 17_a
-    // Publishes explicit source identity and monotonic sequence for downstream dedup/reordering.
-    std::string external_pose_belief_source_ = "liorf";
-    uint32_t external_pose_belief_seq_counter_ = 0;
-    // zy Step 18_a
-    // Defines the global frame contract for all incoming/outgoing external pose exchange messages.
-    std::string external_exchange_frame_id_ = "";
     // zy Step 9_a
     // Controls whether external exchange uses IMU/body frame (true) or lidar frame (false).
     bool external_exchange_in_body_frame_ = false;
-    // zy Step 15_a
-    // Keeps legacy behavior by default while allowing full lidar->body rotation+translation conversion.
-    bool external_exchange_use_full_lidar_body_extrinsic_ = false;
-    // zy Step 16_b
-    // Selects which LIORF calibration rotation source is used for exchange-frame conversion.
-    std::string external_exchange_extrinsic_rotation_source_ = "extRPY";
     // zy Step 12_b
     // Tracks last seen sequence per source to drop replayed/out-of-order external priors.
     mutable std::mutex external_source_seq_mutex_;
@@ -322,29 +301,6 @@ public:
         nh.param<std::string>("liorf/external_prior_default_source",
                               external_prior_default_source_,
                               "kimera");
-        // zy Step 17_b
-        // Makes outgoing belief source tag configurable so integration wiring does not depend on hardcoded strings.
-        nh.param<std::string>("liorf/external_pose_belief_source",
-                              external_pose_belief_source_,
-                              "liorf");
-        std::transform(external_pose_belief_source_.begin(),
-                       external_pose_belief_source_.end(),
-                       external_pose_belief_source_.begin(),
-                       [](unsigned char c) {
-                           return static_cast<char>(std::tolower(c));
-                       });
-        // zy Step 18_b
-        // Makes exchange frame explicit so LIORF never fuses priors from a different world frame.
-        nh.param<std::string>("liorf/external_exchange_frame_id",
-                              external_exchange_frame_id_,
-                              odometryFrame);
-        if (external_exchange_frame_id_.empty()) {
-            external_exchange_frame_id_ = odometryFrame;
-        }
-        while (!external_exchange_frame_id_.empty() &&
-               external_exchange_frame_id_.front() == '/') {
-            external_exchange_frame_id_.erase(external_exchange_frame_id_.begin());
-        }
         // zy Step 10_b
         // Makes prior-aging/budget limits configurable from launch without code edits.
         nh.param<double>("liorf/max_external_prior_age_sec",
@@ -361,80 +317,12 @@ public:
                       200);
         max_external_priors_per_optimize_ =
             static_cast<size_t>(std::max(1, max_external_priors_per_optimize_tmp));
-        // zy Step 21_b
-        // Exposes queue/map/timestamp matching limits to runtime config for dataset-dependent tuning.
-        int max_external_pose_priors_queue_size_tmp =
-            static_cast<int>(max_external_pose_priors_queue_size_);
-        nh.param<int>("liorf/max_external_pose_priors_queue_size",
-                      max_external_pose_priors_queue_size_tmp,
-                      5000);
-        max_external_pose_priors_queue_size_ =
-            static_cast<size_t>(std::max(1, max_external_pose_priors_queue_size_tmp));
-
-        int max_timestamp_to_pose_idx_map_size_tmp =
-            static_cast<int>(max_timestamp_to_pose_idx_map_size_);
-        nh.param<int>("liorf/max_timestamp_to_pose_idx_map_size",
-                      max_timestamp_to_pose_idx_map_size_tmp,
-                      20000);
-        max_timestamp_to_pose_idx_map_size_ =
-            static_cast<size_t>(std::max(1, max_timestamp_to_pose_idx_map_size_tmp));
-
-        nh.param<double>("liorf/external_prior_timestamp_tolerance_sec",
-                         external_prior_timestamp_tolerance_sec_,
-                         0.002);
-        external_prior_timestamp_tolerance_ns_ = static_cast<int64_t>(
-            std::max(0.0, external_prior_timestamp_tolerance_sec_) * 1e9);
-        // zy Step 21_c
-        // Prints active matching/queue limits so runtime behavior is easy to audit from logs.
-        ROS_INFO_STREAM("External prior tuning: tolerance_ns="
-                        << external_prior_timestamp_tolerance_ns_
-                        << ", queue_cap=" << max_external_pose_priors_queue_size_
-                        << ", ts_map_cap=" << max_timestamp_to_pose_idx_map_size_);
-        // zy Step 20_b
-        // Makes legacy-mode external-prior fusion an explicit runtime choice.
-        nh.param<bool>("liorf/allow_external_priors_in_legacy_mode",
-                       allow_external_priors_in_legacy_mode_,
-                       false);
-        // zy Step 13_c
-        // Makes covariance confidence bounds configurable without recompiling.
-        nh.param<double>("liorf/external_prior_min_variance",
-                         external_prior_min_variance_,
-                         1e-6);
-        nh.param<double>("liorf/external_prior_max_variance",
-                         external_prior_max_variance_,
-                         1e2);
-        if (external_prior_max_variance_ < external_prior_min_variance_) {
-            std::swap(external_prior_max_variance_, external_prior_min_variance_);
-        }
         
         // zy Step 9_b
         // Keeps old behavior by default, while allowing body-frame exchange when wiring with Kimera.
         nh.param<bool>("liorf/external_exchange_in_body_frame",
                        external_exchange_in_body_frame_,
                        false);
-        // zy Step 15_b
-        // Lets launch files enable full extrinsic conversion when camera/lidar/body are not axis-aligned.
-        nh.param<bool>("liorf/external_exchange_use_full_lidar_body_extrinsic",
-                       external_exchange_use_full_lidar_body_extrinsic_,
-                       false);
-        // zy Step 16_c
-        // Normalizes rotation-source selection so exchange conversion behavior is explicit and stable.
-        nh.param<std::string>("liorf/external_exchange_extrinsic_rotation_source",
-                              external_exchange_extrinsic_rotation_source_,
-                              "extRPY");
-        std::transform(external_exchange_extrinsic_rotation_source_.begin(),
-                       external_exchange_extrinsic_rotation_source_.end(),
-                       external_exchange_extrinsic_rotation_source_.begin(),
-                       [](unsigned char c) {
-                           return static_cast<char>(std::tolower(c));
-                       });
-        if (external_exchange_extrinsic_rotation_source_ != "extrpy" &&
-            external_exchange_extrinsic_rotation_source_ != "extrot") {
-            ROS_WARN_STREAM("Invalid liorf/external_exchange_extrinsic_rotation_source="
-                            << external_exchange_extrinsic_rotation_source_
-                            << ", falling back to extRPY.");
-            external_exchange_extrinsic_rotation_source_ = "extrpy";
-        }
 
 
 
@@ -599,89 +487,6 @@ public:
         return true;
     }
 
-    // zy Step 18_c
-    // Canonicalizes ROS frame ids by removing optional leading '/' for stable comparisons.
-    std::string canonicalizeFrameId(const std::string& frame_id) const
-    {
-        std::string out = frame_id;
-        while (!out.empty() && out.front() == '/') {
-            out.erase(out.begin());
-        }
-        return out;
-    }
-
-    // zy Step 18_d
-    // Enforces that incoming exchange messages use the configured global frame id.
-    bool matchesExternalExchangeFrame(const std::string& frame_id) const
-    {
-        const std::string expected = canonicalizeFrameId(external_exchange_frame_id_);
-        if (expected.empty()) {
-            return true;
-        }
-        const std::string incoming = canonicalizeFrameId(frame_id);
-        return !incoming.empty() && incoming == expected;
-    }
-
-    // zy Step 19_a
-    // Centralizes exchange-frame prior validation and conversion so all ingress paths behave consistently.
-    bool enqueueExternalPosePriorFromExchangeCovariance(
-        const int64_t timestamp_kf_nsec,
-        const gtsam::Pose3& W_Pose_exchange,
-        const Eigen::Matrix<double, 6, 6>& covariance_exchange,
-        const std::string& source_raw = "unknown",
-        const uint64_t source_seq = 0,
-        const std::string& frame_id = "")
-    {
-        const std::string effective_frame =
-            frame_id.empty() ? external_exchange_frame_id_ : frame_id;
-        if (!matchesExternalExchangeFrame(effective_frame)) {
-            ROS_WARN_STREAM_THROTTLE(
-                2.0,
-                "Dropped external prior with mismatched frame_id='"
-                << frame_id << "', expected='"
-                << external_exchange_frame_id_ << "'.");
-            return false;
-        }
-
-        const std::string source = normalizeExternalSourceTag(source_raw);
-
-        if (isSelfExternalSourceTag(source)) {
-            ROS_WARN_STREAM_THROTTLE(
-                2.0,
-                "Dropped external prior from self source tag: " << source);
-            return false;
-        }
-
-        if (!shouldAcceptExternalSourceSeq(source, source_seq)) {
-            ROS_WARN_STREAM_THROTTLE(
-                2.0,
-                "Dropped replay/out-of-order external prior. source=" << source
-                << ", seq=" << source_seq);
-            return false;
-        }
-
-        // zy Step 22_a
-        // In CBS mode, rejects unmapped source tags at ingress so invalid priors never enter the queue.
-#ifdef LIORF_USE_CBS
-        if (usingCbs()) {
-            cbs::AgentId sender_id = static_cast<cbs::AgentId>('a');
-            if (!mapSourceToCbsAgent(source, &sender_id)) {
-                ROS_WARN_STREAM_THROTTLE(
-                    2.0,
-                    "Dropped external prior with unmapped CBS source='" << source << "'.");
-                return false;
-            }
-        }
-#endif
-
-        const gtsam::Pose3 W_Pose_L = exchangePoseToLidarPose(W_Pose_exchange);
-        const Eigen::Matrix<double, 6, 6> covariance_lidar =
-            exchangeCovarianceToLidarCovariance(covariance_exchange);
-
-        return enqueueExternalPosePriorFromCovariance(
-            timestamp_kf_nsec, W_Pose_L, covariance_lidar, source, source_seq);
-    }
-
 
     // zy Step 5_f
     // Tracks local keyframe timestamp -> pose index for future external prior matching.
@@ -709,9 +514,7 @@ public:
         belief.pose_index_ = pose_idx;
         belief.W_Pose_L_ = W_Pose_L;
         belief.covariance_ = covariance;
-        // zy Step 17_c
-        // Keeps cached outgoing belief source aligned with configured publisher identity.
-        belief.source_ = external_pose_belief_source_;
+        belief.source_ = "liorf";
 
         std::lock_guard<std::mutex> lock(latest_external_pose_belief_mutex_);
         latest_external_pose_belief_ = belief;
@@ -733,47 +536,13 @@ public:
         return true;
     }
 
-    // zy Step 16_d
-    // Picks configured calibration rotation and projects it to nearest valid SO(3) matrix.
-    Eigen::Matrix3d exchangeLidarToBodyRotation() const
-    {
-        Eigen::Matrix3d R =
-            (external_exchange_extrinsic_rotation_source_ == "extrot") ? extRot : extRPY;
-
-        if (!R.allFinite()) {
-            ROS_WARN_STREAM_THROTTLE(
-                2.0,
-                "Non-finite exchange rotation matrix, falling back to identity.");
-            return Eigen::Matrix3d::Identity();
-        }
-
-        Eigen::JacobiSVD<Eigen::Matrix3d> svd(
-            R, Eigen::ComputeFullU | Eigen::ComputeFullV);
-        Eigen::Matrix3d U = svd.matrixU();
-        Eigen::Matrix3d V = svd.matrixV();
-        Eigen::Matrix3d R_ortho = U * V.transpose();
-
-        if (R_ortho.determinant() < 0.0) {
-            U.col(2) *= -1.0;
-            R_ortho = U * V.transpose();
-        }
-
-        return R_ortho;
-    }
-
-    // zy Step 15_c
-    // Builds lidar->body extrinsic in legacy translation-only mode or full rotation+translation mode.
+    // zy Step 9_c
+    // Uses LIORF's existing translation-only lidar<->body extrinsic convention for exchange conversion.
     gtsam::Pose3 lidarToBodyExtrinsic() const
     {
-        const gtsam::Point3 t_lb(extTrans.x(), extTrans.y(), extTrans.z());
-        if (!external_exchange_use_full_lidar_body_extrinsic_) {
-            return gtsam::Pose3(gtsam::Rot3(1, 0, 0, 0), t_lb);
-        }
-
-        // zy Step 16_e
-        // Uses configured and orthonormalized calibration rotation for full exchange transform.
-        const Eigen::Matrix3d R_lb_mat = exchangeLidarToBodyRotation();
-        return gtsam::Pose3(gtsam::Rot3(R_lb_mat), t_lb);
+        return gtsam::Pose3(
+            gtsam::Rot3(1, 0, 0, 0),
+            gtsam::Point3(extTrans.x(), extTrans.y(), extTrans.z()));
     }
 
     // zy Step 9_d
@@ -822,40 +591,6 @@ public:
         const gtsam::Pose3 L_Pose_B = lidarToBodyExtrinsic();
         const gtsam::Matrix66 adj = L_Pose_B.AdjointMap();
         return adj * covariance_lidar * adj.transpose();
-    }
-
-    // zy Step 13_d
-    // Converts raw external covariance into a symmetric PSD matrix with bounded confidence.
-    bool conditionExternalPoseCovariance(
-        const Eigen::Matrix<double, 6, 6>& covariance_in,
-        Eigen::Matrix<double, 6, 6>* covariance_out) const
-    {
-        if (!covariance_out) {
-            return false;
-        }
-        if (!covariance_in.allFinite()) {
-            return false;
-        }
-
-        const Eigen::Matrix<double, 6, 6> sym_cov =
-            0.5 * (covariance_in + covariance_in.transpose());
-
-        Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 6, 6>> eig(sym_cov);
-        if (eig.info() != Eigen::Success || !eig.eigenvalues().allFinite()) {
-            return false;
-        }
-
-        Eigen::Matrix<double, 6, 1> clamped = eig.eigenvalues();
-        const double min_var = std::max(1e-12, external_prior_min_variance_);
-        const double max_var = std::max(min_var, external_prior_max_variance_);
-        for (int i = 0; i < 6; ++i) {
-            clamped(i) = std::min(max_var, std::max(min_var, clamped(i)));
-        }
-
-        *covariance_out =
-            eig.eigenvectors() * clamped.asDiagonal() * eig.eigenvectors().transpose();
-        *covariance_out = 0.5 * (*covariance_out + covariance_out->transpose());
-        return covariance_out->allFinite();
     }
 
     // zy Step 6_b
@@ -920,20 +655,22 @@ public:
         const std::string& source = "unknown",
         const uint64_t source_seq = 0)
     {
-        // zy Step 13_e
-        // Conditions incoming covariance once at ingress so downstream optimizer paths see valid noise.
-        Eigen::Matrix<double, 6, 6> conditioned_cov;
-        if (!conditionExternalPoseCovariance(covariance, &conditioned_cov)) {
-            ROS_WARN_STREAM("Dropped external prior: covariance conditioning failed.");
+        if (!covariance.allFinite()) {
+            ROS_WARN_STREAM("Dropped external prior: covariance has non-finite values.");
+            return false;
+        }
+
+        const Eigen::Matrix<double, 6, 6> sym_cov =
+            0.5 * (covariance + covariance.transpose());
+        if ((sym_cov.diagonal().array() <= 0.0).any()) {
+            ROS_WARN_STREAM("Dropped external prior: covariance diagonal must be positive.");
             return false;
         }
 
         ExternalPosePrior prior;
         prior.timestamp_kf_nsec_ = timestamp_kf_nsec;
         prior.W_Pose_L_ = W_Pose_L;
-        // zy Step 13_f
-        // Stores the validated covariance used later for both CBS beliefs and legacy priors.
-        prior.covariance_ = conditioned_cov;
+        prior.covariance_ = sym_cov;
         prior.source_ = source;
         prior.source_seq_ = source_seq;
 
@@ -1019,19 +756,45 @@ public:
                           msg->pose.pose.position.y,
                           msg->pose.pose.position.z));
 
-        // zy Step 19_b
-        // Routes ROS priors through the shared ingress function to avoid duplicated validation logic.
+        // zy Step 9_f
+        // Converts external message pose to LIORF lidar frame before queueing.
+        const gtsam::Pose3 W_Pose_L =
+            exchangePoseToLidarPose(W_Pose_exchange);
+        // zy Step 11_c
+        // Keeps covariance in the same frame as the converted pose before queueing.
+        const Eigen::Matrix<double, 6, 6> covariance_lidar =
+            exchangeCovarianceToLidarCovariance(covariance);
+
+
         const int64_t ts_nsec = toTimestampNsec(msg->header.stamp);
+        // zy Step 12_f
+        // Normalizes source tags and drops self/duplicate priors before they enter the queue.
+        const std::string source = normalizeExternalSourceTag(msg->child_frame_id);
         const uint64_t source_seq = static_cast<uint64_t>(msg->header.seq);
 
-        const bool queued = enqueueExternalPosePriorFromExchangeCovariance(
-            ts_nsec,
-            W_Pose_exchange,
-            covariance,
-            msg->child_frame_id,
-            source_seq,
-            msg->header.frame_id);
+        if (isSelfExternalSourceTag(source)) {
+            ROS_WARN_STREAM_THROTTLE(
+                2.0,
+                "Dropped external prior from self source tag: " << source);
+            return;
+        }
 
+        if (!shouldAcceptExternalSourceSeq(source, source_seq)) {
+            ROS_WARN_STREAM_THROTTLE(
+                2.0,
+                "Dropped replay/out-of-order external prior. source=" << source
+                << ", seq=" << source_seq);
+            return;
+        }
+
+        const bool queued = enqueueExternalPosePriorFromCovariance(
+            ts_nsec, W_Pose_L, covariance_lidar, source, source_seq);
+
+
+        // if (!queued) {
+        //     ROS_WARN_STREAM("Failed to queue external prior. ts_nsec="
+        //                     << ts_nsec << ", source=" << source
+        //                     << ", seq=" << source_seq); (zy cancelled it)
 
         // zy Step 22_b
         // Avoids duplicate warning spam because ingress helper already logs exact rejection reasons.
@@ -1041,6 +804,8 @@ public:
                 "External prior was not queued. ts_nsec=" << ts_nsec
                 << ", source=" << normalizeExternalSourceTag(msg->child_frame_id)
                 << ", seq=" << source_seq);
+}
+
         }
     }
 
@@ -1063,12 +828,7 @@ public:
         nav_msgs::Odometry msg;
         msg.header.stamp.fromNSec(
             static_cast<uint64_t>(belief.timestamp_kf_nsec_));
-        // zy Step 17_d
-        // Emits monotonic message sequence so receivers can detect replay/out-of-order deliveries.
-        msg.header.seq = external_pose_belief_seq_counter_++;
-        // zy Step 18_f
-        // Publishes beliefs in the configured exchange frame so receivers can enforce the same contract.
-        msg.header.frame_id = external_exchange_frame_id_;
+        msg.header.frame_id = odometryFrame;
         msg.child_frame_id = belief.source_;
 
         // zy Step 9_g
@@ -1135,20 +895,6 @@ public:
                 return;
             }
             incoming_priors.swap(external_pose_priors_queue_);
-        }
-
-        // zy Step 20_c
-        // Drops queued external priors in legacy mode when legacy fusion is disabled.
-        if (!usingCbs() && !allow_external_priors_in_legacy_mode_) {
-            const size_t dropped_legacy_disabled = incoming_priors.size();
-            if (dropped_legacy_disabled > 0) {
-                ROS_WARN_STREAM_THROTTLE(
-                    2.0,
-                    "Dropped " << dropped_legacy_disabled
-                    << " external priors because legacy fusion is disabled "
-                    << "(liorf/allow_external_priors_in_legacy_mode=false).");
-            }
-            return;
         }
 
         const int64_t current_ts_nsec = toTimestampNsec(timeLaserInfoStamp);
