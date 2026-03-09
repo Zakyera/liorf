@@ -204,6 +204,9 @@ public:
     // zy Step 9_a
     // Controls whether external exchange uses IMU/body frame (true) or lidar frame (false).
     bool external_exchange_in_body_frame_ = false;
+    // zy Step 24_a
+    // Handles datasets where extrinsicRot convention is opposite; false uses extRot as-is, true uses extRot^T.
+    bool external_exchange_use_ext_rot_inverse_ = false;
     // zy Step 12_b
     // Tracks last seen sequence per source to drop replayed/out-of-order external priors.
     mutable std::mutex external_source_seq_mutex_;
@@ -322,6 +325,11 @@ public:
         // Keeps old behavior by default, while allowing body-frame exchange when wiring with Kimera.
         nh.param<bool>("liorf/external_exchange_in_body_frame",
                        external_exchange_in_body_frame_,
+                       false);
+        // zy Step 24_b
+        // Makes lidar<->body rotation convention explicit for bridge conversion without recompiling.
+        nh.param<bool>("liorf/external_exchange_use_ext_rot_inverse",
+                       external_exchange_use_ext_rot_inverse_,
                        false);
 
 
@@ -536,12 +544,27 @@ public:
         return true;
     }
 
-    // zy Step 9_c
-    // Uses LIORF's existing translation-only lidar<->body extrinsic convention for exchange conversion.
+    // zy Step 24_c
+    // Uses full lidar<->body rigid extrinsic (rotation + translation) for exchange-frame conversions.
     gtsam::Pose3 lidarToBodyExtrinsic() const
     {
+        Eigen::Matrix3d R_L_B = extRot;
+        if (external_exchange_use_ext_rot_inverse_) {
+            R_L_B = R_L_B.transpose();
+        }
+
+        Eigen::Quaterniond q_l_b(R_L_B);
+        if (q_l_b.norm() < 1e-9) {
+            ROS_WARN_STREAM_THROTTLE(
+                5.0,
+                "Invalid external exchange rotation from extrinsicRot; using identity rotation.");
+            q_l_b = Eigen::Quaterniond::Identity();
+        } else {
+            q_l_b.normalize();
+        }
+
         return gtsam::Pose3(
-            gtsam::Rot3(1, 0, 0, 0),
+            gtsam::Rot3::Quaternion(q_l_b.w(), q_l_b.x(), q_l_b.y(), q_l_b.z()),
             gtsam::Point3(extTrans.x(), extTrans.y(), extTrans.z()));
     }
 
