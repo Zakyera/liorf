@@ -34,6 +34,7 @@
 // Adds source-tag normalization helpers for robust external-prior routing.
 #include <algorithm>
 #include <cctype>
+#include <exception>
 // zy Step 13_a
 // Enables eigenvalue-based covariance conditioning for robust external prior ingestion.
 #include <Eigen/Eigenvalues>
@@ -114,6 +115,11 @@ public:
     // zy Step 1_d
     // runtime switch lets us compare legacy ISAM2 and CBS on the same node.
     bool use_cbs_optimizer_ = false;
+    // CBS belief contraction knobs (pose-sharing stage), aligned with CBS
+    // offline example defaults.
+    double cbs_contract_alpha_ = 0.5;
+    double cbs_d_reset_ = 0.6;
+    double cbs_gamma_ = 0.1;
 
 #ifdef LIORF_USE_CBS
     // zy Step 1_e
@@ -292,6 +298,9 @@ public:
         // zy Step 1_f
         // runtime ROS param controls whether this node should attempt CBS mode.
         nh.param<bool>("liorf/use_cbs_optimizer", use_cbs_optimizer_, false);
+        nh.param<double>("liorf/cbs_contract_alpha", cbs_contract_alpha_, 0.5);
+        nh.param<double>("liorf/cbs_d_reset", cbs_d_reset_, 0.6);
+        nh.param<double>("liorf/cbs_gamma", cbs_gamma_, 0.1);
 
         // zy Step 7_c
         // Loads bridge-facing topics and default source tag for incoming external priors.
@@ -340,8 +349,21 @@ public:
             cbs_params.sam_params_ = parameters;
             cbs_params.enable_gkcm = false;
             cbs_params.robot_id = static_cast<cbs::AgentId>('b');  // LIORF agent id.
+            cbs_params.gbp_update_params.type = gbp::GaussianMergeType::Contract;
+            cbs_params.gbp_update_params.metric_type = gbp::MetricType::Hellinger;
+            cbs_params.gbp_update_params.contract_alpha =
+                static_cast<float>(cbs_contract_alpha_);
+            cbs_params.gbp_update_params.d_reset =
+                static_cast<float>(cbs_d_reset_);
+            cbs_params.gbp_update_params.gamma =
+                static_cast<float>(cbs_gamma_);
             cbs_optimizer_ = std::make_shared<cbs::BPSAM>(cbs_params);
             ROS_INFO_STREAM("LIORF CBS BPSAM initialized. use_cbs_optimizer=true");
+            ROS_INFO_STREAM("LIORF CBS belief contraction params: type=Contract"
+                            << ", metric=Hellinger"
+                            << ", alpha=" << cbs_contract_alpha_
+                            << ", d_reset=" << cbs_d_reset_
+                            << ", gamma=" << cbs_gamma_);
         }
 #else
         if (use_cbs_optimizer_) {
@@ -423,6 +445,47 @@ public:
         if (usingCbs()) {
 #ifdef LIORF_USE_CBS
             return cbs_optimizer_->marginalCovariance(key);
+#endif
+        }
+        return isam->marginalCovariance(key);
+    }
+
+    // Pose-belief covariance should follow CBS local marginalization:
+    // exclude incoming belief factors before publishing beliefs.
+    gtsam::Matrix activePoseBeliefMarginalCovariance(const gtsam::Key& key) const
+    {
+        if (usingCbs()) {
+#ifdef LIORF_USE_CBS
+            if (!cbs_optimizer_) {
+                return isam->marginalCovariance(key);
+            }
+
+            bool local_marginals_active = false;
+            try {
+                cbs_optimizer_->setMarginalizationGraph(
+                    cbs::BPSAM::MarginalizationType::LOCAL);
+                local_marginals_active = true;
+
+                const gtsam::Matrix cov = cbs_optimizer_->marginalCovariance(key);
+
+                if (local_marginals_active) {
+                    cbs_optimizer_->setMarginalizationGraph(
+                        cbs::BPSAM::MarginalizationType::FULL);
+                }
+                return cov;
+            } catch (...) {
+                if (local_marginals_active) {
+                    try {
+                        cbs_optimizer_->setMarginalizationGraph(
+                            cbs::BPSAM::MarginalizationType::FULL);
+                    } catch (...) {
+                    }
+                }
+                ROS_WARN_STREAM_THROTTLE(
+                    2.0,
+                    "Failed LOCAL belief marginalization; falling back to active CBS covariance.");
+                return cbs_optimizer_->marginalCovariance(key);
+            }
 #endif
         }
         return isam->marginalCovariance(key);
@@ -733,7 +796,7 @@ public:
             return false;
         }
 
-        const gtsam::Matrix cov = activePoseMarginalCovariance(pose_key);
+        const gtsam::Matrix cov = activePoseBeliefMarginalCovariance(pose_key);
         if (cov.rows() < 6 || cov.cols() < 6) {
             return false;
         }
@@ -827,8 +890,6 @@ public:
                 "External prior was not queued. ts_nsec=" << ts_nsec
                 << ", source=" << normalizeExternalSourceTag(msg->child_frame_id)
                 << ", seq=" << source_seq);
-}
-
         }
     }
 
@@ -2549,13 +2610,27 @@ public:
         const gtsam::Key last_saved_pose_key =
             poseKeyFromIndex(cloudKeyPoses3D->size() - 1);
         poseCovariance = activePoseMarginalCovariance(last_saved_pose_key);
+        gtsam::Matrix beliefPoseCovariance = poseCovariance;
+        try {
+            beliefPoseCovariance =
+                activePoseBeliefMarginalCovariance(last_saved_pose_key);
+        } catch (const std::exception& e) {
+            ROS_WARN_STREAM_THROTTLE(
+                2.0,
+                "Failed to query LOCAL belief covariance, using active covariance fallback: "
+                    << e.what());
+        } catch (...) {
+            ROS_WARN_STREAM_THROTTLE(
+                2.0,
+                "Failed to query LOCAL belief covariance, using active covariance fallback.");
+        }
         // zy Step 5_j
         // Updates the outgoing LIORF belief snapshot (pose + covariance) for external fusion.
         updateLatestExternalPoseBelief(
             timeLaserInfoStamp,
             cloudKeyPoses3D->size() - 1,
             latestEstimate,
-            poseCovariance.block<6, 6>(0, 0));
+            beliefPoseCovariance.block<6, 6>(0, 0));
 
 
 
