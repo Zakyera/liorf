@@ -29,6 +29,9 @@
 // zy Step 6_a
 // Adds numeric helpers for nearest-timestamp matching and bounded comparisons.
 #include <cstdlib>
+//zy Step 41a0
+// Adds absolute-difference helper for CBS residual convergence checks.
+#include <cmath>
 #include <limits>
 // zy Step 12_a
 // Adds source-tag normalization helpers for robust external-prior routing.
@@ -120,6 +123,12 @@ public:
     double cbs_contract_alpha_ = 0.5;
     double cbs_d_reset_ = 0.6;
     double cbs_gamma_ = 0.1;
+    //zy Step 41a
+    // Adds runtime CBS pose-stage controls so LIORF follows iterative update rounds with convergence checks.
+    bool cbs_enable_gkcm_ = false;
+    int cbs_pose_rounds_per_epoch_ = 3;
+    double cbs_pose_convergence_abs_residual_ = 1e-3;
+    double cbs_pose_convergence_rel_residual_ = 1e-3;
 
 #ifdef LIORF_USE_CBS
     // zy Step 1_e
@@ -301,6 +310,17 @@ public:
         nh.param<double>("liorf/cbs_contract_alpha", cbs_contract_alpha_, 0.5);
         nh.param<double>("liorf/cbs_d_reset", cbs_d_reset_, 0.6);
         nh.param<double>("liorf/cbs_gamma", cbs_gamma_, 0.1);
+        //zy Step 41b
+        // Exposes CBS GkCM and pose-stage iteration controls via ROS params.
+        nh.param<bool>("liorf/cbs_enable_gkcm", cbs_enable_gkcm_, false);
+        nh.param<int>(
+            "liorf/cbs_pose_rounds_per_epoch", cbs_pose_rounds_per_epoch_, 3);
+        nh.param<double>("liorf/cbs_pose_convergence_abs_residual",
+                         cbs_pose_convergence_abs_residual_,
+                         1e-3);
+        nh.param<double>("liorf/cbs_pose_convergence_rel_residual",
+                         cbs_pose_convergence_rel_residual_,
+                         1e-3);
 
         // zy Step 7_c
         // Loads bridge-facing topics and default source tag for incoming external priors.
@@ -347,7 +367,9 @@ public:
         if (use_cbs_optimizer_) {
             cbs::BPSAM::Params cbs_params;
             cbs_params.sam_params_ = parameters;
-            cbs_params.enable_gkcm = false;
+            //zy Step 41c
+            // GkCM toggle is runtime-configurable to align with CBS reference behavior.
+            cbs_params.enable_gkcm = cbs_enable_gkcm_;
             cbs_params.robot_id = static_cast<cbs::AgentId>('b');  // LIORF agent id.
             cbs_params.gbp_update_params.type = gbp::GaussianMergeType::Contract;
             cbs_params.gbp_update_params.metric_type = gbp::MetricType::Hellinger;
@@ -364,6 +386,16 @@ public:
                             << ", alpha=" << cbs_contract_alpha_
                             << ", d_reset=" << cbs_d_reset_
                             << ", gamma=" << cbs_gamma_);
+            //zy Step 41d
+            // Logs pose-stage inner-round settings for reproducibility during CBS experiments.
+            ROS_INFO_STREAM("LIORF CBS pose-stage config: gkcm="
+                            << (cbs_enable_gkcm_ ? "true" : "false")
+                            << ", rounds_per_epoch="
+                            << std::max(1, cbs_pose_rounds_per_epoch_)
+                            << ", conv_abs="
+                            << std::max(0.0, cbs_pose_convergence_abs_residual_)
+                            << ", conv_rel="
+                            << std::max(0.0, cbs_pose_convergence_rel_residual_));
         }
 #else
         if (use_cbs_optimizer_) {
@@ -830,9 +862,14 @@ public:
 
         Eigen::Matrix<double, 6, 6> covariance =
             Eigen::Matrix<double, 6, 6>::Zero();
+        // zy Step 42a
+        // ROS odom covariance uses [tx ty tz rx ry rz], while GTSAM Pose3
+        // tangent space uses [rx ry rz tx ty tz]. Remap to internal order.
+        static const int ros_to_internal[6] = {3, 4, 5, 0, 1, 2};
         for (int r = 0; r < 6; ++r) {
             for (int c = 0; c < 6; ++c) {
-                covariance(r, c) = msg->pose.covariance[r * 6 + c];
+                covariance(r, c) =
+                    msg->pose.covariance[ros_to_internal[r] * 6 + ros_to_internal[c]];
             }
         }
 
@@ -935,9 +972,14 @@ public:
         const Eigen::Matrix<double, 6, 6> covariance_exchange =
             lidarCovarianceToExchangeCovariance(belief.covariance_);
 
+        // zy Step 42b
+        // Convert internal [rx ry rz tx ty tz] covariance to ROS odom layout
+        // [tx ty tz rx ry rz] before publishing.
+        static const int internal_to_ros[6] = {3, 4, 5, 0, 1, 2};
         for (int r = 0; r < 6; ++r) {
             for (int c = 0; c < 6; ++c) {
-                msg.pose.covariance[r * 6 + c] = covariance_exchange(r, c);
+                msg.pose.covariance[internal_to_ros[r] * 6 + internal_to_ros[c]] =
+                    covariance_exchange(r, c);
             }
         }
 
@@ -1153,9 +1195,57 @@ public:
         if (usingCbs()) {
 #ifdef LIORF_USE_CBS
             cbs::BPSAM::UpdateParams update_params;
+            //zy Step 41e
+            // Mirrors CBS pose-stage inner rounds: first update with new factors, then belief-only rounds until convergence.
+            const int max_pose_rounds = std::max(1, cbs_pose_rounds_per_epoch_);
+            const double abs_eps =
+                std::max(0.0, cbs_pose_convergence_abs_residual_);
+            const double rel_eps =
+                std::max(0.0, cbs_pose_convergence_rel_residual_);
+            auto compute_cbs_residual = [&](double* residual_out) -> bool {
+                try {
+                    const gtsam::Values estimate = cbs_optimizer_->calculateEstimate();
+                    *residual_out = cbs_optimizer_->getFactorsUnsafe().error(estimate);
+                    return true;
+                } catch (...) {
+                    return false;
+                }
+            };
             cbs_optimizer_->update(factors, values, update_params);
 
+            double prev_residual = 0.0;
+            bool has_prev_residual = compute_cbs_residual(&prev_residual);
+            for (int round = 1; round < max_pose_rounds; ++round) {
+                cbs_optimizer_->update(gtsam::NonlinearFactorGraph(),
+                                       gtsam::Values(),
+                                       update_params);
+
+                double curr_residual = 0.0;
+                const bool has_curr_residual = compute_cbs_residual(&curr_residual);
+                if (has_prev_residual && has_curr_residual) {
+                    const double abs_change = std::fabs(curr_residual - prev_residual);
+                    const double rel_change =
+                        abs_change / std::max(std::fabs(prev_residual), 1e-12);
+                    if (abs_change <= abs_eps || rel_change <= rel_eps) {
+                        ROS_INFO_STREAM_THROTTLE(
+                            2.0,
+                            "LIORF CBS pose rounds converged early at round "
+                                << (round + 1) << "/" << max_pose_rounds
+                                << " (abs=" << abs_change
+                                << ", rel=" << rel_change << ")");
+                        break;
+                    }
+                }
+
+                if (has_curr_residual) {
+                    prev_residual = curr_residual;
+                    has_prev_residual = true;
+                }
+            }
+
             if (run_extra_updates) {
+                //zy Step 41f
+                // Preserves loop-closure extra refinement passes after pose-stage rounds.
                 for (int i = 0; i < 5; ++i) {
                     cbs_optimizer_->update(gtsam::NonlinearFactorGraph(),
                                            gtsam::Values(),
