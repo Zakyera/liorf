@@ -1,0 +1,22 @@
+<launch>
+
+    <arg name="project" default="liorf"/>
+    <arg name="use_cbs_optimizer" default="false"/>
+    <arg name="loop_closure" default="false"/>
+    <arg name="use_imu_heading_init" default="false"/>
+    <arg name="imu_use_ext_rot_inverse" default="false"/>
+
+    <!-- zy GEODE beta tuned LIORF parameters -->
+    <rosparam file="$(find liorf)/config/lio_sam_geode_beta.yaml" command="load" />
+    <!-- Explicit runtime overrides keep common experiment toggles reproducible. -->
+    <param name="/liorf/use_cbs_optimizer" value="$(arg use_cbs_optimizer)" />
+    <param name="/liorf/loopClosureEnableFlag" value="$(arg loop_closure)" />
+    <param name="/liorf/useImuHeadingInitialization" value="$(arg use_imu_heading_init)" />
+    <param name="/liorf/imuUseExtRotInverse" value="$(arg imu_use_ext_rot_inverse)" />
+
+    <!--- LOAM -->
+    <include file="$(find liorf)/launch/include/module_loam.launch" />
+
+    <!-- zy Intentionally no RViz include to keep RAM usage low -->
+
+</launch>

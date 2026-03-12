@@ -1,0 +1,12 @@
+<launch>
+
+    <arg name="project" default="liorf"/>
+
+    <!-- zy GEODE beta using /ouster/imu as LIORF IMU source -->
+    <rosparam file="$(find liorf)/config/lio_sam_geode_ousterimu.yaml" command="load" />
+
+    <include file="$(find liorf)/launch/include/module_loam.launch" />
+
+    <!-- zy No RViz -->
+
+</launch>

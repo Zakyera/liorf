@@ -534,6 +534,25 @@ public:
         }
         return isamCurrentEstimate.exists(key);
     }
+
+    // Keep timestamp->pose-index lookup aligned with active optimizer values.
+    // This avoids matching incoming priors to keys that no longer exist.
+    size_t pruneTimestampPoseIndexMapToActiveValues()
+    {
+        size_t pruned = 0;
+        std::lock_guard<std::mutex> lock(timestamp_to_pose_idx_map_mutex_);
+        for (auto it = timestamp_to_pose_idx_map_.begin();
+             it != timestamp_to_pose_idx_map_.end();) {
+            const gtsam::Key pose_key = poseKeyFromIndex(it->second);
+            if (activeValueExists(pose_key)) {
+                ++it;
+            } else {
+                it = timestamp_to_pose_idx_map_.erase(it);
+                ++pruned;
+            }
+        }
+        return pruned;
+    }
     
     // zy Step 4_a
     // Aligns LIORF pose keys with Kimera/CBS (`x(index)`) so exchanged beliefs hit the same variable IDs.
@@ -1014,6 +1033,7 @@ public:
     // Applies time-window and per-cycle budget guards so external fusion remains real-time and stable.
     void injectQueuedExternalPosePriors()
     {
+        const size_t pruned_timestamp_entries = pruneTimestampPoseIndexMapToActiveValues();
         std::deque<ExternalPosePrior> incoming_priors;
         {
             std::lock_guard<std::mutex> lock(external_pose_priors_queue_mutex_);
@@ -1043,6 +1063,7 @@ public:
         size_t dropped_bad_noise = 0;
         size_t dropped_self_source = 0;
         size_t dropped_unknown_source = 0;
+        size_t dropped_missing_key = 0;
         size_t deferred_budget = 0;
 
 #ifdef LIORF_USE_CBS
@@ -1099,6 +1120,10 @@ public:
             }
 
             const gtsam::Key pose_key = poseKeyFromIndex(matched_pose_idx);
+            if (!activeValueExists(pose_key)) {
+                ++dropped_missing_key;
+                continue;
+            }
 
 #ifdef LIORF_USE_CBS
             if (usingCbs()) {
@@ -1173,14 +1198,17 @@ public:
 
         ROS_INFO_STREAM_COND(
             (injected + deferred + dropped_old + dropped_bad_noise +
-             dropped_self_source + dropped_unknown_source + deferred_budget) > 0,
+             dropped_self_source + dropped_unknown_source + dropped_missing_key +
+             deferred_budget + pruned_timestamp_entries) > 0,
             "External prior stats: injected=" << injected
             << ", deferred=" << deferred
             << ", dropped_old=" << dropped_old
             << ", dropped_bad_noise=" << dropped_bad_noise
             << ", dropped_self_source=" << dropped_self_source
             << ", dropped_unknown_source=" << dropped_unknown_source
+            << ", dropped_missing_key=" << dropped_missing_key
             << ", deferred_budget=" << deferred_budget
+            << ", pruned_ts_index=" << pruned_timestamp_entries
             << ", queue_size_now=" << queue_size_now
             << ", per_optimize_budget=" << max_external_priors_per_optimize_);
     }
@@ -2661,6 +2689,13 @@ public:
         isamCurrentEstimate = optimizerCurrentEstimate; // keep legacy variable updated for unchanged code paths.
         const size_t latest_pose_idx = cloudKeyPoses3D->size();
         const gtsam::Key latest_pose_key = poseKeyFromIndex(latest_pose_idx);
+        if (!optimizerCurrentEstimate.exists(latest_pose_key)) {
+            ROS_WARN_STREAM_THROTTLE(
+                1.0,
+                "Skipping keyframe commit: missing optimized pose key " << latest_pose_key
+                << " (idx=" << latest_pose_idx << ").");
+            return;
+        }
         latestEstimate = optimizerCurrentEstimate.at<Pose3>(latest_pose_key);
 
 
@@ -2687,10 +2722,6 @@ public:
         const size_t new_pose_idx = cloudKeyPoses3D->size() - 1;
         rememberPoseIndexForTimestamp(timeLaserInfoStamp, new_pose_idx);
 
-        // zy Step 7_g
-        // Emits one fresh LIORF belief per committed keyframe for external fusion consumers.
-        publishLatestExternalPoseBelief();
-
         // cout << "****************************************************" << endl;
         // cout << "Pose covariance:" << endl;
         // cout << isam->marginalCovariance(isamCurrentEstimate.size()-1) << endl << endl;
@@ -2699,28 +2730,42 @@ public:
         // Queries covariance of the latest saved pose using the shared symbolic key.
         const gtsam::Key last_saved_pose_key =
             poseKeyFromIndex(cloudKeyPoses3D->size() - 1);
-        poseCovariance = activePoseMarginalCovariance(last_saved_pose_key);
+        if (activeValueExists(last_saved_pose_key)) {
+            poseCovariance = activePoseMarginalCovariance(last_saved_pose_key);
+        } else {
+            ROS_WARN_STREAM_THROTTLE(
+                1.0,
+                "Missing latest saved pose key when querying covariance: "
+                    << last_saved_pose_key << ". Using identity covariance.");
+            poseCovariance = gtsam::Matrix66::Identity();
+        }
         gtsam::Matrix beliefPoseCovariance = poseCovariance;
-        try {
-            beliefPoseCovariance =
-                activePoseBeliefMarginalCovariance(last_saved_pose_key);
-        } catch (const std::exception& e) {
-            ROS_WARN_STREAM_THROTTLE(
-                2.0,
-                "Failed to query LOCAL belief covariance, using active covariance fallback: "
-                    << e.what());
-        } catch (...) {
-            ROS_WARN_STREAM_THROTTLE(
-                2.0,
-                "Failed to query LOCAL belief covariance, using active covariance fallback.");
+        if (activeValueExists(last_saved_pose_key)) {
+            try {
+                beliefPoseCovariance =
+                    activePoseBeliefMarginalCovariance(last_saved_pose_key);
+            } catch (const std::exception& e) {
+                ROS_WARN_STREAM_THROTTLE(
+                    2.0,
+                    "Failed to query LOCAL belief covariance, using active covariance fallback: "
+                        << e.what());
+            } catch (...) {
+                ROS_WARN_STREAM_THROTTLE(
+                    2.0,
+                    "Failed to query LOCAL belief covariance, using active covariance fallback.");
+            }
         }
         // zy Step 5_j
         // Updates the outgoing LIORF belief snapshot (pose + covariance) for external fusion.
         updateLatestExternalPoseBelief(
             timeLaserInfoStamp,
-            cloudKeyPoses3D->size() - 1,
+            new_pose_idx,
             latestEstimate,
             beliefPoseCovariance.block<6, 6>(0, 0));
+
+        // zy Step 7_g
+        // Publish after updating cache so external consumers receive the current keyframe belief.
+        publishLatestExternalPoseBelief();
 
 
 
@@ -2784,7 +2829,9 @@ public:
             // int numPoses = isamCurrentEstimate.size(); (zy cancelled it)
             // zy Step 2_i
             // Use the active estimate container as the single source for pose correction after loop/CBS updates.
-            int numPoses = optimizerCurrentEstimate.size();
+            const int numPoses = std::min<int>(
+                static_cast<int>(cloudKeyPoses3D->points.size()),
+                static_cast<int>(cloudKeyPoses6D->points.size()));
 
             // for (int i = 0; i < numPoses; ++i)
             // {   
@@ -2809,6 +2856,13 @@ public:
                 // Applies loop-corrected poses by symbolic key so map backfill matches optimizer key IDs.
                 const gtsam::Key pose_key =
                     poseKeyFromIndex(static_cast<size_t>(i));
+                if (!optimizerCurrentEstimate.exists(pose_key)) {
+                    ROS_WARN_STREAM_THROTTLE(
+                        1.0,
+                        "Skipping corrected pose update: missing key " << pose_key
+                        << " at index " << i << ".");
+                    continue;
+                }
                 const gtsam::Pose3 pose_i =
                     optimizerCurrentEstimate.at<Pose3>(pose_key);
 

@@ -1,0 +1,12 @@
+<launch>
+
+    <arg name="project" default="liorf"/>
+
+    <!-- zy GEODE beta with inverse extrinsicRot convention test -->
+    <rosparam file="$(find liorf)/config/lio_sam_geode_beta_rotinv.yaml" command="load" />
+
+    <include file="$(find liorf)/launch/include/module_loam.launch" />
+
+    <!-- zy No RViz to reduce RAM usage -->
+
+</launch>

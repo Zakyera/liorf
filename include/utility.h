@@ -120,6 +120,8 @@ public:
     Eigen::Matrix3d extRPY;
     Eigen::Vector3d extTrans;
     Eigen::Quaterniond extQRPY;
+    //zy Runtime switch to test IMU->LiDAR rotation convention without editing calibration matrix.
+    bool imuUseExtRotInverse;
 
     // voxel filter paprams
     float mappingSurfLeafSize ;
@@ -223,6 +225,8 @@ public:
         extRPY = Eigen::Map<const Eigen::Matrix<double, -1, -1, Eigen::RowMajor>>(extRPYV.data(), 3, 3);
         extTrans = Eigen::Map<const Eigen::Matrix<double, -1, -1, Eigen::RowMajor>>(extTransV.data(), 3, 1);
         extQRPY = Eigen::Quaterniond(extRPY).inverse();
+        //zy If true, imuConverter uses extRot^T for rotating raw IMU vectors.
+        nh.param<bool>("liorf/imuUseExtRotInverse", imuUseExtRotInverse, false);
 
         nh.param<float>("liorf/mappingSurfLeafSize", mappingSurfLeafSize, 0.2);
         nh.param<float>("liorf/surroundingKeyframeMapLeafSize", surroundingKeyframeMapLeafSize, 0.2);
@@ -257,15 +261,17 @@ public:
     sensor_msgs::Imu imuConverter(const sensor_msgs::Imu& imu_in)
     {
         sensor_msgs::Imu imu_out = imu_in;
+        //zy Choose rotation convention at runtime for fast A/B checks on dataset-specific calibrations.
+        const Eigen::Matrix3d imuRot = imuUseExtRotInverse ? extRot.transpose() : extRot;
         // rotate acceleration
         Eigen::Vector3d acc(imu_in.linear_acceleration.x, imu_in.linear_acceleration.y, imu_in.linear_acceleration.z);
-        acc = extRot * acc;
+        acc = imuRot * acc;
         imu_out.linear_acceleration.x = acc.x();
         imu_out.linear_acceleration.y = acc.y();
         imu_out.linear_acceleration.z = acc.z();
         // rotate gyroscope
         Eigen::Vector3d gyr(imu_in.angular_velocity.x, imu_in.angular_velocity.y, imu_in.angular_velocity.z);
-        gyr = extRot * gyr;
+        gyr = imuRot * gyr;
         imu_out.angular_velocity.x = gyr.x();
         imu_out.angular_velocity.y = gyr.y();
         imu_out.angular_velocity.z = gyr.z();
