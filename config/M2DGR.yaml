@@ -1,8 +1,8 @@
 liorf:
 
   # Topics
-  pointCloudTopic: "velodyne_points"               # Point cloud data
-  imuTopic: "handsfree/imu"                         # IMU data
+  pointCloudTopic: "/velodyne_points"               # Point cloud data
+  imuTopic: "/handsfree/imu"                        # IMU data
   odomTopic: "odometry/imu"                   # IMU pre-preintegration odometry, same frequency as IMU
   gpsTopic: "gps/fixz"                   # GPS odometry topic from navsat, see module_navsat.launch file
 
@@ -33,7 +33,7 @@ liorf:
 
   # IMU Settings
   imuType: 0                                  # 0: 6-axis  1: 9-axis
-  imuRate: 100.0
+  imuRate: 144.0                              # /handsfree/imu in hall_02.bag is ~13661 msgs / 95s ~= 144 Hz
   imuAccNoise: 3.7686306102624571e-02
   imuGyrNoise: 2.3417543020438883e-03
   imuAccBiasN: 1.1416642385952368e-03

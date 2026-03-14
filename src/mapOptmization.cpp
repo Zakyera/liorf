@@ -664,7 +664,8 @@ public:
     {
         Eigen::Matrix3d R_L_B = extRot;
         if (external_exchange_use_ext_rot_inverse_) {
-            R_L_B = R_L_B.transpose();
+            // Avoid Eigen self-alias assertion from R = R.transpose().
+            R_L_B.transposeInPlace();
         }
 
         Eigen::Quaterniond q_l_b(R_L_B);

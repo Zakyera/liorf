@@ -12,6 +12,9 @@ liorf:
   baselinkFrame: "base_link"
   odometryFrame: "odom"
   mapFrame: "map"
+  # External pose exchange with Kimera should be in IMU/body frame, using inverse extRot convention.
+  external_exchange_in_body_frame: true
+  external_exchange_use_ext_rot_inverse: true
 
   # GPS Settings
   useImuHeadingInitialization: false          # GEODE baseline: keep heading init off for fair CBS OFF/ON comparisons.
