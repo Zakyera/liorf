@@ -334,7 +334,15 @@ public:
                               external_prior_default_source_,
                               "kimera");
         // zy Step 10_b
-        // Makes prior-aging/budget limits configurable from launch without code edits.
+        // Makes prior matching/aging/budget limits configurable from launch without code edits.
+        double external_prior_timestamp_tolerance_sec =
+            static_cast<double>(external_prior_timestamp_tolerance_ns_) * 1e-9;
+        nh.param<double>("liorf/external_prior_timestamp_tolerance_sec",
+                         external_prior_timestamp_tolerance_sec,
+                         external_prior_timestamp_tolerance_sec);
+        external_prior_timestamp_tolerance_ns_ = static_cast<int64_t>(
+            std::max(0.0, external_prior_timestamp_tolerance_sec) * 1e9);
+
         nh.param<double>("liorf/max_external_prior_age_sec",
                          max_external_prior_age_sec_,
                          2.0);
@@ -349,6 +357,13 @@ public:
                       200);
         max_external_priors_per_optimize_ =
             static_cast<size_t>(std::max(1, max_external_priors_per_optimize_tmp));
+        ROS_INFO_STREAM("LIORF external prior config: tolerance_ns="
+                        << external_prior_timestamp_tolerance_ns_
+                        << ", max_age_sec=" << max_external_prior_age_sec_
+                        << ", max_future_lead_sec="
+                        << max_external_prior_future_lead_sec_
+                        << ", max_per_optimize="
+                        << max_external_priors_per_optimize_);
         
         // zy Step 9_b
         // Keeps old behavior by default, while allowing body-frame exchange when wiring with Kimera.

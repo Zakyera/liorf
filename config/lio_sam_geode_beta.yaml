@@ -15,6 +15,11 @@ liorf:
   # External pose exchange with Kimera should be in IMU/body frame, using inverse extRot convention.
   external_exchange_in_body_frame: true
   external_exchange_use_ext_rot_inverse: true
+  # zy CBS bridge strict-safe profile for LIORF (keeps Kimera->LIORF priors very tightly matched).
+  external_prior_timestamp_tolerance_sec: 0.002
+  max_external_prior_age_sec: 2.0
+  max_external_prior_future_lead_sec: 0.05
+  max_external_priors_per_optimize: 200
 
   # GPS Settings
   useImuHeadingInitialization: false          # GEODE baseline: keep heading init off for fair CBS OFF/ON comparisons.
