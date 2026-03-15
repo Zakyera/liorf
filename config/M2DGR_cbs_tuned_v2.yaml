@@ -15,12 +15,13 @@ liorf:
   external_pose_belief_topic: "/liorf/cbs/external_pose_belief"
   external_pose_prior_topic: "/liorf/cbs/external_pose_prior"
   external_prior_default_source: "kimera"
-  # Conservative external-prior gating defaults for first M2DGR runs.
-  external_exchange_in_body_frame: false
+  # zy CBS tuned v2 profile:
+  # exchange in body frame to align with Kimera W_Pose_B convention.
+  external_exchange_in_body_frame: true
   external_exchange_use_ext_rot_inverse: false
-  external_prior_timestamp_tolerance_sec: 0.002
-  max_external_prior_age_sec: 2.0
-  max_external_prior_future_lead_sec: 0.05
+  external_prior_timestamp_tolerance_sec: 0.05
+  max_external_prior_age_sec: 3.0
+  max_external_prior_future_lead_sec: 0.20
   max_external_priors_per_optimize: 200
 
   # GPS Settings

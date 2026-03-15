@@ -1,0 +1,16 @@
+<launch>
+
+    <arg name="project" default="liorf"/>
+    <arg name="use_rviz" default="false"/>
+
+    <!-- Bridge-specific M2DGR config:
+         uses /camera/imu and camera-aligned exchange frame for Kimera fusion. -->
+    <rosparam file="$(find liorf)/config/M2DGR_kimera_bridge.yaml" command="load" />
+
+    <!--- LOAM -->
+    <include file="$(find liorf)/launch/include/module_loam.launch" />
+
+    <!--- Run Rviz-->
+    <include file="$(find liorf)/launch/include/module_rviz.launch" if="$(arg use_rviz)"/>
+
+</launch>

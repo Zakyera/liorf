@@ -1,0 +1,15 @@
+<launch>
+
+    <arg name="project" default="liorf"/>
+    <arg name="use_rviz" default="false"/>
+
+    <!-- CBS tuned v2 M2DGR config for Kimera<->LIORF bridge experiments. -->
+    <rosparam file="$(find liorf)/config/M2DGR_cbs_tuned_v2.yaml" command="load" />
+
+    <!--- LOAM -->
+    <include file="$(find liorf)/launch/include/module_loam.launch" />
+
+    <!--- Run Rviz-->
+    <include file="$(find liorf)/launch/include/module_rviz.launch" if="$(arg use_rviz)"/>
+
+</launch>

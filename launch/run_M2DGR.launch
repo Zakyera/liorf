@@ -1,6 +1,7 @@
 <launch>
 
     <arg name="project" default="liorf"/>
+    <arg name="use_rviz" default="false"/>
     
     <!-- Parameters -->
     <rosparam file="$(find liorf)/config/M2DGR.yaml" command="load" />
@@ -15,6 +16,6 @@
     <!-- <include file="$(find liorf)/launch/include/module_navsat.launch" /> -->
 
     <!--- Run Rviz-->
-    <include file="$(find liorf)/launch/include/module_rviz.launch" />
+    <include file="$(find liorf)/launch/include/module_rviz.launch" if="$(arg use_rviz)"/>
 
 </launch>

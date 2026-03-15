@@ -443,16 +443,22 @@ public:
         pubSLAMInfo           = nh.advertise<liorf::cloud_info>("liorf/mapping/slam_info", 1);
         pubGpsOdom            = nh.advertise<nav_msgs::Odometry> ("liorf/mapping/gps_odom", 1);
 
-        // zy Step 7_d
-        // Publishes LIORF beliefs and receives external priors over ROS for cross-estimator fusion.
-        pubExternalPoseBelief_ =
-            nh.advertise<nav_msgs::Odometry>(external_pose_belief_topic_, 10);
-        subExternalPosePrior_ = nh.subscribe<nav_msgs::Odometry>(
-            external_pose_prior_topic_,
-            200,
-            &mapOptimization::externalPosePriorHandler,
-            this,
-            ros::TransportHints().tcpNoDelay());
+        // Strict two-mode behavior:
+        // CBS ON  -> wire external belief exchange.
+        // CBS OFF -> no external exchange topics.
+        if (usingCbs()) {
+            pubExternalPoseBelief_ =
+                nh.advertise<nav_msgs::Odometry>(external_pose_belief_topic_, 10);
+            subExternalPosePrior_ = nh.subscribe<nav_msgs::Odometry>(
+                external_pose_prior_topic_,
+                200,
+                &mapOptimization::externalPosePriorHandler,
+                this,
+                ros::TransportHints().tcpNoDelay());
+        } else {
+            ROS_INFO_STREAM(
+                "LIORF external belief exchange disabled because CBS heart is OFF.");
+        }
 
 
         downSizeFilterSurf.setLeafSize(mappingSurfLeafSize, mappingSurfLeafSize, mappingSurfLeafSize);
@@ -883,6 +889,9 @@ public:
     // Converts inbound ROS prior messages into LIORF external-prior queue entries.
     void externalPosePriorHandler(const nav_msgs::OdometryConstPtr& msg)
     {
+        if (!usingCbs()) {
+            return;
+        }
         if (!msg) {
             return;
         }
@@ -969,6 +978,9 @@ public:
     // Publishes latest LIORF belief as ROS odometry so bridge nodes can forward it to Kimera.
     void publishLatestExternalPoseBelief()
     {
+        if (!usingCbs()) {
+            return;
+        }
         if (pubExternalPoseBelief_.getNumSubscribers() == 0) {
             return;
         }
@@ -1049,6 +1061,12 @@ public:
     // Applies time-window and per-cycle budget guards so external fusion remains real-time and stable.
     void injectQueuedExternalPosePriors()
     {
+        if (!usingCbs()) {
+            std::lock_guard<std::mutex> lock(external_pose_priors_queue_mutex_);
+            external_pose_priors_queue_.clear();
+            return;
+        }
+
         const size_t pruned_timestamp_entries = pruneTimestampPoseIndexMapToActiveValues();
         std::deque<ExternalPosePrior> incoming_priors;
         {
