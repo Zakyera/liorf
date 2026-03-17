@@ -1,0 +1,17 @@
+<launch>
+
+    <!-- Locked Offroad7 profile (CBS OFF) to avoid cross-dataset leakage. -->
+    <rosparam file="$(find liorf)/config/lio_sam_geode_beta.yaml" command="load" />
+
+    <param name="/liorf/use_cbs_optimizer" value="false" />
+    <param name="/liorf/loopClosureEnableFlag" value="false" />
+    <param name="/liorf/useImuHeadingInitialization" value="false" />
+    <param name="/liorf/imuUseExtRotInverse" value="false" />
+
+    <param name="/liorf/downsampleRate" value="1" />
+    <param name="/liorf/point_filter_num" value="1" />
+    <param name="/liorf/lidarMinRange" value="1.0" />
+
+    <include file="$(find liorf)/launch/include/module_loam.launch" />
+
+</launch>
