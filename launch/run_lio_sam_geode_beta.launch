@@ -5,6 +5,10 @@
     <arg name="loop_closure" default="false"/>
     <arg name="use_imu_heading_init" default="false"/>
     <arg name="imu_use_ext_rot_inverse" default="false"/>
+    <arg name="lidar_min_range" default="1.0"/>
+    <arg name="downsample_rate" default="1"/>
+    <arg name="point_filter_num" default="1"/>
+    <arg name="surrounding_keyframe_search_radius" default="50.0"/>
 
     <!-- zy GEODE beta tuned LIORF parameters -->
     <rosparam file="$(find liorf)/config/lio_sam_geode_beta.yaml" command="load" />
@@ -13,6 +17,11 @@
     <param name="/liorf/loopClosureEnableFlag" value="$(arg loop_closure)" />
     <param name="/liorf/useImuHeadingInitialization" value="$(arg use_imu_heading_init)" />
     <param name="/liorf/imuUseExtRotInverse" value="$(arg imu_use_ext_rot_inverse)" />
+    <!-- zy Allow deterministic A/B tests without editing YAML. -->
+    <param name="/liorf/lidarMinRange" value="$(arg lidar_min_range)" />
+    <param name="/liorf/downsampleRate" value="$(arg downsample_rate)" />
+    <param name="/liorf/point_filter_num" value="$(arg point_filter_num)" />
+    <param name="/liorf/surroundingKeyframeSearchRadius" value="$(arg surrounding_keyframe_search_radius)" />
 
     <!--- LOAM -->
     <include file="$(find liorf)/launch/include/module_loam.launch" />
