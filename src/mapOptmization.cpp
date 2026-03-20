@@ -1091,7 +1091,10 @@ public:
             }
         }
 
-        size_t injected = 0;
+        // Count priors that pass local gating/matching (staged) separately from
+        // priors actually accepted by the active optimizer.
+        size_t staged = 0;
+        size_t accepted = 0;
         size_t deferred = 0;
         size_t dropped_old = 0;
         size_t dropped_bad_noise = 0;
@@ -1130,7 +1133,7 @@ public:
                 continue;
             }
 
-            if (injected >= max_external_priors_per_optimize_) {
+            if (staged >= max_external_priors_per_optimize_) {
                 deferred_priors.push_back(prior);
                 ++deferred_budget;
                 continue;
@@ -1184,7 +1187,7 @@ public:
 
                 cbs_incoming_beliefs[pose_key].emplace_back(sender_id, belief);
                 ++num_external_beliefs_staged;
-                ++injected;
+                ++staged;
                 continue;
             }
 #endif
@@ -1198,7 +1201,8 @@ public:
                 gtsam::noiseModel::Gaussian::Covariance(prior.covariance_);
             gtSAMgraph.add(gtsam::PriorFactor<gtsam::Pose3>(
                 pose_key, prior.W_Pose_L_, prior_noise));
-            ++injected;
+            ++staged;
+            ++accepted;
         }
 
         size_t queue_size_now = 0;
@@ -1218,23 +1222,32 @@ public:
         if (usingCbs() && !cbs_incoming_beliefs.empty()) {
             num_external_beliefs_rejected =
                 cbs_optimizer_->addBeliefs(cbs_incoming_beliefs);
+            const size_t num_external_beliefs_accepted =
+                (num_external_beliefs_staged >= num_external_beliefs_rejected)
+                    ? (num_external_beliefs_staged - num_external_beliefs_rejected)
+                    : 0u;
+            accepted += num_external_beliefs_accepted;
 
             ROS_INFO_STREAM("CBS addBeliefs: staged=" << num_external_beliefs_staged
                             << ", rejected=" << num_external_beliefs_rejected
+                            << ", accepted=" << num_external_beliefs_accepted
                             << ", unknown_source=" << dropped_unknown_source
                             << ", self_source=" << dropped_self_source);
         }
 #endif
 
-        if (injected > 0) {
+        // Trigger loop-closed correction only when priors were actually accepted,
+        // not merely staged for CBS.
+        if (accepted > 0) {
             aLoopIsClosed = true;
         }
 
         ROS_INFO_STREAM_COND(
-            (injected + deferred + dropped_old + dropped_bad_noise +
+            (staged + accepted + deferred + dropped_old + dropped_bad_noise +
              dropped_self_source + dropped_unknown_source + dropped_missing_key +
              deferred_budget + pruned_timestamp_entries) > 0,
-            "External prior stats: injected=" << injected
+            "External prior stats: injected=" << accepted
+            << ", staged=" << staged
             << ", deferred=" << deferred
             << ", dropped_old=" << dropped_old
             << ", dropped_bad_noise=" << dropped_bad_noise
