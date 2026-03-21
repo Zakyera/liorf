@@ -5,6 +5,8 @@
     <arg name="loop_closure" default="false"/>
     <arg name="use_imu_heading_init" default="false"/>
     <arg name="imu_use_ext_rot_inverse" default="false"/>
+    <arg name="external_exchange_in_body_frame" default="true"/>
+    <arg name="external_exchange_use_ext_rot_inverse" default="false"/>
     <arg name="lidar_min_range" default="1.0"/>
     <arg name="downsample_rate" default="1"/>
     <arg name="point_filter_num" default="1"/>
@@ -21,6 +23,8 @@
     <param name="/liorf/loopClosureEnableFlag" value="$(arg loop_closure)" />
     <param name="/liorf/useImuHeadingInitialization" value="$(arg use_imu_heading_init)" />
     <param name="/liorf/imuUseExtRotInverse" value="$(arg imu_use_ext_rot_inverse)" />
+    <param name="/liorf/external_exchange_in_body_frame" value="$(arg external_exchange_in_body_frame)" />
+    <param name="/liorf/external_exchange_use_ext_rot_inverse" value="$(arg external_exchange_use_ext_rot_inverse)" />
     <param name="/liorf/lidarMinRange" value="$(arg lidar_min_range)" />
     <param name="/liorf/downsampleRate" value="$(arg downsample_rate)" />
     <param name="/liorf/point_filter_num" value="$(arg point_filter_num)" />

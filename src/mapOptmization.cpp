@@ -38,6 +38,9 @@
 #include <algorithm>
 #include <cctype>
 #include <exception>
+#include <iomanip>
+#include <unordered_set>
+#include <Eigen/Cholesky>
 // zy Step 13_a
 // Enables eigenvalue-based covariance conditioning for robust external prior ingestion.
 #include <Eigen/Eigenvalues>
@@ -129,6 +132,13 @@ public:
     int cbs_pose_rounds_per_epoch_ = 3;
     double cbs_pose_convergence_abs_residual_ = 1e-3;
     double cbs_pose_convergence_rel_residual_ = 1e-3;
+    // Diagnostic-only controls for investigating LOCAL marginal covariance scale.
+    bool cbs_local_cov_diag_enabled_ = true;
+    int cbs_local_cov_diag_stride_ = 20;
+    int cbs_local_cov_diag_max_samples_ = 200;
+    double cbs_local_cov_diag_anchor_rot_var_ = 1e-2;
+    double cbs_local_cov_diag_anchor_trans_var_ = 1e-1;
+    size_t cbs_local_cov_diag_samples_emitted_ = 0;
 
 #ifdef LIORF_USE_CBS
     // zy Step 1_e
@@ -222,10 +232,15 @@ public:
     // zy Step 24_a
     // Handles datasets where extrinsicRot convention is opposite; false uses extRot as-is, true uses extRot^T.
     bool external_exchange_use_ext_rot_inverse_ = false;
+    // Diagnostic-only mean alignment mode: estimate/apply per-source
+    // receiver_world<-sender_world transform before CBS addBeliefs().
+    bool cbs_diag_align_incoming_mean_ = false;
     // zy Step 12_b
     // Tracks last seen sequence per source to drop replayed/out-of-order external priors.
     mutable std::mutex external_source_seq_mutex_;
     std::map<std::string, uint64_t> last_external_source_seq_by_source_;
+    mutable std::mutex external_mean_alignment_mutex_;
+    std::map<std::string, gtsam::Pose3> external_mean_alignment_by_source_;
 
 
 
@@ -321,6 +336,21 @@ public:
         nh.param<double>("liorf/cbs_pose_convergence_rel_residual",
                          cbs_pose_convergence_rel_residual_,
                          1e-3);
+        nh.param<bool>("liorf/cbs_local_cov_diag_enabled",
+                       cbs_local_cov_diag_enabled_,
+                       true);
+        nh.param<int>("liorf/cbs_local_cov_diag_stride",
+                      cbs_local_cov_diag_stride_,
+                      20);
+        nh.param<int>("liorf/cbs_local_cov_diag_max_samples",
+                      cbs_local_cov_diag_max_samples_,
+                      200);
+        nh.param<double>("liorf/cbs_local_cov_diag_anchor_rot_var",
+                         cbs_local_cov_diag_anchor_rot_var_,
+                         1e-2);
+        nh.param<double>("liorf/cbs_local_cov_diag_anchor_trans_var",
+                         cbs_local_cov_diag_anchor_trans_var_,
+                         1e-1);
 
         // zy Step 7_c
         // Loads bridge-facing topics and default source tag for incoming external priors.
@@ -375,6 +405,11 @@ public:
         nh.param<bool>("liorf/external_exchange_use_ext_rot_inverse",
                        external_exchange_use_ext_rot_inverse_,
                        false);
+        nh.param<bool>("liorf/cbs_diag_align_incoming_mean",
+                       cbs_diag_align_incoming_mean_,
+                       false);
+        ROS_INFO_STREAM("LIORF CBS incoming-mean alignment diagnostic mode: "
+                        << (cbs_diag_align_incoming_mean_ ? "ON" : "OFF"));
 
 
 
@@ -386,6 +421,11 @@ public:
             // GkCM toggle is runtime-configurable to align with CBS reference behavior.
             cbs_params.enable_gkcm = cbs_enable_gkcm_;
             cbs_params.robot_id = static_cast<cbs::AgentId>('b');  // LIORF agent id.
+            cbs_params.use_anchored_receiver_local_for_merge = true;
+            cbs_params.receiver_local_anchor_rot_var =
+                cbs_local_cov_diag_anchor_rot_var_;
+            cbs_params.receiver_local_anchor_trans_var =
+                cbs_local_cov_diag_anchor_trans_var_;
             cbs_params.gbp_update_params.type = gbp::GaussianMergeType::Contract;
             cbs_params.gbp_update_params.metric_type = gbp::MetricType::Hellinger;
             cbs_params.gbp_update_params.contract_alpha =
@@ -401,6 +441,11 @@ public:
                             << ", alpha=" << cbs_contract_alpha_
                             << ", d_reset=" << cbs_d_reset_
                             << ", gamma=" << cbs_gamma_);
+            ROS_INFO_STREAM("LIORF CBS merge-local covariance mode: anchored_local=true"
+                            << ", anchor_rot_var="
+                            << cbs_local_cov_diag_anchor_rot_var_
+                            << ", anchor_trans_var="
+                            << cbs_local_cov_diag_anchor_trans_var_);
             //zy Step 41d
             // Logs pose-stage inner-round settings for reproducibility during CBS experiments.
             ROS_INFO_STREAM("LIORF CBS pose-stage config: gkcm="
@@ -505,11 +550,27 @@ public:
 
     // Pose-belief covariance should follow CBS local marginalization:
     // exclude incoming belief factors before publishing beliefs.
-    gtsam::Matrix activePoseBeliefMarginalCovariance(const gtsam::Key& key) const
+    gtsam::Matrix activePoseBeliefMarginalCovariance(
+        const gtsam::Key& key,
+        bool* used_fallback = nullptr,
+        std::string* covariance_source_path = nullptr) const
     {
+        if (used_fallback) {
+            *used_fallback = false;
+        }
+        if (covariance_source_path) {
+            *covariance_source_path = "isam->marginalCovariance(key)";
+        }
         if (usingCbs()) {
 #ifdef LIORF_USE_CBS
             if (!cbs_optimizer_) {
+                if (used_fallback) {
+                    *used_fallback = true;
+                }
+                if (covariance_source_path) {
+                    *covariance_source_path =
+                        "isam->marginalCovariance(key)[fallback_no_cbs_optimizer]";
+                }
                 return isam->marginalCovariance(key);
             }
 
@@ -525,6 +586,10 @@ public:
                     cbs_optimizer_->setMarginalizationGraph(
                         cbs::BPSAM::MarginalizationType::FULL);
                 }
+                if (covariance_source_path) {
+                    *covariance_source_path =
+                        "cbs_optimizer_->marginalCovariance(key, LOCAL)";
+                }
                 return cov;
             } catch (...) {
                 if (local_marginals_active) {
@@ -537,11 +602,325 @@ public:
                 ROS_WARN_STREAM_THROTTLE(
                     2.0,
                     "Failed LOCAL belief marginalization; falling back to active CBS covariance.");
+                if (used_fallback) {
+                    *used_fallback = true;
+                }
+                if (covariance_source_path) {
+                    *covariance_source_path =
+                        "cbs_optimizer_->marginalCovariance(key)[FULL_fallback_after_local_failure]";
+                }
                 return cbs_optimizer_->marginalCovariance(key);
             }
 #endif
         }
+        if (covariance_source_path) {
+            *covariance_source_path = "isam->marginalCovariance(key)";
+        }
         return isam->marginalCovariance(key);
+    }
+
+    bool shouldEmitCbsLocalCovDiag(const size_t frame_id) const
+    {
+        if (!cbs_local_cov_diag_enabled_) {
+            return false;
+        }
+        if (!usingCbs()) {
+            return false;
+        }
+        if (cbs_local_cov_diag_max_samples_ > 0 &&
+            cbs_local_cov_diag_samples_emitted_ >=
+                static_cast<size_t>(cbs_local_cov_diag_max_samples_)) {
+            return false;
+        }
+        if (frame_id < 5) {
+            return true;
+        }
+        const int stride = std::max(1, cbs_local_cov_diag_stride_);
+        return (frame_id % static_cast<size_t>(stride)) == 0;
+    }
+
+    void emitCbsLocalCovDiag(const gtsam::Key& key,
+                             const size_t frame_id,
+                             const int64_t timestamp_ns)
+    {
+#ifndef LIORF_USE_CBS
+        (void)key;
+        (void)frame_id;
+        (void)timestamp_ns;
+        return;
+#else
+        if (!usingCbs() || !cbs_optimizer_) {
+            return;
+        }
+        if (cbs_local_cov_diag_max_samples_ > 0 &&
+            cbs_local_cov_diag_samples_emitted_ >=
+                static_cast<size_t>(cbs_local_cov_diag_max_samples_)) {
+            return;
+        }
+
+        const auto covarianceTrace = [](const gtsam::Matrix& cov) {
+            if (cov.rows() < 6 || cov.cols() < 6) {
+                return std::numeric_limits<double>::quiet_NaN();
+            }
+            const Eigen::Matrix<double, 6, 6> cov6 = cov.topLeftCorner<6, 6>();
+            return cov6.trace();
+        };
+        const auto covarianceLogdet = [](const gtsam::Matrix& cov) {
+            if (cov.rows() < 6 || cov.cols() < 6) {
+                return std::numeric_limits<double>::quiet_NaN();
+            }
+            const Eigen::Matrix<double, 6, 6> cov6 = cov.topLeftCorner<6, 6>();
+            Eigen::LLT<Eigen::Matrix<double, 6, 6>> llt(cov6);
+            if (llt.info() != Eigen::Success) {
+                return std::numeric_limits<double>::quiet_NaN();
+            }
+            const auto& L = llt.matrixL();
+            double sum_log_diag = 0.0;
+            for (int i = 0; i < 6; ++i) {
+                const double d = L(i, i);
+                if (!(d > 0.0) || !std::isfinite(d)) {
+                    return std::numeric_limits<double>::quiet_NaN();
+                }
+                sum_log_diag += std::log(d);
+            }
+            return 2.0 * sum_log_diag;
+        };
+        const auto covarianceLambdaMin = [](const gtsam::Matrix& cov) {
+            if (cov.rows() < 6 || cov.cols() < 6) {
+                return std::numeric_limits<double>::quiet_NaN();
+            }
+            const Eigen::Matrix<double, 6, 6> cov6 = cov.topLeftCorner<6, 6>();
+            Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 6, 6>> eig(cov6);
+            if (eig.info() != Eigen::Success) {
+                return std::numeric_limits<double>::quiet_NaN();
+            }
+            return eig.eigenvalues().minCoeff();
+        };
+        const auto covarianceLambdaMax = [](const gtsam::Matrix& cov) {
+            if (cov.rows() < 6 || cov.cols() < 6) {
+                return std::numeric_limits<double>::quiet_NaN();
+            }
+            const Eigen::Matrix<double, 6, 6> cov6 = cov.topLeftCorner<6, 6>();
+            Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 6, 6>> eig(cov6);
+            if (eig.info() != Eigen::Success) {
+                return std::numeric_limits<double>::quiet_NaN();
+            }
+            return eig.eigenvalues().maxCoeff();
+        };
+        const auto safeRatio = [](const double a, const double b) {
+            if (!std::isfinite(a) || !std::isfinite(b) || b == 0.0) {
+                return std::numeric_limits<double>::quiet_NaN();
+            }
+            return a / b;
+        };
+
+        double local_trace = std::numeric_limits<double>::quiet_NaN();
+        double local_logdet = std::numeric_limits<double>::quiet_NaN();
+        double local_lambda_min = std::numeric_limits<double>::quiet_NaN();
+        double local_lambda_max = std::numeric_limits<double>::quiet_NaN();
+        double local_cond = std::numeric_limits<double>::quiet_NaN();
+        double full_trace = std::numeric_limits<double>::quiet_NaN();
+        double full_logdet = std::numeric_limits<double>::quiet_NaN();
+        double full_lambda_min = std::numeric_limits<double>::quiet_NaN();
+        double anchored_trace = std::numeric_limits<double>::quiet_NaN();
+        double anchored_logdet = std::numeric_limits<double>::quiet_NaN();
+        double anchored_lambda_min = std::numeric_limits<double>::quiet_NaN();
+        double rebuilt_local_trace = std::numeric_limits<double>::quiet_NaN();
+
+        int local_query_ok = 0;
+        int full_query_ok = 0;
+        int anchored_query_ok = 0;
+        int rebuilt_local_ok = 0;
+        int key_connected_to_robot = 0;
+        int key_exists_in_values_local = 0;
+        int gauge_suspected = 0;
+        int anchored_collapse = 0;
+        size_t full_factor_count = 0;
+        size_t local_factor_count = 0;
+        size_t removed_pose_belief_count = 0;
+        size_t removed_anchor_belief_count = 0;
+        size_t key_degree_full = 0;
+        size_t key_degree_local = 0;
+
+        const auto all_values = cbs_optimizer_->calculateEstimate();
+        const auto factors_full = cbs_optimizer_->getFactorsUnsafe();
+        gtsam::NonlinearFactorGraph local_factors;
+        std::unordered_set<gtsam::Key> local_graph_keys;
+        local_factors.reserve(factors_full.size());
+
+        for (const auto& factor : factors_full) {
+            if (!factor) {
+                continue;
+            }
+            ++full_factor_count;
+            const auto& fkeys = factor->keys();
+            bool touches_key = false;
+            bool touches_robot = false;
+            for (const auto fk : fkeys) {
+                if (fk == key) {
+                    touches_key = true;
+                }
+                if (cbs::isRobotKey(gtsam::LabeledSymbol(fk))) {
+                    touches_robot = true;
+                }
+            }
+            if (touches_key) {
+                ++key_degree_full;
+            }
+
+            const bool remove_from_local =
+                (fkeys.size() == 2) &&
+                (cbs::isPoseBeliefFactor(cbs_optimizer_->id(), factor) ||
+                 cbs::isAnchorBeliefFactor(factor));
+            if (remove_from_local) {
+                if (cbs::isPoseBeliefFactor(cbs_optimizer_->id(), factor)) {
+                    ++removed_pose_belief_count;
+                }
+                if (cbs::isAnchorBeliefFactor(factor)) {
+                    ++removed_anchor_belief_count;
+                }
+                continue;
+            }
+
+            local_factors.push_back(factor);
+            ++local_factor_count;
+            for (const auto fk : fkeys) {
+                local_graph_keys.insert(fk);
+            }
+            if (touches_key) {
+                ++key_degree_local;
+                if (touches_robot) {
+                    key_connected_to_robot = 1;
+                }
+            }
+        }
+
+        gtsam::Values local_values;
+        for (const auto fk : local_graph_keys) {
+            if (all_values.exists(fk)) {
+                local_values.insert_or_assign(fk, all_values.at(fk));
+            }
+        }
+        if (all_values.exists(key) && !local_values.exists(key)) {
+            local_values.insert_or_assign(key, all_values.at(key));
+        }
+        key_exists_in_values_local = local_values.exists(key) ? 1 : 0;
+
+        try {
+            const gtsam::Matrix local_cov = cbs_optimizer_->marginalCovariance(
+                key, cbs::BPSAM::MarginalizationType::LOCAL);
+            local_trace = covarianceTrace(local_cov);
+            local_logdet = covarianceLogdet(local_cov);
+            local_lambda_min = covarianceLambdaMin(local_cov);
+            local_lambda_max = covarianceLambdaMax(local_cov);
+            local_cond = safeRatio(local_lambda_max, local_lambda_min);
+            local_query_ok = 1;
+        } catch (const std::exception& e) {
+            ROS_WARN_STREAM_THROTTLE(
+                1.0,
+                "LOCAL covariance diagnostic query failed for key " << key
+                                                                   << ": " << e.what());
+        } catch (...) {
+            ROS_WARN_STREAM_THROTTLE(
+                1.0,
+                "LOCAL covariance diagnostic query failed for key " << key);
+        }
+
+        try {
+            const gtsam::Matrix full_cov = cbs_optimizer_->marginalCovariance(
+                key, cbs::BPSAM::MarginalizationType::FULL);
+            full_trace = covarianceTrace(full_cov);
+            full_logdet = covarianceLogdet(full_cov);
+            full_lambda_min = covarianceLambdaMin(full_cov);
+            full_query_ok = 1;
+        } catch (...) {
+        }
+
+        if (key_exists_in_values_local && local_values.exists(key)) {
+            try {
+                const gtsam::Marginals local_marginals(local_factors, local_values);
+                const gtsam::Matrix local_rebuilt_cov =
+                    local_marginals.marginalCovariance(key);
+                rebuilt_local_trace = covarianceTrace(local_rebuilt_cov);
+                rebuilt_local_ok = 1;
+            } catch (...) {
+            }
+
+            try {
+                gtsam::NonlinearFactorGraph anchored_local_factors = local_factors;
+                gtsam::Vector6 anchor_var;
+                anchor_var << cbs_local_cov_diag_anchor_rot_var_,
+                    cbs_local_cov_diag_anchor_rot_var_,
+                    cbs_local_cov_diag_anchor_rot_var_,
+                    cbs_local_cov_diag_anchor_trans_var_,
+                    cbs_local_cov_diag_anchor_trans_var_,
+                    cbs_local_cov_diag_anchor_trans_var_;
+                const auto anchor_noise =
+                    gtsam::noiseModel::Diagonal::Variances(anchor_var);
+                const gtsam::Pose3 anchor_pose = local_values.at<gtsam::Pose3>(key);
+                anchored_local_factors.emplace_shared<gtsam::PriorFactor<gtsam::Pose3>>(
+                    key, anchor_pose, anchor_noise);
+                const gtsam::Marginals anchored_marginals(anchored_local_factors,
+                                                          local_values);
+                const gtsam::Matrix anchored_cov =
+                    anchored_marginals.marginalCovariance(key);
+                anchored_trace = covarianceTrace(anchored_cov);
+                anchored_logdet = covarianceLogdet(anchored_cov);
+                anchored_lambda_min = covarianceLambdaMin(anchored_cov);
+                anchored_query_ok = 1;
+            } catch (...) {
+            }
+        }
+
+        if ((std::isfinite(local_cond) && local_cond > 1e12) ||
+            (std::isfinite(local_trace) && local_trace > 1e6) ||
+            (std::isfinite(local_lambda_min) && local_lambda_min < 1e-12)) {
+            gauge_suspected = 1;
+        }
+        if (std::isfinite(local_trace) && std::isfinite(anchored_trace) &&
+            local_trace > 0.0 && anchored_trace > 0.0 &&
+            (local_trace / anchored_trace) > 1e4) {
+            anchored_collapse = 1;
+        }
+
+        std::cerr << std::setprecision(12)
+                  << "[CBS][LocalMarginalDiag] key=" << key
+                  << " frame_id=" << frame_id
+                  << " timestamp_ns=" << timestamp_ns
+                  << " local_trace=" << local_trace
+                  << " local_logdet=" << local_logdet
+                  << " local_lambda_min=" << local_lambda_min
+                  << " local_lambda_max=" << local_lambda_max
+                  << " local_condition=" << local_cond
+                  << " full_trace=" << full_trace
+                  << " full_logdet=" << full_logdet
+                  << " full_lambda_min=" << full_lambda_min
+                  << " anchored_trace=" << anchored_trace
+                  << " anchored_logdet=" << anchored_logdet
+                  << " anchored_lambda_min=" << anchored_lambda_min
+                  << " local_to_full_trace_ratio=" << safeRatio(local_trace, full_trace)
+                  << " local_to_anchored_trace_ratio="
+                  << safeRatio(local_trace, anchored_trace)
+                  << " rebuilt_local_trace=" << rebuilt_local_trace
+                  << " local_to_rebuilt_trace_ratio="
+                  << safeRatio(local_trace, rebuilt_local_trace)
+                  << " local_query_ok=" << local_query_ok
+                  << " full_query_ok=" << full_query_ok
+                  << " anchored_query_ok=" << anchored_query_ok
+                  << " rebuilt_local_ok=" << rebuilt_local_ok
+                  << " full_factor_count=" << full_factor_count
+                  << " local_factor_count=" << local_factor_count
+                  << " removed_pose_belief_count=" << removed_pose_belief_count
+                  << " removed_anchor_belief_count=" << removed_anchor_belief_count
+                  << " key_degree_full=" << key_degree_full
+                  << " key_degree_local=" << key_degree_local
+                  << " key_connected_to_robot=" << key_connected_to_robot
+                  << " key_exists_in_values_local=" << key_exists_in_values_local
+                  << " gauge_suspected=" << gauge_suspected
+                  << " anchored_collapse=" << anchored_collapse << std::endl;
+
+        ++cbs_local_cov_diag_samples_emitted_;
+#endif
     }
 
     // zy Step 2_f
@@ -906,6 +1285,12 @@ public:
 
         Eigen::Matrix<double, 6, 6> covariance =
             Eigen::Matrix<double, 6, 6>::Zero();
+        Eigen::Matrix<double, 6, 6, Eigen::RowMajor> covariance_ros_layout;
+        for (int r = 0; r < 6; ++r) {
+            for (int c = 0; c < 6; ++c) {
+                covariance_ros_layout(r, c) = msg->pose.covariance[r * 6 + c];
+            }
+        }
         // zy Step 42a
         // ROS odom covariance uses [tx ty tz rx ry rz], while GTSAM Pose3
         // tangent space uses [rx ry rz tx ty tz]. Remap to internal order.
@@ -931,13 +1316,92 @@ public:
         // Keeps covariance in the same frame as the converted pose before queueing.
         const Eigen::Matrix<double, 6, 6> covariance_lidar =
             exchangeCovarianceToLidarCovariance(covariance);
-
+        const Eigen::Quaterniond q_raw_exchange(W_Pose_exchange.rotation().matrix());
+        const Eigen::Quaterniond q_converted_lidar(W_Pose_L.rotation().matrix());
 
         const int64_t ts_nsec = toTimestampNsec(msg->header.stamp);
         // zy Step 12_f
         // Normalizes source tags and drops self/duplicate priors before they enter the queue.
         const std::string source = normalizeExternalSourceTag(msg->child_frame_id);
         const uint64_t source_seq = static_cast<uint64_t>(msg->header.seq);
+
+        const auto covarianceLogdet = [](const Eigen::Matrix<double, 6, 6>& cov) {
+            Eigen::LLT<Eigen::Matrix<double, 6, 6>> llt(cov);
+            if (llt.info() != Eigen::Success) {
+                return std::numeric_limits<double>::quiet_NaN();
+            }
+            const auto& L = llt.matrixL();
+            double sum_log_diag = 0.0;
+            for (int i = 0; i < 6; ++i) {
+                const double d = L(i, i);
+                if (!(d > 0.0) || !std::isfinite(d)) {
+                    return std::numeric_limits<double>::quiet_NaN();
+                }
+                sum_log_diag += std::log(d);
+            }
+            return 2.0 * sum_log_diag;
+        };
+        const auto covarianceLambdaMin = [](const Eigen::Matrix<double, 6, 6>& cov) {
+            Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 6, 6>> eig(cov);
+            if (eig.info() != Eigen::Success) {
+                return std::numeric_limits<double>::quiet_NaN();
+            }
+            return eig.eigenvalues().minCoeff();
+        };
+        std::cerr << std::setprecision(12)
+                  << "[CBS][IncomingPriorCov] source=" << source
+                  << " source_seq=" << source_seq
+                  << " timestamp_ns=" << ts_nsec
+                  << " msg_frame_id=" << msg->header.frame_id
+                  << " msg_child_frame_id=" << msg->child_frame_id
+                  << " raw_ros_trace=" << covariance_ros_layout.trace()
+                  << " raw_ros_logdet=" << covarianceLogdet(covariance_ros_layout)
+                  << " raw_ros_lambda_min=" << covarianceLambdaMin(covariance_ros_layout)
+                  << " incoming_raw_mean_semantic="
+                  << (external_exchange_in_body_frame_ ? "world_to_body_pose"
+                                                       : "world_to_lidar_pose")
+                  << " incoming_raw_mean_tx=" << W_Pose_exchange.translation().x()
+                  << " incoming_raw_mean_ty=" << W_Pose_exchange.translation().y()
+                  << " incoming_raw_mean_tz=" << W_Pose_exchange.translation().z()
+                  << " incoming_raw_mean_qx=" << q_raw_exchange.x()
+                  << " incoming_raw_mean_qy=" << q_raw_exchange.y()
+                  << " incoming_raw_mean_qz=" << q_raw_exchange.z()
+                  << " incoming_raw_mean_qw=" << q_raw_exchange.w()
+                  << " reordered_trace=" << covariance.trace()
+                  << " reordered_logdet=" << covarianceLogdet(covariance)
+                  << " reordered_lambda_min=" << covarianceLambdaMin(covariance)
+                  << " converted_trace=" << covariance_lidar.trace()
+                  << " converted_logdet=" << covarianceLogdet(covariance_lidar)
+                  << " converted_lambda_min=" << covarianceLambdaMin(covariance_lidar)
+                  << " incoming_converted_mean_semantic=world_to_lidar_pose"
+                  << " incoming_converted_mean_tx="
+                  << W_Pose_L.translation().x()
+                  << " incoming_converted_mean_ty="
+                  << W_Pose_L.translation().y()
+                  << " incoming_converted_mean_tz="
+                  << W_Pose_L.translation().z()
+                  << " incoming_converted_mean_qx="
+                  << q_converted_lidar.x()
+                  << " incoming_converted_mean_qy="
+                  << q_converted_lidar.y()
+                  << " incoming_converted_mean_qz="
+                  << q_converted_lidar.z()
+                  << " incoming_converted_mean_qw="
+                  << q_converted_lidar.w()
+                  << " body_frame_conversion_applied="
+                  << (external_exchange_in_body_frame_ ? 1 : 0)
+                  << " ext_rot_inverse_applied="
+                  << (external_exchange_use_ext_rot_inverse_ ? 1 : 0)
+                  << " exchange_frame_mode="
+                  << (external_exchange_in_body_frame_ ? "body" : "lidar")
+                  << " exchange_rot_mode="
+                  << (external_exchange_use_ext_rot_inverse_ ? "extRot_inverse"
+                                                             : "extRot")
+                  << " extrinsic_tx=" << extTrans.x()
+                  << " extrinsic_ty=" << extTrans.y()
+                  << " extrinsic_tz=" << extTrans.z()
+                  << " covariance_reorder_applied=1"
+                  << std::endl;
 
         if (isSelfExternalSourceTag(source)) {
             ROS_WARN_STREAM_THROTTLE(
@@ -1003,6 +1467,8 @@ public:
         // Publishes in configured exchange frame while keeping LIORF internals in lidar frame.
         const gtsam::Pose3 W_Pose_exchange =
             lidarPoseToExchangePose(belief.W_Pose_L_);
+        const Eigen::Quaterniond q_exchange(W_Pose_exchange.rotation().matrix());
+        const Eigen::Quaterniond q_lidar(belief.W_Pose_L_.rotation().matrix());
 
         msg.pose.pose.position.x = W_Pose_exchange.translation().x();
         msg.pose.pose.position.y = W_Pose_exchange.translation().y();
@@ -1029,6 +1495,41 @@ public:
                     covariance_exchange(r, c);
             }
         }
+
+        std::cerr << std::setprecision(12)
+                  << "[CBS][OutgoingBeliefMean] source=liorf"
+                  << " frame_id=" << belief.pose_index_
+                  << " timestamp_ns=" << belief.timestamp_kf_nsec_
+                  << " key="
+                  << poseKeyFromIndex(static_cast<size_t>(belief.pose_index_))
+                  << " msg_frame_id=" << msg.header.frame_id
+                  << " msg_child_frame_id=" << msg.child_frame_id
+                  << " sender_mean_semantic=world_to_lidar_pose"
+                  << " sender_exchange_frame_semantic="
+                  << (external_exchange_in_body_frame_ ? "world_to_body_pose"
+                                                       : "world_to_lidar_pose")
+                  << " sender_exchange_frame_mode="
+                  << (external_exchange_in_body_frame_ ? "body" : "lidar")
+                  << " sender_extrinsic_applied_to_mean="
+                  << (external_exchange_in_body_frame_ ? 1 : 0)
+                  << " sender_mean_internal_tx=" << belief.W_Pose_L_.translation().x()
+                  << " sender_mean_internal_ty=" << belief.W_Pose_L_.translation().y()
+                  << " sender_mean_internal_tz=" << belief.W_Pose_L_.translation().z()
+                  << " sender_mean_internal_qx=" << q_lidar.x()
+                  << " sender_mean_internal_qy=" << q_lidar.y()
+                  << " sender_mean_internal_qz=" << q_lidar.z()
+                  << " sender_mean_internal_qw=" << q_lidar.w()
+                  << " mean_tx=" << W_Pose_exchange.translation().x()
+                  << " mean_ty=" << W_Pose_exchange.translation().y()
+                  << " mean_tz=" << W_Pose_exchange.translation().z()
+                  << " mean_qx=" << q_exchange.x()
+                  << " mean_qy=" << q_exchange.y()
+                  << " mean_qz=" << q_exchange.z()
+                  << " mean_qw=" << q_exchange.w()
+                  << " extrinsic_tx=" << extTrans.x()
+                  << " extrinsic_ty=" << extTrans.y()
+                  << " extrinsic_tz=" << extTrans.z()
+                  << std::endl;
 
         pubExternalPoseBelief_.publish(msg);
     }
@@ -1162,6 +1663,383 @@ public:
                 continue;
             }
 
+            bool receiver_local_mean_available = false;
+            gtsam::Pose3 receiver_local_pose;
+            try {
+                if (usingCbs()) {
+#ifdef LIORF_USE_CBS
+                    if (cbs_optimizer_ && cbs_optimizer_->valueExists(pose_key)) {
+                        receiver_local_pose =
+                            cbs_optimizer_->calculateEstimate<gtsam::Pose3>(pose_key);
+                        receiver_local_mean_available = true;
+                    }
+#endif
+                } else if (isamCurrentEstimate.exists(pose_key)) {
+                    receiver_local_pose =
+                        isamCurrentEstimate.at<gtsam::Pose3>(pose_key);
+                    receiver_local_mean_available = true;
+                }
+            } catch (...) {
+                receiver_local_mean_available = false;
+            }
+
+            const gtsam::Pose3 incoming_pose_raw = prior.W_Pose_L_;
+            gtsam::Pose3 incoming_pose_aligned = incoming_pose_raw;
+            bool mean_alignment_mode_enabled = cbs_diag_align_incoming_mean_;
+            bool mean_alignment_prev_available = false;
+            bool mean_alignment_applied = false;
+            gtsam::Pose3 mean_alignment_prev = gtsam::Pose3();
+            if (mean_alignment_mode_enabled) {
+                std::lock_guard<std::mutex> lock(external_mean_alignment_mutex_);
+                const auto it = external_mean_alignment_by_source_.find(prior.source_);
+                if (it != external_mean_alignment_by_source_.end()) {
+                    mean_alignment_prev_available = true;
+                    mean_alignment_prev = it->second;
+                    incoming_pose_aligned = mean_alignment_prev.compose(
+                        incoming_pose_raw);
+                    mean_alignment_applied = true;
+                }
+            }
+
+            double delta_local_incoming_trans_m =
+                std::numeric_limits<double>::quiet_NaN();
+            double delta_local_incoming_rot_rad =
+                std::numeric_limits<double>::quiet_NaN();
+            double delta_local_incoming_norm =
+                std::numeric_limits<double>::quiet_NaN();
+            double delta_local_incoming_trans_m_before_align =
+                std::numeric_limits<double>::quiet_NaN();
+            double delta_local_incoming_rot_rad_before_align =
+                std::numeric_limits<double>::quiet_NaN();
+            double delta_local_incoming_norm_before_align =
+                std::numeric_limits<double>::quiet_NaN();
+            double delta_local_incoming_trans_m_after_align =
+                std::numeric_limits<double>::quiet_NaN();
+            double delta_local_incoming_rot_rad_after_align =
+                std::numeric_limits<double>::quiet_NaN();
+            double delta_local_incoming_norm_after_align =
+                std::numeric_limits<double>::quiet_NaN();
+            double div_hell_local_incoming_before_align =
+                std::numeric_limits<double>::quiet_NaN();
+            double div_hell_local_incoming_after_align =
+                std::numeric_limits<double>::quiet_NaN();
+
+            gtsam::Matrix66 receiver_local_cov_for_diag = gtsam::Matrix66::Zero();
+            bool receiver_local_cov_for_diag_available = false;
+#ifdef LIORF_USE_CBS
+            if (receiver_local_mean_available && usingCbs() && cbs_optimizer_ &&
+                cbs_optimizer_->valueExists(pose_key)) {
+                try {
+                    const gtsam::Matrix receiver_local_cov_dynamic =
+                        cbs_optimizer_->marginalCovariance(
+                            pose_key, cbs::BPSAM::MarginalizationType::LOCAL);
+                    if (receiver_local_cov_dynamic.rows() >= 6 &&
+                        receiver_local_cov_dynamic.cols() >= 6 &&
+                        receiver_local_cov_dynamic.block<6, 6>(0, 0).allFinite()) {
+                        receiver_local_cov_for_diag =
+                            receiver_local_cov_dynamic.block<6, 6>(0, 0);
+                        receiver_local_cov_for_diag_available = true;
+                    }
+                } catch (...) {
+                    receiver_local_cov_for_diag_available = false;
+                }
+            }
+#endif
+
+            const auto logDetSym6 = [](const gtsam::Matrix66& sigma) {
+                if (!sigma.allFinite()) {
+                    return std::numeric_limits<double>::quiet_NaN();
+                }
+                Eigen::SelfAdjointEigenSolver<gtsam::Matrix66> eig(sigma);
+                if (eig.info() != Eigen::Success) {
+                    return std::numeric_limits<double>::quiet_NaN();
+                }
+                double sum = 0.0;
+                for (int i = 0; i < eig.eigenvalues().size(); ++i) {
+                    const double ev = eig.eigenvalues()(i);
+                    if (!(ev > 0.0) || !std::isfinite(ev)) {
+                        return std::numeric_limits<double>::quiet_NaN();
+                    }
+                    sum += std::log(ev);
+                }
+                return sum;
+            };
+            const auto hellingerDistance6 =
+                [&logDetSym6](const gtsam::Vector6& mu_a,
+                              const gtsam::Matrix66& sigma_a,
+                              const gtsam::Vector6& mu_b,
+                              const gtsam::Matrix66& sigma_b) {
+                    if (!mu_a.allFinite() || !mu_b.allFinite() ||
+                        !sigma_a.allFinite() || !sigma_b.allFinite()) {
+                        return std::numeric_limits<double>::quiet_NaN();
+                    }
+                    const gtsam::Matrix66 sigma_bar = 0.5 * (sigma_a + sigma_b);
+                    const double log_det_a = logDetSym6(sigma_a);
+                    const double log_det_b = logDetSym6(sigma_b);
+                    const double log_det_bar = logDetSym6(sigma_bar);
+                    if (!std::isfinite(log_det_a) || !std::isfinite(log_det_b) ||
+                        !std::isfinite(log_det_bar)) {
+                        return std::numeric_limits<double>::quiet_NaN();
+                    }
+                    const gtsam::Vector6 delta = mu_a - mu_b;
+                    Eigen::LDLT<gtsam::Matrix66> ldlt(sigma_bar);
+                    if (ldlt.info() != Eigen::Success) {
+                        return std::numeric_limits<double>::quiet_NaN();
+                    }
+                    const auto d = ldlt.vectorD();
+                    for (int i = 0; i < d.size(); ++i) {
+                        if (!(d(i) > 0.0) || !std::isfinite(d(i))) {
+                            return std::numeric_limits<double>::quiet_NaN();
+                        }
+                    }
+                    const gtsam::Vector6 x = ldlt.solve(delta);
+                    if (!x.allFinite()) {
+                        return std::numeric_limits<double>::quiet_NaN();
+                    }
+                    const double quad = delta.dot(x);
+                    if (!std::isfinite(quad)) {
+                        return std::numeric_limits<double>::quiet_NaN();
+                    }
+                    const double log_coeff =
+                        0.25 * (log_det_a + log_det_b) - 0.5 * log_det_bar;
+                    const double coeff = std::exp(log_coeff - 0.125 * quad);
+                    if (!std::isfinite(coeff)) {
+                        return std::numeric_limits<double>::quiet_NaN();
+                    }
+                    const double h2 = std::clamp(1.0 - coeff, 0.0, 1.0);
+                    return std::sqrt(h2);
+                };
+
+            if (receiver_local_mean_available) {
+                const gtsam::Vector6 delta_local_incoming_before =
+                    gtsam::traits<gtsam::Pose3>::Logmap(
+                        receiver_local_pose.between(incoming_pose_raw));
+                delta_local_incoming_rot_rad_before_align =
+                    delta_local_incoming_before.head<3>().norm();
+                delta_local_incoming_trans_m_before_align =
+                    delta_local_incoming_before.tail<3>().norm();
+                delta_local_incoming_norm_before_align =
+                    delta_local_incoming_before.norm();
+
+                const gtsam::Vector6 delta_local_incoming_after =
+                    gtsam::traits<gtsam::Pose3>::Logmap(
+                        receiver_local_pose.between(incoming_pose_aligned));
+                delta_local_incoming_rot_rad_after_align =
+                    delta_local_incoming_after.head<3>().norm();
+                delta_local_incoming_trans_m_after_align =
+                    delta_local_incoming_after.tail<3>().norm();
+                delta_local_incoming_norm_after_align =
+                    delta_local_incoming_after.norm();
+
+                // Keep legacy fields mapped to post-alignment values so prior
+                // analysis tooling remains valid.
+                delta_local_incoming_rot_rad =
+                    delta_local_incoming_rot_rad_after_align;
+                delta_local_incoming_trans_m =
+                    delta_local_incoming_trans_m_after_align;
+                delta_local_incoming_norm = delta_local_incoming_norm_after_align;
+
+                if (receiver_local_cov_for_diag_available) {
+                    const gtsam::Vector6 mu_local =
+                        gtsam::traits<gtsam::Pose3>::Logmap(receiver_local_pose);
+                    const gtsam::Vector6 mu_incoming_before =
+                        gtsam::traits<gtsam::Pose3>::Logmap(incoming_pose_raw);
+                    const gtsam::Vector6 mu_incoming_after =
+                        gtsam::traits<gtsam::Pose3>::Logmap(incoming_pose_aligned);
+                    div_hell_local_incoming_before_align = hellingerDistance6(
+                        mu_local,
+                        receiver_local_cov_for_diag,
+                        mu_incoming_before,
+                        prior.covariance_);
+                    div_hell_local_incoming_after_align = hellingerDistance6(
+                        mu_local,
+                        receiver_local_cov_for_diag,
+                        mu_incoming_after,
+                        prior.covariance_);
+                }
+            }
+
+            bool mean_alignment_updated = false;
+            gtsam::Pose3 mean_alignment_update = gtsam::Pose3();
+            if (mean_alignment_mode_enabled && receiver_local_mean_available) {
+                mean_alignment_update =
+                    receiver_local_pose.compose(incoming_pose_raw.inverse());
+                {
+                    std::lock_guard<std::mutex> lock(external_mean_alignment_mutex_);
+                    external_mean_alignment_by_source_[prior.source_] =
+                        mean_alignment_update;
+                }
+                mean_alignment_updated = true;
+            }
+
+            const Eigen::Quaterniond q_incoming_raw(
+                incoming_pose_raw.rotation().matrix());
+            const Eigen::Quaterniond q_incoming_aligned(
+                incoming_pose_aligned.rotation().matrix());
+            Eigen::Quaterniond q_receiver_local = Eigen::Quaterniond::Identity();
+            if (receiver_local_mean_available) {
+                q_receiver_local = Eigen::Quaterniond(
+                    receiver_local_pose.rotation().matrix());
+            }
+            const Eigen::Quaterniond q_alignment_prev(
+                mean_alignment_prev.rotation().matrix());
+            const Eigen::Quaterniond q_alignment_update(
+                mean_alignment_update.rotation().matrix());
+
+            const auto covarianceLogdet = [](const Eigen::Matrix<double, 6, 6>& cov) {
+                Eigen::LLT<Eigen::Matrix<double, 6, 6>> llt(cov);
+                if (llt.info() != Eigen::Success) {
+                    return std::numeric_limits<double>::quiet_NaN();
+                }
+                const auto& L = llt.matrixL();
+                double sum_log_diag = 0.0;
+                for (int i = 0; i < 6; ++i) {
+                    const double d = L(i, i);
+                    if (!(d > 0.0) || !std::isfinite(d)) {
+                        return std::numeric_limits<double>::quiet_NaN();
+                    }
+                    sum_log_diag += std::log(d);
+                }
+                return 2.0 * sum_log_diag;
+            };
+            const auto covarianceLambdaMin = [](const Eigen::Matrix<double, 6, 6>& cov) {
+                Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 6, 6>> eig(cov);
+                if (eig.info() != Eigen::Success) {
+                    return std::numeric_limits<double>::quiet_NaN();
+                }
+                return eig.eigenvalues().minCoeff();
+            };
+            const int64_t dt_ns = matched_ts_nsec - prior.timestamp_kf_nsec_;
+            std::cerr << std::setprecision(12)
+                      << "[CBS][IncomingPriorStage] source=" << prior.source_
+                      << " source_seq=" << prior.source_seq_
+                      << " prior_timestamp_ns=" << prior.timestamp_kf_nsec_
+                      << " matched_timestamp_ns=" << matched_ts_nsec
+                      << " dt_ns=" << dt_ns
+                      << " matched_pose_idx=" << matched_pose_idx
+                      << " pose_key=" << pose_key
+                      << " final_used_trace=" << prior.covariance_.trace()
+                      << " final_used_logdet=" << covarianceLogdet(prior.covariance_)
+                      << " final_used_lambda_min="
+                      << covarianceLambdaMin(prior.covariance_)
+                      << " incoming_raw_mean_semantic=world_to_lidar_pose"
+                      << " incoming_raw_mean_tx="
+                      << incoming_pose_raw.translation().x()
+                      << " incoming_raw_mean_ty="
+                      << incoming_pose_raw.translation().y()
+                      << " incoming_raw_mean_tz="
+                      << incoming_pose_raw.translation().z()
+                      << " incoming_raw_mean_qx=" << q_incoming_raw.x()
+                      << " incoming_raw_mean_qy=" << q_incoming_raw.y()
+                      << " incoming_raw_mean_qz=" << q_incoming_raw.z()
+                      << " incoming_raw_mean_qw=" << q_incoming_raw.w()
+                      << " incoming_mean_semantic=world_to_lidar_pose"
+                      << " incoming_mean_tx="
+                      << incoming_pose_aligned.translation().x()
+                      << " incoming_mean_ty="
+                      << incoming_pose_aligned.translation().y()
+                      << " incoming_mean_tz="
+                      << incoming_pose_aligned.translation().z()
+                      << " incoming_mean_qx=" << q_incoming_aligned.x()
+                      << " incoming_mean_qy=" << q_incoming_aligned.y()
+                      << " incoming_mean_qz=" << q_incoming_aligned.z()
+                      << " incoming_mean_qw=" << q_incoming_aligned.w()
+                      << " receiver_local_mean_semantic=world_to_lidar_pose"
+                      << " receiver_local_mean_available="
+                      << (receiver_local_mean_available ? 1 : 0)
+                      << " receiver_local_mean_tx="
+                      << (receiver_local_mean_available
+                              ? receiver_local_pose.translation().x()
+                              : std::numeric_limits<double>::quiet_NaN())
+                      << " receiver_local_mean_ty="
+                      << (receiver_local_mean_available
+                              ? receiver_local_pose.translation().y()
+                              : std::numeric_limits<double>::quiet_NaN())
+                      << " receiver_local_mean_tz="
+                      << (receiver_local_mean_available
+                              ? receiver_local_pose.translation().z()
+                              : std::numeric_limits<double>::quiet_NaN())
+                      << " receiver_local_mean_qx="
+                      << (receiver_local_mean_available
+                              ? q_receiver_local.x()
+                              : std::numeric_limits<double>::quiet_NaN())
+                      << " receiver_local_mean_qy="
+                      << (receiver_local_mean_available
+                              ? q_receiver_local.y()
+                              : std::numeric_limits<double>::quiet_NaN())
+                      << " receiver_local_mean_qz="
+                      << (receiver_local_mean_available
+                              ? q_receiver_local.z()
+                              : std::numeric_limits<double>::quiet_NaN())
+                      << " receiver_local_mean_qw="
+                      << (receiver_local_mean_available
+                              ? q_receiver_local.w()
+                              : std::numeric_limits<double>::quiet_NaN())
+                      << " delta_local_incoming_trans_m="
+                      << delta_local_incoming_trans_m
+                      << " delta_local_incoming_rot_rad="
+                      << delta_local_incoming_rot_rad
+                      << " delta_local_incoming_norm="
+                      << delta_local_incoming_norm
+                      << " delta_local_incoming_trans_m_before_align="
+                      << delta_local_incoming_trans_m_before_align
+                      << " delta_local_incoming_rot_rad_before_align="
+                      << delta_local_incoming_rot_rad_before_align
+                      << " delta_local_incoming_norm_before_align="
+                      << delta_local_incoming_norm_before_align
+                      << " delta_local_incoming_trans_m_after_align="
+                      << delta_local_incoming_trans_m_after_align
+                      << " delta_local_incoming_rot_rad_after_align="
+                      << delta_local_incoming_rot_rad_after_align
+                      << " delta_local_incoming_norm_after_align="
+                      << delta_local_incoming_norm_after_align
+                      << " div_hell_local_incoming_before_align="
+                      << div_hell_local_incoming_before_align
+                      << " div_hell_local_incoming_after_align="
+                      << div_hell_local_incoming_after_align
+                      << " mean_semantics_match=1"
+                      << " mean_alignment_mode_enabled="
+                      << (mean_alignment_mode_enabled ? 1 : 0)
+                      << " mean_alignment_prev_available="
+                      << (mean_alignment_prev_available ? 1 : 0)
+                      << " mean_alignment_applied="
+                      << (mean_alignment_applied ? 1 : 0)
+                      << " mean_alignment_prev_tx="
+                      << mean_alignment_prev.translation().x()
+                      << " mean_alignment_prev_ty="
+                      << mean_alignment_prev.translation().y()
+                      << " mean_alignment_prev_tz="
+                      << mean_alignment_prev.translation().z()
+                      << " mean_alignment_prev_qx=" << q_alignment_prev.x()
+                      << " mean_alignment_prev_qy=" << q_alignment_prev.y()
+                      << " mean_alignment_prev_qz=" << q_alignment_prev.z()
+                      << " mean_alignment_prev_qw=" << q_alignment_prev.w()
+                      << " mean_alignment_updated="
+                      << (mean_alignment_updated ? 1 : 0)
+                      << " mean_alignment_update_tx="
+                      << mean_alignment_update.translation().x()
+                      << " mean_alignment_update_ty="
+                      << mean_alignment_update.translation().y()
+                      << " mean_alignment_update_tz="
+                      << mean_alignment_update.translation().z()
+                      << " mean_alignment_update_qx=" << q_alignment_update.x()
+                      << " mean_alignment_update_qy=" << q_alignment_update.y()
+                      << " mean_alignment_update_qz=" << q_alignment_update.z()
+                      << " mean_alignment_update_qw=" << q_alignment_update.w()
+                      << " body_frame_conversion_applied="
+                      << (external_exchange_in_body_frame_ ? 1 : 0)
+                      << " ext_rot_inverse_applied="
+                      << (external_exchange_use_ext_rot_inverse_ ? 1 : 0)
+                      << " exchange_frame_mode="
+                      << (external_exchange_in_body_frame_ ? "body" : "lidar")
+                      << " exchange_rot_mode="
+                      << (external_exchange_use_ext_rot_inverse_ ? "extRot_inverse"
+                                                                 : "extRot")
+                      << " extrinsic_tx=" << extTrans.x()
+                      << " extrinsic_ty=" << extTrans.y()
+                      << " extrinsic_tz=" << extTrans.z()
+                      << std::endl;
+
 #ifdef LIORF_USE_CBS
             if (usingCbs()) {
                 if (!cbs_optimizer_) {
@@ -1181,7 +2059,7 @@ public:
                 }
 
                 const gtsam::Vector6 mu =
-                    gtsam::traits<gtsam::Pose3>::Logmap(prior.W_Pose_L_);
+                    gtsam::traits<gtsam::Pose3>::Logmap(incoming_pose_aligned);
                 const gtsam::Matrix66 cov = prior.covariance_;
                 gbp::Gaussian belief(pose_key, mu, cov, 1);
 
@@ -2787,20 +3665,242 @@ public:
             poseCovariance = gtsam::Matrix66::Identity();
         }
         gtsam::Matrix beliefPoseCovariance = poseCovariance;
+        bool belief_cov_fallback_used = false;
+        std::string belief_cov_source_path =
+            "activePoseMarginalCovariance(last_saved_pose_key)";
         if (activeValueExists(last_saved_pose_key)) {
             try {
                 beliefPoseCovariance =
-                    activePoseBeliefMarginalCovariance(last_saved_pose_key);
+                    activePoseBeliefMarginalCovariance(
+                        last_saved_pose_key,
+                        &belief_cov_fallback_used,
+                        &belief_cov_source_path);
             } catch (const std::exception& e) {
+                belief_cov_fallback_used = true;
+                belief_cov_source_path =
+                    "activePoseBeliefMarginalCovariance(exception_fallback_activePoseMarginalCovariance)";
                 ROS_WARN_STREAM_THROTTLE(
                     2.0,
                     "Failed to query LOCAL belief covariance, using active covariance fallback: "
                         << e.what());
             } catch (...) {
+                belief_cov_fallback_used = true;
+                belief_cov_source_path =
+                    "activePoseBeliefMarginalCovariance(unknown_exception_fallback_activePoseMarginalCovariance)";
                 ROS_WARN_STREAM_THROTTLE(
                     2.0,
                     "Failed to query LOCAL belief covariance, using active covariance fallback.");
             }
+        }
+        Eigen::Matrix<double, 6, 6> anchored_cov_lidar =
+            beliefPoseCovariance.block<6, 6>(0, 0);
+        bool anchored_cov_available = false;
+        if (usingCbs()) {
+#ifdef LIORF_USE_CBS
+            if (cbs_optimizer_ && activeValueExists(last_saved_pose_key)) {
+                try {
+                    const gtsam::Values all_values = cbs_optimizer_->calculateEstimate();
+                    const auto factors_full = cbs_optimizer_->getFactorsUnsafe();
+
+                    gtsam::NonlinearFactorGraph local_factors;
+                    std::unordered_set<gtsam::Key> local_graph_keys;
+                    local_factors.reserve(factors_full.size());
+
+                    for (const auto& factor : factors_full) {
+                        if (!factor) {
+                            continue;
+                        }
+                        const auto& fkeys = factor->keys();
+                        const bool remove_from_local =
+                            (fkeys.size() == 2) &&
+                            (cbs::isPoseBeliefFactor(cbs_optimizer_->id(), factor) ||
+                             cbs::isAnchorBeliefFactor(factor));
+                        if (remove_from_local) {
+                            continue;
+                        }
+
+                        local_factors.push_back(factor);
+                        for (const auto fk : fkeys) {
+                            local_graph_keys.insert(fk);
+                        }
+                    }
+
+                    gtsam::Values local_values;
+                    for (const auto fk : local_graph_keys) {
+                        if (all_values.exists(fk)) {
+                            local_values.insert_or_assign(fk, all_values.at(fk));
+                        }
+                    }
+                    if (all_values.exists(last_saved_pose_key) &&
+                        !local_values.exists(last_saved_pose_key)) {
+                        local_values.insert_or_assign(
+                            last_saved_pose_key, all_values.at(last_saved_pose_key));
+                    }
+
+                    if (local_values.exists(last_saved_pose_key)) {
+                        gtsam::NonlinearFactorGraph anchored_local_factors = local_factors;
+                        gtsam::Vector6 anchor_var;
+                        anchor_var << cbs_local_cov_diag_anchor_rot_var_,
+                            cbs_local_cov_diag_anchor_rot_var_,
+                            cbs_local_cov_diag_anchor_rot_var_,
+                            cbs_local_cov_diag_anchor_trans_var_,
+                            cbs_local_cov_diag_anchor_trans_var_,
+                            cbs_local_cov_diag_anchor_trans_var_;
+                        const auto anchor_noise =
+                            gtsam::noiseModel::Diagonal::Variances(anchor_var);
+                        const gtsam::Pose3 anchor_pose =
+                            local_values.at<gtsam::Pose3>(last_saved_pose_key);
+                        anchored_local_factors
+                            .emplace_shared<gtsam::PriorFactor<gtsam::Pose3>>(
+                                last_saved_pose_key, anchor_pose, anchor_noise);
+
+                        const gtsam::Marginals anchored_marginals(
+                            anchored_local_factors, local_values);
+                        const gtsam::Matrix anchored_cov =
+                            anchored_marginals.marginalCovariance(last_saved_pose_key);
+                        if (anchored_cov.rows() >= 6 && anchored_cov.cols() >= 6 &&
+                            anchored_cov.allFinite()) {
+                            anchored_cov_lidar = anchored_cov.topLeftCorner(6, 6);
+                            anchored_cov_available = true;
+                        }
+                    }
+                } catch (const std::exception& e) {
+                    ROS_WARN_STREAM_THROTTLE(
+                        2.0,
+                        "Failed anchored covariance query for outgoing CBS belief export: "
+                            << e.what());
+                } catch (...) {
+                    ROS_WARN_STREAM_THROTTLE(
+                        2.0,
+                        "Failed anchored covariance query for outgoing CBS belief export.");
+                }
+            }
+#endif
+        }
+
+        Eigen::Matrix<double, 6, 6> published_cov_lidar =
+            beliefPoseCovariance.block<6, 6>(0, 0);
+        std::string published_cov_source_path = belief_cov_source_path;
+        if (anchored_cov_available) {
+            published_cov_lidar = anchored_cov_lidar;
+            published_cov_source_path =
+                "anchored_local_graph_marginal_with_pose_anchor_prior";
+        }
+
+        const auto covarianceLogdet = [](const Eigen::Matrix<double, 6, 6>& cov) {
+            Eigen::LLT<Eigen::Matrix<double, 6, 6>> llt(cov);
+            if (llt.info() != Eigen::Success) {
+                return std::numeric_limits<double>::quiet_NaN();
+            }
+            const auto& L = llt.matrixL();
+            double sum_log_diag = 0.0;
+            for (int i = 0; i < 6; ++i) {
+                const double d = L(i, i);
+                if (!(d > 0.0) || !std::isfinite(d)) {
+                    return std::numeric_limits<double>::quiet_NaN();
+                }
+                sum_log_diag += std::log(d);
+            }
+            return 2.0 * sum_log_diag;
+        };
+        const auto covarianceLambdaMin = [](const Eigen::Matrix<double, 6, 6>& cov) {
+            Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 6, 6>> eig(cov);
+            if (eig.info() != Eigen::Success) {
+                return std::numeric_limits<double>::quiet_NaN();
+                }
+                return eig.eigenvalues().minCoeff();
+        };
+        const Eigen::Matrix<double, 6, 6> raw_local_cov_lidar =
+            beliefPoseCovariance.block<6, 6>(0, 0);
+        const Eigen::Matrix<double, 6, 6> full_cov_lidar =
+            poseCovariance.block<6, 6>(0, 0);
+        const Eigen::Matrix<double, 6, 6> published_cov_exchange =
+            lidarCovarianceToExchangeCovariance(published_cov_lidar);
+        const Eigen::Matrix<double, 6, 6> raw_local_cov_exchange =
+            lidarCovarianceToExchangeCovariance(raw_local_cov_lidar);
+        const Eigen::Matrix<double, 6, 6> full_cov_exchange =
+            lidarCovarianceToExchangeCovariance(full_cov_lidar);
+        const Eigen::Matrix<double, 6, 6> anchored_cov_exchange =
+            lidarCovarianceToExchangeCovariance(anchored_cov_lidar);
+
+        const double local_trace = published_cov_exchange.trace();
+        const double local_logdet = covarianceLogdet(published_cov_exchange);
+        const double local_lambda_min = covarianceLambdaMin(published_cov_exchange);
+        const double raw_local_trace = raw_local_cov_exchange.trace();
+        const double raw_local_logdet = covarianceLogdet(raw_local_cov_exchange);
+        const double raw_local_lambda_min =
+            covarianceLambdaMin(raw_local_cov_exchange);
+        const double full_trace = full_cov_exchange.trace();
+        const double full_logdet = covarianceLogdet(full_cov_exchange);
+        const double full_lambda_min = covarianceLambdaMin(full_cov_exchange);
+        const double anchored_trace = anchored_cov_exchange.trace();
+        const double anchored_logdet = covarianceLogdet(anchored_cov_exchange);
+        const double anchored_lambda_min = covarianceLambdaMin(anchored_cov_exchange);
+        const int fused_available =
+            (full_cov_exchange.allFinite() && std::isfinite(full_trace)) ? 1 : 0;
+        const double trace_ratio =
+            (std::isfinite(local_trace) && local_trace > 0.0 &&
+             std::isfinite(full_trace))
+                ? (full_trace / local_trace)
+                : std::numeric_limits<double>::quiet_NaN();
+        const double logdet_delta =
+            (std::isfinite(local_logdet) && std::isfinite(full_logdet))
+                ? (full_logdet - local_logdet)
+                : std::numeric_limits<double>::quiet_NaN();
+        const double lambda_min_ratio =
+            (std::isfinite(local_lambda_min) && local_lambda_min > 0.0 &&
+             std::isfinite(full_lambda_min))
+                ? (full_lambda_min / local_lambda_min)
+                : std::numeric_limits<double>::quiet_NaN();
+        std::cerr << std::setprecision(12)
+                  << "[CBS][OutgoingBeliefCov] key=" << last_saved_pose_key
+                  << " frame_id=" << new_pose_idx
+                  << " timestamp_ns=" << toTimestampNsec(timeLaserInfoStamp)
+                  << " local_only_trace=" << local_trace
+                  << " local_only_logdet=" << local_logdet
+                  << " local_only_lambda_min=" << local_lambda_min
+                  << " fused_posterior_available=" << fused_available
+                  << " fused_posterior_trace=" << full_trace
+                  << " fused_posterior_logdet=" << full_logdet
+                  << " fused_posterior_lambda_min=" << full_lambda_min
+                  << " local_to_fused_trace_ratio=" << trace_ratio
+                  << " fused_minus_local_logdet_delta=" << logdet_delta
+                  << " fused_to_local_lambda_min_ratio=" << lambda_min_ratio
+                  << " published_trace=" << local_trace
+                  << " published_logdet=" << local_logdet
+                  << " published_lambda_min=" << local_lambda_min
+                  << " raw_local_trace=" << raw_local_trace
+                  << " raw_local_logdet=" << raw_local_logdet
+                  << " raw_local_lambda_min=" << raw_local_lambda_min
+                  << " full_trace=" << full_trace
+                  << " full_logdet=" << full_logdet
+                  << " full_lambda_min=" << full_lambda_min
+                  << " anchored_available=" << (anchored_cov_available ? 1 : 0)
+                  << " anchored_trace=" << anchored_trace
+                  << " anchored_logdet=" << anchored_logdet
+                  << " anchored_lambda_min=" << anchored_lambda_min
+                  << " local_sender_lidar_trace=" << published_cov_lidar.trace()
+                  << " raw_local_sender_lidar_trace=" << raw_local_cov_lidar.trace()
+                  << " full_sender_lidar_trace=" << full_cov_lidar.trace()
+                  << " anchored_sender_lidar_trace=" << anchored_cov_lidar.trace()
+                  << " source_func=activePoseBeliefMarginalCovariance"
+                  << " source_path=" << published_cov_source_path
+                  << " raw_source_path=" << belief_cov_source_path
+                  << " covariance_conversion_applied="
+                  << (external_exchange_in_body_frame_ ? 1 : 0)
+                  << " exchange_frame_mode="
+                  << (external_exchange_in_body_frame_ ? "body" : "lidar")
+                  << " exchange_rot_mode="
+                  << (external_exchange_use_ext_rot_inverse_ ? "extRot_inverse"
+                                                             : "extRot")
+                  << " fallback_applied=" << (belief_cov_fallback_used ? 1 : 0)
+                  << " regularization_applied=0"
+                  << std::endl;
+        if (shouldEmitCbsLocalCovDiag(new_pose_idx)) {
+            emitCbsLocalCovDiag(
+                last_saved_pose_key,
+                new_pose_idx,
+                toTimestampNsec(timeLaserInfoStamp));
         }
         // zy Step 5_j
         // Updates the outgoing LIORF belief snapshot (pose + covariance) for external fusion.
@@ -2808,7 +3908,7 @@ public:
             timeLaserInfoStamp,
             new_pose_idx,
             latestEstimate,
-            beliefPoseCovariance.block<6, 6>(0, 0));
+            published_cov_lidar);
 
         // zy Step 7_g
         // Publish after updating cache so external consumers receive the current keyframe belief.

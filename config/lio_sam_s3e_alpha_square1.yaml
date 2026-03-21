@@ -46,6 +46,10 @@ liorf:
   extrinsicRot: [0.999952972927, 0.009666233370, -0.000789813389,
                 -0.009686315560, 0.999457004696, -0.031493921503,
                  0.000484959760, 0.031500094968, 0.999503635170]
+  # CBS exchange convention for S3E single-drone Kimera<->LIORF bridge:
+  # exchange in body frame and use extrinsicRot as provided (no inverse).
+  external_exchange_in_body_frame: true
+  external_exchange_use_ext_rot_inverse: false
 
   # 9-axis only (kept identity since imuType=0 for S3E runs)
   extrinsicRPY: [1, 0, 0,
