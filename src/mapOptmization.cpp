@@ -144,7 +144,12 @@ public:
     // zy Step 1_e
     // initialize CBS object now; full update-path substitution comes in next steps.
     std::shared_ptr<cbs::BPSAM> cbs_optimizer_;
+    // Local-only incremental sidegraph used for outgoing CBS local covariance.
+    std::shared_ptr<cbs::BPSAM> cbs_local_cov_sidegraph_;
 #endif
+    bool cbs_local_sidegraph_enabled_ = true;
+    size_t cbs_local_sidegraph_updates_ = 0;
+    mutable size_t cbs_local_sidegraph_sync_miss_count_ = 0;
 
     // zy Step 5_b
     // Holds the latest LIORF pose belief that can be shared with an external fusion bridge.
@@ -235,6 +240,11 @@ public:
     // Diagnostic-only mean alignment mode: estimate/apply per-source
     // receiver_world<-sender_world transform before CBS addBeliefs().
     bool cbs_diag_align_incoming_mean_ = false;
+    // Diagnostic-only switch: treat incoming exchange pose/covariance as already
+    // lidar-frame on receive path (skip exchange->lidar transform).
+    bool cbs_diag_force_identity_exchange_to_lidar_ = false;
+    // Diagnostic knob: scales only outgoing CBS belief covariance before publish.
+    double cbs_outgoing_cov_scale_ = 1.0;
     // zy Step 12_b
     // Tracks last seen sequence per source to drop replayed/out-of-order external priors.
     mutable std::mutex external_source_seq_mutex_;
@@ -408,8 +418,32 @@ public:
         nh.param<bool>("liorf/cbs_diag_align_incoming_mean",
                        cbs_diag_align_incoming_mean_,
                        false);
+        nh.param<bool>("liorf/cbs_diag_force_identity_exchange_to_lidar",
+                       cbs_diag_force_identity_exchange_to_lidar_,
+                       false);
+        nh.param<double>("liorf/cbs_outgoing_cov_scale",
+                         cbs_outgoing_cov_scale_,
+                         1.0);
+        nh.param<bool>("liorf/cbs_local_sidegraph_enabled",
+                       cbs_local_sidegraph_enabled_,
+                       true);
+        if (!std::isfinite(cbs_outgoing_cov_scale_) ||
+            cbs_outgoing_cov_scale_ < 1.0) {
+            ROS_WARN_STREAM(
+                "liorf/cbs_outgoing_cov_scale must be finite and >= 1.0. "
+                "Resetting to 1.0 (requested="
+                << cbs_outgoing_cov_scale_ << ")");
+            cbs_outgoing_cov_scale_ = 1.0;
+        }
         ROS_INFO_STREAM("LIORF CBS incoming-mean alignment diagnostic mode: "
                         << (cbs_diag_align_incoming_mean_ ? "ON" : "OFF"));
+        ROS_INFO_STREAM(
+            "LIORF CBS identity exchange->lidar covariance/pose diagnostic mode: "
+            << (cbs_diag_force_identity_exchange_to_lidar_ ? "ON" : "OFF"));
+        ROS_INFO_STREAM("LIORF CBS outgoing covariance scale: "
+                        << cbs_outgoing_cov_scale_);
+        ROS_INFO_STREAM("LIORF CBS local sidegraph mode: "
+                        << (cbs_local_sidegraph_enabled_ ? "ON" : "OFF"));
 
 
 
@@ -436,6 +470,11 @@ public:
                 static_cast<float>(cbs_gamma_);
             cbs_optimizer_ = std::make_shared<cbs::BPSAM>(cbs_params);
             ROS_INFO_STREAM("LIORF CBS BPSAM initialized. use_cbs_optimizer=true");
+            if (cbs_local_sidegraph_enabled_) {
+                cbs_local_cov_sidegraph_ = std::make_shared<cbs::BPSAM>(cbs_params);
+                ROS_INFO_STREAM(
+                    "LIORF CBS local sidegraph initialized (incremental local-only covariance path).");
+            }
             ROS_INFO_STREAM("LIORF CBS belief contraction params: type=Contract"
                             << ", metric=Hellinger"
                             << ", alpha=" << cbs_contract_alpha_
@@ -548,6 +587,100 @@ public:
         return isam->marginalCovariance(key);
     }
 
+    bool localSidegraphReady() const
+    {
+#ifdef LIORF_USE_CBS
+        return usingCbs() && cbs_local_sidegraph_enabled_ &&
+               static_cast<bool>(cbs_local_cov_sidegraph_);
+#else
+        return false;
+#endif
+    }
+
+    bool localSidegraphValueExists(const gtsam::Key& key) const
+    {
+#ifdef LIORF_USE_CBS
+        return localSidegraphReady() && cbs_local_cov_sidegraph_->valueExists(key);
+#else
+        (void)key;
+        return false;
+#endif
+    }
+
+    bool computeAnchoredLocalSidegraphCovariance(
+        const gtsam::Key& key,
+        Eigen::Matrix<double, 6, 6>* anchored_cov_out,
+        std::string* source_path = nullptr) const
+    {
+#ifndef LIORF_USE_CBS
+        (void)key;
+        (void)anchored_cov_out;
+        (void)source_path;
+        return false;
+#else
+        if (!anchored_cov_out || !localSidegraphReady() ||
+            !cbs_local_cov_sidegraph_->valueExists(key)) {
+            return false;
+        }
+
+        try {
+            const gtsam::Values all_values =
+                cbs_local_cov_sidegraph_->calculateEstimate();
+            if (!all_values.exists(key)) {
+                return false;
+            }
+
+            const auto factors_full = cbs_local_cov_sidegraph_->getFactorsUnsafe();
+            gtsam::NonlinearFactorGraph anchored_factors;
+            anchored_factors.reserve(factors_full.size() + 1);
+            for (const auto& factor : factors_full) {
+                if (factor) {
+                    anchored_factors.push_back(factor);
+                }
+            }
+
+            gtsam::Vector6 anchor_var;
+            anchor_var << cbs_local_cov_diag_anchor_rot_var_,
+                cbs_local_cov_diag_anchor_rot_var_,
+                cbs_local_cov_diag_anchor_rot_var_,
+                cbs_local_cov_diag_anchor_trans_var_,
+                cbs_local_cov_diag_anchor_trans_var_,
+                cbs_local_cov_diag_anchor_trans_var_;
+            const auto anchor_noise =
+                gtsam::noiseModel::Diagonal::Variances(anchor_var);
+            const gtsam::Pose3 anchor_pose = all_values.at<gtsam::Pose3>(key);
+            anchored_factors.emplace_shared<gtsam::PriorFactor<gtsam::Pose3>>(
+                key, anchor_pose, anchor_noise);
+
+            const gtsam::Marginals anchored_marginals(anchored_factors, all_values);
+            const gtsam::Matrix anchored_cov =
+                anchored_marginals.marginalCovariance(key);
+            if (anchored_cov.rows() < 6 || anchored_cov.cols() < 6 ||
+                !anchored_cov.allFinite()) {
+                return false;
+            }
+
+            *anchored_cov_out = anchored_cov.topLeftCorner(6, 6);
+            if (source_path) {
+                *source_path =
+                    "cbs_local_cov_sidegraph_->marginalCovariance(key)[anchored_pose_prior]";
+            }
+            return true;
+        } catch (const std::exception& e) {
+            ROS_WARN_STREAM_THROTTLE(
+                2.0,
+                "Local sidegraph anchored covariance query failed for key " << key
+                                                                             << ": "
+                                                                             << e.what());
+        } catch (...) {
+            ROS_WARN_STREAM_THROTTLE(
+                2.0,
+                "Local sidegraph anchored covariance query failed for key " << key);
+        }
+        return false;
+#endif
+    }
+
     // Pose-belief covariance should follow CBS local marginalization:
     // exclude incoming belief factors before publishing beliefs.
     gtsam::Matrix activePoseBeliefMarginalCovariance(
@@ -563,6 +696,54 @@ public:
         }
         if (usingCbs()) {
 #ifdef LIORF_USE_CBS
+            if (localSidegraphReady()) {
+                if (!cbs_local_cov_sidegraph_->valueExists(key)) {
+                    ++cbs_local_sidegraph_sync_miss_count_;
+                    if (used_fallback) {
+                        *used_fallback = true;
+                    }
+                    if (covariance_source_path) {
+                        *covariance_source_path =
+                            "cbs_local_cov_sidegraph_->marginalCovariance(key)[fallback_missing_key]";
+                    }
+                } else {
+                    try {
+                        const gtsam::Matrix cov =
+                            cbs_local_cov_sidegraph_->marginalCovariance(key);
+                        if (covariance_source_path) {
+                            *covariance_source_path =
+                                "cbs_local_cov_sidegraph_->marginalCovariance(key)";
+                        }
+                        return cov;
+                    } catch (const std::exception& e) {
+                        if (used_fallback) {
+                            *used_fallback = true;
+                        }
+                        if (covariance_source_path) {
+                            *covariance_source_path =
+                                "cbs_local_cov_sidegraph_->marginalCovariance(key)[fallback_query_failure]";
+                        }
+                        ROS_WARN_STREAM_THROTTLE(
+                            2.0,
+                            "Local sidegraph covariance query failed for key "
+                                << key << ", falling back to main CBS LOCAL query: "
+                                << e.what());
+                    } catch (...) {
+                        if (used_fallback) {
+                            *used_fallback = true;
+                        }
+                        if (covariance_source_path) {
+                            *covariance_source_path =
+                                "cbs_local_cov_sidegraph_->marginalCovariance(key)[fallback_unknown_failure]";
+                        }
+                        ROS_WARN_STREAM_THROTTLE(
+                            2.0,
+                            "Local sidegraph covariance query failed for key "
+                                << key << ", falling back to main CBS LOCAL query.");
+                    }
+                }
+            }
+
             if (!cbs_optimizer_) {
                 if (used_fallback) {
                     *used_fallback = true;
@@ -741,6 +922,7 @@ public:
         size_t removed_anchor_belief_count = 0;
         size_t key_degree_full = 0;
         size_t key_degree_local = 0;
+        std::string local_cov_source = "cbs_optimizer_local_marginalization";
 
         const auto all_values = cbs_optimizer_->calculateEstimate();
         const auto factors_full = cbs_optimizer_->getFactorsUnsafe();
@@ -807,8 +989,17 @@ public:
         key_exists_in_values_local = local_values.exists(key) ? 1 : 0;
 
         try {
-            const gtsam::Matrix local_cov = cbs_optimizer_->marginalCovariance(
-                key, cbs::BPSAM::MarginalizationType::LOCAL);
+            gtsam::Matrix local_cov;
+            if (localSidegraphReady() &&
+                cbs_local_cov_sidegraph_->valueExists(key)) {
+                local_cov = cbs_local_cov_sidegraph_->marginalCovariance(key);
+                local_cov_source = "cbs_local_cov_sidegraph";
+            } else {
+                local_cov = cbs_optimizer_->marginalCovariance(
+                    key, cbs::BPSAM::MarginalizationType::LOCAL);
+                local_cov_source =
+                    "cbs_optimizer_local_marginalization[fallback]";
+            }
             local_trace = covarianceTrace(local_cov);
             local_logdet = covarianceLogdet(local_cov);
             local_lambda_min = covarianceLambdaMin(local_cov);
@@ -912,6 +1103,7 @@ public:
                   << " local_factor_count=" << local_factor_count
                   << " removed_pose_belief_count=" << removed_pose_belief_count
                   << " removed_anchor_belief_count=" << removed_anchor_belief_count
+                  << " local_cov_source=" << local_cov_source
                   << " key_degree_full=" << key_degree_full
                   << " key_degree_local=" << key_degree_local
                   << " key_connected_to_robot=" << key_connected_to_robot
@@ -1087,7 +1279,8 @@ public:
     // Converts incoming exchange-frame pose into LIORF internal lidar frame.
     gtsam::Pose3 exchangePoseToLidarPose(const gtsam::Pose3& W_Pose_exchange) const
     {
-        if (!external_exchange_in_body_frame_) {
+        if (!external_exchange_in_body_frame_ ||
+            cbs_diag_force_identity_exchange_to_lidar_) {
             return W_Pose_exchange;
         }
         const gtsam::Pose3 B_Pose_L = lidarToBodyExtrinsic().inverse();
@@ -1110,7 +1303,8 @@ public:
     Eigen::Matrix<double, 6, 6> exchangeCovarianceToLidarCovariance(
         const Eigen::Matrix<double, 6, 6>& covariance_exchange) const
     {
-        if (!external_exchange_in_body_frame_) {
+        if (!external_exchange_in_body_frame_ ||
+            cbs_diag_force_identity_exchange_to_lidar_) {
             return covariance_exchange;
         }
         const gtsam::Pose3 B_Pose_L = lidarToBodyExtrinsic().inverse();
@@ -1324,6 +1518,9 @@ public:
         // Normalizes source tags and drops self/duplicate priors before they enter the queue.
         const std::string source = normalizeExternalSourceTag(msg->child_frame_id);
         const uint64_t source_seq = static_cast<uint64_t>(msg->header.seq);
+        const bool exchange_to_lidar_conversion_applied =
+            external_exchange_in_body_frame_ &&
+            !cbs_diag_force_identity_exchange_to_lidar_;
 
         const auto covarianceLogdet = [](const Eigen::Matrix<double, 6, 6>& cov) {
             Eigen::LLT<Eigen::Matrix<double, 6, 6>> llt(cov);
@@ -1348,6 +1545,26 @@ public:
             }
             return eig.eigenvalues().minCoeff();
         };
+        const auto safeRatio = [](const double num, const double den) {
+            if (std::isfinite(num) && std::isfinite(den) && den > 0.0) {
+                return num / den;
+            }
+            return std::numeric_limits<double>::quiet_NaN();
+        };
+        const double raw_trace = covariance.trace();
+        const double raw_logdet = covarianceLogdet(covariance);
+        const double raw_lambda_min = covarianceLambdaMin(covariance);
+        const double converted_trace = covariance_lidar.trace();
+        const double converted_logdet = covarianceLogdet(covariance_lidar);
+        const double converted_lambda_min = covarianceLambdaMin(covariance_lidar);
+        const double converted_over_raw_trace_ratio =
+            safeRatio(converted_trace, raw_trace);
+        const double converted_over_raw_lambda_min_ratio =
+            safeRatio(converted_lambda_min, raw_lambda_min);
+        const double converted_minus_raw_logdet_delta =
+            (std::isfinite(converted_logdet) && std::isfinite(raw_logdet))
+                ? (converted_logdet - raw_logdet)
+                : std::numeric_limits<double>::quiet_NaN();
         std::cerr << std::setprecision(12)
                   << "[CBS][IncomingPriorCov] source=" << source
                   << " source_seq=" << source_seq
@@ -1367,12 +1584,21 @@ public:
                   << " incoming_raw_mean_qy=" << q_raw_exchange.y()
                   << " incoming_raw_mean_qz=" << q_raw_exchange.z()
                   << " incoming_raw_mean_qw=" << q_raw_exchange.w()
-                  << " reordered_trace=" << covariance.trace()
-                  << " reordered_logdet=" << covarianceLogdet(covariance)
-                  << " reordered_lambda_min=" << covarianceLambdaMin(covariance)
-                  << " converted_trace=" << covariance_lidar.trace()
-                  << " converted_logdet=" << covarianceLogdet(covariance_lidar)
-                  << " converted_lambda_min=" << covarianceLambdaMin(covariance_lidar)
+                  << " raw_trace=" << raw_trace
+                  << " raw_logdet=" << raw_logdet
+                  << " raw_lambda_min=" << raw_lambda_min
+                  << " reordered_trace=" << raw_trace
+                  << " reordered_logdet=" << raw_logdet
+                  << " reordered_lambda_min=" << raw_lambda_min
+                  << " converted_trace=" << converted_trace
+                  << " converted_logdet=" << converted_logdet
+                  << " converted_lambda_min=" << converted_lambda_min
+                  << " converted_over_raw_trace_ratio="
+                  << converted_over_raw_trace_ratio
+                  << " converted_over_raw_lambda_min_ratio="
+                  << converted_over_raw_lambda_min_ratio
+                  << " converted_minus_raw_logdet_delta="
+                  << converted_minus_raw_logdet_delta
                   << " incoming_converted_mean_semantic=world_to_lidar_pose"
                   << " incoming_converted_mean_tx="
                   << W_Pose_L.translation().x()
@@ -1389,11 +1615,19 @@ public:
                   << " incoming_converted_mean_qw="
                   << q_converted_lidar.w()
                   << " body_frame_conversion_applied="
-                  << (external_exchange_in_body_frame_ ? 1 : 0)
+                  << (exchange_to_lidar_conversion_applied ? 1 : 0)
+                  << " cbs_diag_force_identity_exchange_to_lidar="
+                  << (cbs_diag_force_identity_exchange_to_lidar_ ? 1 : 0)
+                  << " exchange_to_lidar_conversion_skipped="
+                  << (exchange_to_lidar_conversion_applied ? 0 : 1)
                   << " ext_rot_inverse_applied="
                   << (external_exchange_use_ext_rot_inverse_ ? 1 : 0)
                   << " exchange_frame_mode="
                   << (external_exchange_in_body_frame_ ? "body" : "lidar")
+                  << " covariance_transport_mode="
+                  << (exchange_to_lidar_conversion_applied
+                          ? "reorder_plus_exchange_to_lidar_adjoint"
+                          : "reorder_only_identity_exchange_to_lidar")
                   << " exchange_rot_mode="
                   << (external_exchange_use_ext_rot_inverse_ ? "extRot_inverse"
                                                              : "extRot")
@@ -2148,63 +2382,154 @@ public:
         if (usingCbs()) {
 #ifdef LIORF_USE_CBS
             cbs::BPSAM::UpdateParams update_params;
-            //zy Step 41e
-            // Mirrors CBS pose-stage inner rounds: first update with new factors, then belief-only rounds until convergence.
             const int max_pose_rounds = std::max(1, cbs_pose_rounds_per_epoch_);
             const double abs_eps =
                 std::max(0.0, cbs_pose_convergence_abs_residual_);
             const double rel_eps =
                 std::max(0.0, cbs_pose_convergence_rel_residual_);
-            auto compute_cbs_residual = [&](double* residual_out) -> bool {
-                try {
-                    const gtsam::Values estimate = cbs_optimizer_->calculateEstimate();
-                    *residual_out = cbs_optimizer_->getFactorsUnsafe().error(estimate);
-                    return true;
-                } catch (...) {
-                    return false;
-                }
-            };
-            cbs_optimizer_->update(factors, values, update_params);
+            auto run_pose_rounds = [&](cbs::BPSAM* optimizer,
+                                       const gtsam::NonlinearFactorGraph& new_factors,
+                                       const gtsam::Values& new_values,
+                                       const cbs::BPSAM::UpdateParams& params,
+                                       const bool emit_convergence_log) {
+                auto compute_cbs_residual = [&](double* residual_out) -> bool {
+                    try {
+                        const gtsam::Values estimate = optimizer->calculateEstimate();
+                        *residual_out = optimizer->getFactorsUnsafe().error(estimate);
+                        return true;
+                    } catch (...) {
+                        return false;
+                    }
+                };
+                optimizer->update(new_factors, new_values, params);
 
-            double prev_residual = 0.0;
-            bool has_prev_residual = compute_cbs_residual(&prev_residual);
-            for (int round = 1; round < max_pose_rounds; ++round) {
-                cbs_optimizer_->update(gtsam::NonlinearFactorGraph(),
-                                       gtsam::Values(),
-                                       update_params);
+                double prev_residual = 0.0;
+                bool has_prev_residual = compute_cbs_residual(&prev_residual);
+                for (int round = 1; round < max_pose_rounds; ++round) {
+                    optimizer->update(gtsam::NonlinearFactorGraph(),
+                                      gtsam::Values(),
+                                      params);
 
-                double curr_residual = 0.0;
-                const bool has_curr_residual = compute_cbs_residual(&curr_residual);
-                if (has_prev_residual && has_curr_residual) {
-                    const double abs_change = std::fabs(curr_residual - prev_residual);
-                    const double rel_change =
-                        abs_change / std::max(std::fabs(prev_residual), 1e-12);
-                    if (abs_change <= abs_eps || rel_change <= rel_eps) {
-                        ROS_INFO_STREAM_THROTTLE(
-                            2.0,
-                            "LIORF CBS pose rounds converged early at round "
-                                << (round + 1) << "/" << max_pose_rounds
-                                << " (abs=" << abs_change
-                                << ", rel=" << rel_change << ")");
-                        break;
+                    double curr_residual = 0.0;
+                    const bool has_curr_residual = compute_cbs_residual(&curr_residual);
+                    if (has_prev_residual && has_curr_residual) {
+                        const double abs_change =
+                            std::fabs(curr_residual - prev_residual);
+                        const double rel_change =
+                            abs_change / std::max(std::fabs(prev_residual), 1e-12);
+                        if (abs_change <= abs_eps || rel_change <= rel_eps) {
+                            if (emit_convergence_log) {
+                                ROS_INFO_STREAM_THROTTLE(
+                                    2.0,
+                                    "LIORF CBS pose rounds converged early at round "
+                                        << (round + 1) << "/" << max_pose_rounds
+                                        << " (abs=" << abs_change
+                                        << ", rel=" << rel_change << ")");
+                            }
+                            break;
+                        }
+                    }
+
+                    if (has_curr_residual) {
+                        prev_residual = curr_residual;
+                        has_prev_residual = true;
                     }
                 }
 
-                if (has_curr_residual) {
-                    prev_residual = curr_residual;
-                    has_prev_residual = true;
+                if (run_extra_updates) {
+                    for (int i = 0; i < 5; ++i) {
+                        optimizer->update(gtsam::NonlinearFactorGraph(),
+                                          gtsam::Values(),
+                                          params);
+                    }
+                }
+            };
+
+            // Main (fused) CBS graph update.
+            run_pose_rounds(
+                cbs_optimizer_.get(), factors, values, update_params, true);
+
+            // Local-only CBS sidegraph update used for outgoing local covariance.
+            if (localSidegraphReady()) {
+                try {
+                    gtsam::NonlinearFactorGraph local_factors;
+                    std::unordered_set<gtsam::Key> local_factor_keys;
+                    local_factors.reserve(factors.size());
+
+                    size_t skipped_belief_or_anchor = 0;
+                    for (const auto& factor : factors) {
+                        if (!factor) {
+                            continue;
+                        }
+                        const auto& fkeys = factor->keys();
+                        const bool remove_from_local =
+                            (fkeys.size() == 2) &&
+                            (cbs::isPoseBeliefFactor(
+                                 cbs_local_cov_sidegraph_->id(), factor) ||
+                             cbs::isAnchorBeliefFactor(factor));
+                        if (remove_from_local) {
+                            ++skipped_belief_or_anchor;
+                            continue;
+                        }
+                        local_factors.push_back(factor);
+                        for (const auto fk : fkeys) {
+                            local_factor_keys.insert(fk);
+                        }
+                    }
+
+                    gtsam::Values local_values;
+                    for (const auto fk : local_factor_keys) {
+                        if (values.exists(fk)) {
+                            local_values.insert_or_assign(fk, values.at(fk));
+                        }
+                    }
+
+                    run_pose_rounds(cbs_local_cov_sidegraph_.get(),
+                                    local_factors,
+                                    local_values,
+                                    update_params,
+                                    false);
+                    ++cbs_local_sidegraph_updates_;
+
+                    const size_t main_key_count =
+                        cbs_optimizer_->allKeysInSAM().size();
+                    const size_t local_key_count =
+                        cbs_local_cov_sidegraph_->allKeysInSAM().size();
+                    const int sync_ok =
+                        (local_key_count <= main_key_count) ? 1 : 0;
+                    if (!sync_ok) {
+                        ++cbs_local_sidegraph_sync_miss_count_;
+                    }
+                    std::cerr << "[CBS][LocalSidegraphDiag]"
+                              << " update_seq=" << cbs_local_sidegraph_updates_
+                              << " incoming_factor_count=" << factors.size()
+                              << " local_factor_count=" << local_factors.size()
+                              << " skipped_belief_or_anchor="
+                              << skipped_belief_or_anchor
+                              << " incoming_value_count=" << values.size()
+                              << " local_value_count=" << local_values.size()
+                              << " main_key_count=" << main_key_count
+                              << " local_key_count=" << local_key_count
+                              << " sync_ok=" << sync_ok
+                              << " sync_miss_total="
+                              << cbs_local_sidegraph_sync_miss_count_
+                              << std::endl;
+                } catch (const std::exception& e) {
+                    ROS_WARN_STREAM_THROTTLE(
+                        1.0,
+                        "LIORF local sidegraph update failed, disabling sidegraph path: "
+                            << e.what());
+                    cbs_local_cov_sidegraph_.reset();
+                    cbs_local_sidegraph_enabled_ = false;
+                } catch (...) {
+                    ROS_WARN_STREAM_THROTTLE(
+                        1.0,
+                        "LIORF local sidegraph update failed (unknown), disabling sidegraph path.");
+                    cbs_local_cov_sidegraph_.reset();
+                    cbs_local_sidegraph_enabled_ = false;
                 }
             }
 
-            if (run_extra_updates) {
-                //zy Step 41f
-                // Preserves loop-closure extra refinement passes after pose-stage rounds.
-                for (int i = 0; i < 5; ++i) {
-                    cbs_optimizer_->update(gtsam::NonlinearFactorGraph(),
-                                           gtsam::Values(),
-                                           update_params);
-                }
-            }
             return;
 #endif
         }
@@ -3621,6 +3946,19 @@ public:
                 << " (idx=" << latest_pose_idx << ").");
             return;
         }
+        if (localSidegraphReady()) {
+            const bool sync_ok = localSidegraphValueExists(latest_pose_key);
+            if (!sync_ok) {
+                ++cbs_local_sidegraph_sync_miss_count_;
+            }
+            std::cerr << "[CBS][LocalSidegraphSync]"
+                      << " frame_id=" << latest_pose_idx
+                      << " key=" << latest_pose_key
+                      << " sync_ok=" << (sync_ok ? 1 : 0)
+                      << " sync_miss_total="
+                      << cbs_local_sidegraph_sync_miss_count_
+                      << std::endl;
+        }
         latestEstimate = optimizerCurrentEstimate.at<Pose3>(latest_pose_key);
 
 
@@ -3695,97 +4033,26 @@ public:
         Eigen::Matrix<double, 6, 6> anchored_cov_lidar =
             beliefPoseCovariance.block<6, 6>(0, 0);
         bool anchored_cov_available = false;
+        std::string anchored_cov_source_path = belief_cov_source_path;
         if (usingCbs()) {
 #ifdef LIORF_USE_CBS
-            if (cbs_optimizer_ && activeValueExists(last_saved_pose_key)) {
-                try {
-                    const gtsam::Values all_values = cbs_optimizer_->calculateEstimate();
-                    const auto factors_full = cbs_optimizer_->getFactorsUnsafe();
-
-                    gtsam::NonlinearFactorGraph local_factors;
-                    std::unordered_set<gtsam::Key> local_graph_keys;
-                    local_factors.reserve(factors_full.size());
-
-                    for (const auto& factor : factors_full) {
-                        if (!factor) {
-                            continue;
-                        }
-                        const auto& fkeys = factor->keys();
-                        const bool remove_from_local =
-                            (fkeys.size() == 2) &&
-                            (cbs::isPoseBeliefFactor(cbs_optimizer_->id(), factor) ||
-                             cbs::isAnchorBeliefFactor(factor));
-                        if (remove_from_local) {
-                            continue;
-                        }
-
-                        local_factors.push_back(factor);
-                        for (const auto fk : fkeys) {
-                            local_graph_keys.insert(fk);
-                        }
-                    }
-
-                    gtsam::Values local_values;
-                    for (const auto fk : local_graph_keys) {
-                        if (all_values.exists(fk)) {
-                            local_values.insert_or_assign(fk, all_values.at(fk));
-                        }
-                    }
-                    if (all_values.exists(last_saved_pose_key) &&
-                        !local_values.exists(last_saved_pose_key)) {
-                        local_values.insert_or_assign(
-                            last_saved_pose_key, all_values.at(last_saved_pose_key));
-                    }
-
-                    if (local_values.exists(last_saved_pose_key)) {
-                        gtsam::NonlinearFactorGraph anchored_local_factors = local_factors;
-                        gtsam::Vector6 anchor_var;
-                        anchor_var << cbs_local_cov_diag_anchor_rot_var_,
-                            cbs_local_cov_diag_anchor_rot_var_,
-                            cbs_local_cov_diag_anchor_rot_var_,
-                            cbs_local_cov_diag_anchor_trans_var_,
-                            cbs_local_cov_diag_anchor_trans_var_,
-                            cbs_local_cov_diag_anchor_trans_var_;
-                        const auto anchor_noise =
-                            gtsam::noiseModel::Diagonal::Variances(anchor_var);
-                        const gtsam::Pose3 anchor_pose =
-                            local_values.at<gtsam::Pose3>(last_saved_pose_key);
-                        anchored_local_factors
-                            .emplace_shared<gtsam::PriorFactor<gtsam::Pose3>>(
-                                last_saved_pose_key, anchor_pose, anchor_noise);
-
-                        const gtsam::Marginals anchored_marginals(
-                            anchored_local_factors, local_values);
-                        const gtsam::Matrix anchored_cov =
-                            anchored_marginals.marginalCovariance(last_saved_pose_key);
-                        if (anchored_cov.rows() >= 6 && anchored_cov.cols() >= 6 &&
-                            anchored_cov.allFinite()) {
-                            anchored_cov_lidar = anchored_cov.topLeftCorner(6, 6);
-                            anchored_cov_available = true;
-                        }
-                    }
-                } catch (const std::exception& e) {
-                    ROS_WARN_STREAM_THROTTLE(
-                        2.0,
-                        "Failed anchored covariance query for outgoing CBS belief export: "
-                            << e.what());
-                } catch (...) {
-                    ROS_WARN_STREAM_THROTTLE(
-                        2.0,
-                        "Failed anchored covariance query for outgoing CBS belief export.");
-                }
-            }
+            anchored_cov_available = computeAnchoredLocalSidegraphCovariance(
+                last_saved_pose_key,
+                &anchored_cov_lidar,
+                &anchored_cov_source_path);
 #endif
         }
 
-        Eigen::Matrix<double, 6, 6> published_cov_lidar =
+        Eigen::Matrix<double, 6, 6> published_cov_lidar_original =
             beliefPoseCovariance.block<6, 6>(0, 0);
         std::string published_cov_source_path = belief_cov_source_path;
         if (anchored_cov_available) {
-            published_cov_lidar = anchored_cov_lidar;
-            published_cov_source_path =
-                "anchored_local_graph_marginal_with_pose_anchor_prior";
+            published_cov_lidar_original = anchored_cov_lidar;
+            published_cov_source_path = anchored_cov_source_path;
         }
+        Eigen::Matrix<double, 6, 6> published_cov_lidar_scaled =
+            published_cov_lidar_original;
+        published_cov_lidar_scaled *= cbs_outgoing_cov_scale_;
 
         const auto covarianceLogdet = [](const Eigen::Matrix<double, 6, 6>& cov) {
             Eigen::LLT<Eigen::Matrix<double, 6, 6>> llt(cov);
@@ -3814,8 +4081,10 @@ public:
             beliefPoseCovariance.block<6, 6>(0, 0);
         const Eigen::Matrix<double, 6, 6> full_cov_lidar =
             poseCovariance.block<6, 6>(0, 0);
-        const Eigen::Matrix<double, 6, 6> published_cov_exchange =
-            lidarCovarianceToExchangeCovariance(published_cov_lidar);
+        const Eigen::Matrix<double, 6, 6> published_cov_exchange_original =
+            lidarCovarianceToExchangeCovariance(published_cov_lidar_original);
+        const Eigen::Matrix<double, 6, 6> published_cov_exchange_scaled =
+            lidarCovarianceToExchangeCovariance(published_cov_lidar_scaled);
         const Eigen::Matrix<double, 6, 6> raw_local_cov_exchange =
             lidarCovarianceToExchangeCovariance(raw_local_cov_lidar);
         const Eigen::Matrix<double, 6, 6> full_cov_exchange =
@@ -3823,9 +4092,18 @@ public:
         const Eigen::Matrix<double, 6, 6> anchored_cov_exchange =
             lidarCovarianceToExchangeCovariance(anchored_cov_lidar);
 
-        const double local_trace = published_cov_exchange.trace();
-        const double local_logdet = covarianceLogdet(published_cov_exchange);
-        const double local_lambda_min = covarianceLambdaMin(published_cov_exchange);
+        const double original_trace = published_cov_exchange_original.trace();
+        const double original_logdet =
+            covarianceLogdet(published_cov_exchange_original);
+        const double original_lambda_min =
+            covarianceLambdaMin(published_cov_exchange_original);
+        const double scaled_trace = published_cov_exchange_scaled.trace();
+        const double scaled_logdet = covarianceLogdet(published_cov_exchange_scaled);
+        const double scaled_lambda_min =
+            covarianceLambdaMin(published_cov_exchange_scaled);
+        const double local_trace = scaled_trace;
+        const double local_logdet = scaled_logdet;
+        const double local_lambda_min = scaled_lambda_min;
         const double raw_local_trace = raw_local_cov_exchange.trace();
         const double raw_local_logdet = covarianceLogdet(raw_local_cov_exchange);
         const double raw_local_lambda_min =
@@ -3856,6 +4134,13 @@ public:
                   << "[CBS][OutgoingBeliefCov] key=" << last_saved_pose_key
                   << " frame_id=" << new_pose_idx
                   << " timestamp_ns=" << toTimestampNsec(timeLaserInfoStamp)
+                  << " outgoing_cov_scale=" << cbs_outgoing_cov_scale_
+                  << " original_trace=" << original_trace
+                  << " scaled_trace=" << scaled_trace
+                  << " original_logdet=" << original_logdet
+                  << " scaled_logdet=" << scaled_logdet
+                  << " original_lambda_min=" << original_lambda_min
+                  << " scaled_lambda_min=" << scaled_lambda_min
                   << " local_only_trace=" << local_trace
                   << " local_only_logdet=" << local_logdet
                   << " local_only_lambda_min=" << local_lambda_min
@@ -3879,7 +4164,9 @@ public:
                   << " anchored_trace=" << anchored_trace
                   << " anchored_logdet=" << anchored_logdet
                   << " anchored_lambda_min=" << anchored_lambda_min
-                  << " local_sender_lidar_trace=" << published_cov_lidar.trace()
+                  << " local_sender_lidar_trace=" << published_cov_lidar_scaled.trace()
+                  << " local_sender_lidar_trace_original="
+                  << published_cov_lidar_original.trace()
                   << " raw_local_sender_lidar_trace=" << raw_local_cov_lidar.trace()
                   << " full_sender_lidar_trace=" << full_cov_lidar.trace()
                   << " anchored_sender_lidar_trace=" << anchored_cov_lidar.trace()
@@ -3908,7 +4195,7 @@ public:
             timeLaserInfoStamp,
             new_pose_idx,
             latestEstimate,
-            published_cov_lidar);
+            published_cov_lidar_scaled);
 
         // zy Step 7_g
         // Publish after updating cache so external consumers receive the current keyframe belief.

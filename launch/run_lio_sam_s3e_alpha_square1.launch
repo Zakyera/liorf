@@ -7,6 +7,8 @@
     <arg name="imu_use_ext_rot_inverse" default="false"/>
     <arg name="external_exchange_in_body_frame" default="true"/>
     <arg name="external_exchange_use_ext_rot_inverse" default="false"/>
+    <arg name="cbs_diag_force_identity_exchange_to_lidar" default="false"/>
+    <arg name="cbs_outgoing_cov_scale" default="1.0"/>
     <arg name="lidar_min_range" default="1.0"/>
     <arg name="downsample_rate" default="1"/>
     <arg name="point_filter_num" default="1"/>
@@ -25,6 +27,8 @@
     <param name="/liorf/imuUseExtRotInverse" value="$(arg imu_use_ext_rot_inverse)" />
     <param name="/liorf/external_exchange_in_body_frame" value="$(arg external_exchange_in_body_frame)" />
     <param name="/liorf/external_exchange_use_ext_rot_inverse" value="$(arg external_exchange_use_ext_rot_inverse)" />
+    <param name="/liorf/cbs_diag_force_identity_exchange_to_lidar" value="$(arg cbs_diag_force_identity_exchange_to_lidar)" />
+    <param name="/liorf/cbs_outgoing_cov_scale" value="$(arg cbs_outgoing_cov_scale)" />
     <param name="/liorf/lidarMinRange" value="$(arg lidar_min_range)" />
     <param name="/liorf/downsampleRate" value="$(arg downsample_rate)" />
     <param name="/liorf/point_filter_num" value="$(arg point_filter_num)" />
