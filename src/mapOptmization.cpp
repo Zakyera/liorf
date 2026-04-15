@@ -126,6 +126,7 @@ public:
     double cbs_contract_alpha_ = 0.5;
     double cbs_d_reset_ = 0.6;
     double cbs_gamma_ = 0.1;
+    bool cbs_enable_soft_reset_ = true;
     //zy Step 41a
     // Adds runtime CBS pose-stage controls so LIORF follows iterative update rounds with convergence checks.
     bool cbs_enable_gkcm_ = false;
@@ -148,6 +149,7 @@ public:
     std::shared_ptr<cbs::BPSAM> cbs_local_cov_sidegraph_;
 #endif
     bool cbs_local_sidegraph_enabled_ = true;
+    bool cbs_use_anchored_receiver_local_for_merge_ = false;
     size_t cbs_local_sidegraph_updates_ = 0;
     mutable size_t cbs_local_sidegraph_sync_miss_count_ = 0;
 
@@ -335,6 +337,8 @@ public:
         nh.param<double>("liorf/cbs_contract_alpha", cbs_contract_alpha_, 0.5);
         nh.param<double>("liorf/cbs_d_reset", cbs_d_reset_, 0.6);
         nh.param<double>("liorf/cbs_gamma", cbs_gamma_, 0.1);
+        nh.param<bool>(
+            "liorf/cbs_enable_soft_reset", cbs_enable_soft_reset_, true);
         //zy Step 41b
         // Exposes CBS GkCM and pose-stage iteration controls via ROS params.
         nh.param<bool>("liorf/cbs_enable_gkcm", cbs_enable_gkcm_, false);
@@ -427,6 +431,9 @@ public:
         nh.param<bool>("liorf/cbs_local_sidegraph_enabled",
                        cbs_local_sidegraph_enabled_,
                        true);
+        nh.param<bool>("liorf/cbs_use_anchored_receiver_local_for_merge",
+                       cbs_use_anchored_receiver_local_for_merge_,
+                       false);
         if (!std::isfinite(cbs_outgoing_cov_scale_) ||
             cbs_outgoing_cov_scale_ < 1.0) {
             ROS_WARN_STREAM(
@@ -455,7 +462,8 @@ public:
             // GkCM toggle is runtime-configurable to align with CBS reference behavior.
             cbs_params.enable_gkcm = cbs_enable_gkcm_;
             cbs_params.robot_id = static_cast<cbs::AgentId>('b');  // LIORF agent id.
-            cbs_params.use_anchored_receiver_local_for_merge = true;
+            cbs_params.use_anchored_receiver_local_for_merge =
+                cbs_use_anchored_receiver_local_for_merge_;
             cbs_params.receiver_local_anchor_rot_var =
                 cbs_local_cov_diag_anchor_rot_var_;
             cbs_params.receiver_local_anchor_trans_var =
@@ -468,6 +476,8 @@ public:
                 static_cast<float>(cbs_d_reset_);
             cbs_params.gbp_update_params.gamma =
                 static_cast<float>(cbs_gamma_);
+            cbs_params.gbp_update_params.enable_soft_reset =
+                cbs_enable_soft_reset_;
             cbs_optimizer_ = std::make_shared<cbs::BPSAM>(cbs_params);
             ROS_INFO_STREAM("LIORF CBS BPSAM initialized. use_cbs_optimizer=true");
             if (cbs_local_sidegraph_enabled_) {
@@ -479,8 +489,12 @@ public:
                             << ", metric=Hellinger"
                             << ", alpha=" << cbs_contract_alpha_
                             << ", d_reset=" << cbs_d_reset_
-                            << ", gamma=" << cbs_gamma_);
-            ROS_INFO_STREAM("LIORF CBS merge-local covariance mode: anchored_local=true"
+                            << ", gamma=" << cbs_gamma_
+                            << ", soft_reset="
+                            << (cbs_enable_soft_reset_ ? "true" : "false"));
+            ROS_INFO_STREAM("LIORF CBS merge-local covariance mode: anchored_local="
+                            << (cbs_use_anchored_receiver_local_for_merge_ ? "true"
+                                                                           : "false")
                             << ", anchor_rot_var="
                             << cbs_local_cov_diag_anchor_rot_var_
                             << ", anchor_trans_var="
