@@ -1832,11 +1832,11 @@ public:
         const int64_t max_future_lead_ns = static_cast<int64_t>(
             std::max(0.0, max_external_prior_future_lead_sec_) * 1e9);
 
-        int64_t newest_local_ts_nsec = -1;
+        int64_t oldest_local_ts_nsec = -1;
         {
             std::lock_guard<std::mutex> lock(timestamp_to_pose_idx_map_mutex_);
             if (!timestamp_to_pose_idx_map_.empty()) {
-                newest_local_ts_nsec = timestamp_to_pose_idx_map_.rbegin()->first;
+                oldest_local_ts_nsec = timestamp_to_pose_idx_map_.begin()->first;
             }
         }
 
@@ -1892,11 +1892,14 @@ public:
             int64_t matched_ts_nsec = -1;
             if (!findNearestPoseIndexForTimestamp(
                     prior.timestamp_kf_nsec_, &matched_pose_idx, &matched_ts_nsec)) {
-                const bool could_match_future =
-                    (newest_local_ts_nsec >= 0) &&
-                    (prior.timestamp_kf_nsec_ >
-                     newest_local_ts_nsec + external_prior_timestamp_tolerance_ns_);
-                if (could_match_future) {
+                const bool provably_older_than_active_window =
+                    (oldest_local_ts_nsec >= 0) &&
+                    (prior.timestamp_kf_nsec_ + external_prior_timestamp_tolerance_ns_ <
+                     oldest_local_ts_nsec);
+                // For asynchronous cross-estimator exchange, a no-match this epoch
+                // is not enough evidence of staleness unless it is provably older
+                // than the oldest surviving local pose window.
+                if (!provably_older_than_active_window) {
                     deferred_priors.push_back(prior);
                     ++deferred;
                 } else {

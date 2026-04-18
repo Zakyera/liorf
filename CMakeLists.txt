@@ -32,10 +32,19 @@ find_package(GTSAM REQUIRED QUIET)
 # Intuition: add an optional CBS build switch so LIORF can keep legacy behavior while we integrate incrementally.
 option(LIORF_USE_CBS "Build LIORF with CBS/BPSAM integration hooks" OFF)
 if(LIORF_USE_CBS)
+  set(_CBS_WS_HINT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
   set(_CBS_SRC_HINT "${CMAKE_CURRENT_SOURCE_DIR}/../cbs")
-  if(NOT cbs_DIR AND EXISTS "${_CBS_SRC_HINT}/build/cbsConfig.cmake")
-    set(cbs_DIR "${_CBS_SRC_HINT}/build" CACHE PATH
-        "Directory containing cbsConfig.cmake")
+  if(NOT cbs_DIR)
+    if(EXISTS "${_CBS_WS_HINT}/devel/lib/cmake/cbs/cbsConfig.cmake")
+      set(cbs_DIR "${_CBS_WS_HINT}/devel/lib/cmake/cbs" CACHE PATH
+          "Directory containing cbsConfig.cmake")
+    elseif(EXISTS "${_CBS_WS_HINT}/build/cbs/cbsConfig.cmake")
+      set(cbs_DIR "${_CBS_WS_HINT}/build/cbs" CACHE PATH
+          "Directory containing cbsConfig.cmake")
+    elseif(EXISTS "${_CBS_SRC_HINT}/build/cbsConfig.cmake")
+      set(cbs_DIR "${_CBS_SRC_HINT}/build" CACHE PATH
+          "Directory containing cbsConfig.cmake")
+    endif()
   endif()
   find_package(cbs REQUIRED CONFIG)
 endif()
