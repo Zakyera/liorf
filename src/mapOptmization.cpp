@@ -3,6 +3,7 @@
 #include "liorf/save_map.h"
 // <!-- liorf_yjz_lucky_boy -->
 #include <sensor_msgs/NavSatFix.h>
+#include <std_msgs/Int64MultiArray.h>
 #include <gtsam/geometry/Rot3.h>
 #include <gtsam/geometry/Pose3.h>
 #include <gtsam/slam/PriorFactor.h>
@@ -38,6 +39,7 @@
 #include <algorithm>
 #include <cctype>
 #include <exception>
+#include <chrono>
 #include <iomanip>
 #include <unordered_set>
 #include <Eigen/Cholesky>
@@ -177,6 +179,21 @@ public:
         uint64_t source_seq_ = 0;
     };
 
+    // Kimera receiver pacing watermark used to decide when outbound LIORF
+    // beliefs should be released.
+    struct ExternalReceiverWatermark
+    {
+        int64_t emitted_at_backend_timestamp_ns_ = -1;
+        int64_t oldest_active_pose_timestamp_ns_ = -1;
+        int64_t newest_active_pose_timestamp_ns_ = -1;
+        int64_t recommended_sender_min_timestamp_ns_ = -1;
+        int64_t recommended_sender_max_timestamp_ns_ = -1;
+        int64_t recommended_sender_max_future_lead_ns_ = -1;
+        size_t ready_queue_size_ = 0u;
+        size_t future_reservoir_size_ = 0u;
+        size_t total_buffered_priors_ = 0u;
+    };
+
     // zy Step 5_d
     // Keeps exchange-related state bounded and thread-safe for async bridge I/O.
     mutable std::mutex external_pose_priors_queue_mutex_;
@@ -201,6 +218,16 @@ public:
     mutable std::mutex latest_external_pose_belief_mutex_;
     ExternalPoseBelief latest_external_pose_belief_;
     bool has_latest_external_pose_belief_ = false;
+    mutable std::mutex outgoing_external_pose_belief_reservoir_mutex_;
+    std::deque<ExternalPoseBelief> outgoing_external_pose_belief_reservoir_;
+    int64_t outgoing_external_pose_belief_last_queued_timestamp_ns_ = -1;
+    size_t max_outgoing_pose_belief_reservoir_size_ = 2000;
+    size_t max_outgoing_pose_beliefs_per_publish_call_ = 10;
+    mutable std::mutex external_receiver_watermark_mutex_;
+    ExternalReceiverWatermark external_receiver_watermark_;
+    bool has_external_receiver_watermark_ = false;
+    int64_t external_receiver_watermark_stale_ns_ = 1000000000LL;
+    int64_t external_receiver_watermark_receive_wall_ns_ = -1;
 
 
     ros::Publisher pubLaserCloudSurround;
@@ -227,11 +254,13 @@ public:
     // ROS bridge endpoints for exchanging external pose beliefs and priors.
     ros::Publisher pubExternalPoseBelief_;
     ros::Subscriber subExternalPosePrior_;
+    ros::Subscriber subExternalReceiverWatermark_;
 
     // zy Step 7_b
     // Topic and source settings are configurable so bridge wiring does not require recompiling LIORF.
     std::string external_pose_belief_topic_ = "liorf/cbs/external_pose_belief";
     std::string external_pose_prior_topic_ = "liorf/cbs/external_pose_prior";
+    std::string external_receiver_watermark_topic_ = "/kimera/cbs/receiver_watermark";
     std::string external_prior_default_source_ = "kimera";
     // zy Step 9_a
     // Controls whether external exchange uses IMU/body frame (true) or lidar frame (false).
@@ -374,9 +403,33 @@ public:
         nh.param<std::string>("liorf/external_pose_prior_topic",
                               external_pose_prior_topic_,
                               "liorf/cbs/external_pose_prior");
+        nh.param<std::string>("liorf/external_receiver_watermark_topic",
+                              external_receiver_watermark_topic_,
+                              "/kimera/cbs/receiver_watermark");
         nh.param<std::string>("liorf/external_prior_default_source",
                               external_prior_default_source_,
                               "kimera");
+        double external_receiver_watermark_stale_sec =
+            static_cast<double>(external_receiver_watermark_stale_ns_) * 1e-9;
+        nh.param<double>("liorf/external_receiver_watermark_stale_sec",
+                         external_receiver_watermark_stale_sec,
+                         external_receiver_watermark_stale_sec);
+        external_receiver_watermark_stale_ns_ = static_cast<int64_t>(
+            std::max(0.1, external_receiver_watermark_stale_sec) * 1e9);
+        int max_outgoing_pose_belief_reservoir_size_tmp =
+            static_cast<int>(max_outgoing_pose_belief_reservoir_size_);
+        nh.param<int>("liorf/max_outgoing_pose_belief_reservoir_size",
+                      max_outgoing_pose_belief_reservoir_size_tmp,
+                      max_outgoing_pose_belief_reservoir_size_tmp);
+        max_outgoing_pose_belief_reservoir_size_ = static_cast<size_t>(
+            std::max(100, max_outgoing_pose_belief_reservoir_size_tmp));
+        int max_outgoing_pose_beliefs_per_publish_call_tmp =
+            static_cast<int>(max_outgoing_pose_beliefs_per_publish_call_);
+        nh.param<int>("liorf/max_outgoing_pose_beliefs_per_publish_call",
+                      max_outgoing_pose_beliefs_per_publish_call_tmp,
+                      max_outgoing_pose_beliefs_per_publish_call_tmp);
+        max_outgoing_pose_beliefs_per_publish_call_ = static_cast<size_t>(
+            std::max(1, max_outgoing_pose_beliefs_per_publish_call_tmp));
         // zy Step 10_b
         // Makes prior matching/aging/budget limits configurable from launch without code edits.
         double external_prior_timestamp_tolerance_sec =
@@ -407,7 +460,15 @@ public:
                         << ", max_future_lead_sec="
                         << max_external_prior_future_lead_sec_
                         << ", max_per_optimize="
-                        << max_external_priors_per_optimize_);
+                        << max_external_priors_per_optimize_
+                        << ", receiver_watermark_topic="
+                        << external_receiver_watermark_topic_
+                        << ", receiver_watermark_stale_ns="
+                        << external_receiver_watermark_stale_ns_
+                        << ", outgoing_belief_reservoir_max="
+                        << max_outgoing_pose_belief_reservoir_size_
+                        << ", outgoing_flush_budget="
+                        << max_outgoing_pose_beliefs_per_publish_call_);
         
         // zy Step 9_b
         // Keeps old behavior by default, while allowing body-frame exchange when wiring with Kimera.
@@ -551,6 +612,12 @@ public:
                 external_pose_prior_topic_,
                 200,
                 &mapOptimization::externalPosePriorHandler,
+                this,
+                ros::TransportHints().tcpNoDelay());
+            subExternalReceiverWatermark_ = nh.subscribe<std_msgs::Int64MultiArray>(
+                external_receiver_watermark_topic_,
+                200,
+                &mapOptimization::externalReceiverWatermarkHandler,
                 this,
                 ros::TransportHints().tcpNoDelay());
         } else {
@@ -1686,8 +1753,75 @@ public:
         }
     }
 
+    void externalReceiverWatermarkHandler(
+        const std_msgs::Int64MultiArrayConstPtr& msg)
+    {
+        if (!usingCbs() || !msg) {
+            return;
+        }
+        if (msg->data.size() < 9u) {
+            ROS_WARN_STREAM_THROTTLE(
+                2.0,
+                "Ignoring malformed receiver watermark message. size="
+                    << msg->data.size());
+            return;
+        }
+
+        ExternalReceiverWatermark watermark;
+        watermark.emitted_at_backend_timestamp_ns_ = msg->data[0];
+        watermark.oldest_active_pose_timestamp_ns_ = msg->data[1];
+        watermark.newest_active_pose_timestamp_ns_ = msg->data[2];
+        watermark.recommended_sender_min_timestamp_ns_ = msg->data[3];
+        watermark.recommended_sender_max_timestamp_ns_ = msg->data[4];
+        watermark.recommended_sender_max_future_lead_ns_ = msg->data[5];
+        watermark.ready_queue_size_ =
+            static_cast<size_t>(std::max<int64_t>(0, msg->data[6]));
+        watermark.future_reservoir_size_ =
+            static_cast<size_t>(std::max<int64_t>(0, msg->data[7]));
+        watermark.total_buffered_priors_ =
+            static_cast<size_t>(std::max<int64_t>(0, msg->data[8]));
+
+        std::lock_guard<std::mutex> lock(external_receiver_watermark_mutex_);
+        external_receiver_watermark_ = watermark;
+        has_external_receiver_watermark_ = true;
+        external_receiver_watermark_receive_wall_ns_ = static_cast<int64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count());
+    }
+
+    bool getExternalReceiverWatermark(ExternalReceiverWatermark* watermark,
+                                      bool* fresh = nullptr) const
+    {
+        if (!watermark) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(external_receiver_watermark_mutex_);
+        if (!has_external_receiver_watermark_) {
+            return false;
+        }
+        *watermark = external_receiver_watermark_;
+        bool is_fresh = true;
+        const int64_t now_wall_ns = static_cast<int64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count());
+        if (external_receiver_watermark_receive_wall_ns_ > 0 &&
+            external_receiver_watermark_stale_ns_ > 0 &&
+            now_wall_ns >
+                external_receiver_watermark_receive_wall_ns_ +
+                    external_receiver_watermark_stale_ns_) {
+            is_fresh = false;
+        }
+        if (fresh) {
+            *fresh = is_fresh;
+        }
+        return true;
+    }
+
     // zy Step 7_f
-    // Publishes latest LIORF belief as ROS odometry so bridge nodes can forward it to Kimera.
+    // Publishes LIORF beliefs paced by Kimera receiver watermark. Future beliefs
+    // are held in a local reservoir and released only when eligible.
     void publishLatestExternalPoseBelief()
     {
         if (!usingCbs()) {
@@ -1697,89 +1831,162 @@ public:
             return;
         }
 
-        ExternalPoseBelief belief;
-        if (!getLatestExternalPoseBelief(&belief)) {
+        ExternalPoseBelief latest_belief;
+        if (!getLatestExternalPoseBelief(&latest_belief)) {
             return;
         }
-        if (belief.timestamp_kf_nsec_ < 0) {
+        if (latest_belief.timestamp_kf_nsec_ < 0) {
             return;
         }
 
-        nav_msgs::Odometry msg;
-        msg.header.stamp.fromNSec(
-            static_cast<uint64_t>(belief.timestamp_kf_nsec_));
-        msg.header.frame_id = odometryFrame;
-        msg.child_frame_id = belief.source_;
-
-        // zy Step 9_g
-        // Publishes in configured exchange frame while keeping LIORF internals in lidar frame.
-        const gtsam::Pose3 W_Pose_exchange =
-            lidarPoseToExchangePose(belief.W_Pose_L_);
-        const Eigen::Quaterniond q_exchange(W_Pose_exchange.rotation().matrix());
-        const Eigen::Quaterniond q_lidar(belief.W_Pose_L_.rotation().matrix());
-
-        msg.pose.pose.position.x = W_Pose_exchange.translation().x();
-        msg.pose.pose.position.y = W_Pose_exchange.translation().y();
-        msg.pose.pose.position.z = W_Pose_exchange.translation().z();
-
-        const Eigen::Quaterniond q_belief(W_Pose_exchange.rotation().matrix());
-        msg.pose.pose.orientation.x = q_belief.x();
-        msg.pose.pose.orientation.y = q_belief.y();
-        msg.pose.pose.orientation.z = q_belief.z();
-        msg.pose.pose.orientation.w = q_belief.w();
-
-        // zy Step 11_d
-        // Publishes covariance in the same exchange frame as the outgoing pose.
-        const Eigen::Matrix<double, 6, 6> covariance_exchange =
-            lidarCovarianceToExchangeCovariance(belief.covariance_);
-
-        // zy Step 42b
-        // Convert internal [rx ry rz tx ty tz] covariance to ROS odom layout
-        // [tx ty tz rx ry rz] before publishing.
-        static const int internal_to_ros[6] = {3, 4, 5, 0, 1, 2};
-        for (int r = 0; r < 6; ++r) {
-            for (int c = 0; c < 6; ++c) {
-                msg.pose.covariance[internal_to_ros[r] * 6 + internal_to_ros[c]] =
-                    covariance_exchange(r, c);
+        {
+            std::lock_guard<std::mutex> lock(
+                outgoing_external_pose_belief_reservoir_mutex_);
+            if (latest_belief.timestamp_kf_nsec_ >
+                outgoing_external_pose_belief_last_queued_timestamp_ns_) {
+                outgoing_external_pose_belief_reservoir_.push_back(latest_belief);
+                outgoing_external_pose_belief_last_queued_timestamp_ns_ =
+                    latest_belief.timestamp_kf_nsec_;
+            }
+            while (outgoing_external_pose_belief_reservoir_.size() >
+                   max_outgoing_pose_belief_reservoir_size_) {
+                outgoing_external_pose_belief_reservoir_.pop_front();
             }
         }
 
-        std::cerr << std::setprecision(12)
-                  << "[CBS][OutgoingBeliefMean] source=liorf"
-                  << " frame_id=" << belief.pose_index_
-                  << " timestamp_ns=" << belief.timestamp_kf_nsec_
-                  << " key="
-                  << poseKeyFromIndex(static_cast<size_t>(belief.pose_index_))
-                  << " msg_frame_id=" << msg.header.frame_id
-                  << " msg_child_frame_id=" << msg.child_frame_id
-                  << " sender_mean_semantic=world_to_lidar_pose"
-                  << " sender_exchange_frame_semantic="
-                  << (external_exchange_in_body_frame_ ? "world_to_body_pose"
-                                                       : "world_to_lidar_pose")
-                  << " sender_exchange_frame_mode="
-                  << (external_exchange_in_body_frame_ ? "body" : "lidar")
-                  << " sender_extrinsic_applied_to_mean="
-                  << (external_exchange_in_body_frame_ ? 1 : 0)
-                  << " sender_mean_internal_tx=" << belief.W_Pose_L_.translation().x()
-                  << " sender_mean_internal_ty=" << belief.W_Pose_L_.translation().y()
-                  << " sender_mean_internal_tz=" << belief.W_Pose_L_.translation().z()
-                  << " sender_mean_internal_qx=" << q_lidar.x()
-                  << " sender_mean_internal_qy=" << q_lidar.y()
-                  << " sender_mean_internal_qz=" << q_lidar.z()
-                  << " sender_mean_internal_qw=" << q_lidar.w()
-                  << " mean_tx=" << W_Pose_exchange.translation().x()
-                  << " mean_ty=" << W_Pose_exchange.translation().y()
-                  << " mean_tz=" << W_Pose_exchange.translation().z()
-                  << " mean_qx=" << q_exchange.x()
-                  << " mean_qy=" << q_exchange.y()
-                  << " mean_qz=" << q_exchange.z()
-                  << " mean_qw=" << q_exchange.w()
-                  << " extrinsic_tx=" << extTrans.x()
-                  << " extrinsic_ty=" << extTrans.y()
-                  << " extrinsic_tz=" << extTrans.z()
-                  << std::endl;
+        ExternalReceiverWatermark watermark;
+        bool have_watermark = false;
+        bool watermark_fresh = false;
+        have_watermark =
+            getExternalReceiverWatermark(&watermark, &watermark_fresh);
 
-        pubExternalPoseBelief_.publish(msg);
+        auto publish_one_belief = [&](const ExternalPoseBelief& belief) {
+            nav_msgs::Odometry msg;
+            msg.header.stamp.fromNSec(
+                static_cast<uint64_t>(belief.timestamp_kf_nsec_));
+            msg.header.frame_id = odometryFrame;
+            msg.child_frame_id = belief.source_;
+
+            const gtsam::Pose3 W_Pose_exchange =
+                lidarPoseToExchangePose(belief.W_Pose_L_);
+            const Eigen::Quaterniond q_exchange(
+                W_Pose_exchange.rotation().matrix());
+            const Eigen::Quaterniond q_lidar(belief.W_Pose_L_.rotation().matrix());
+
+            msg.pose.pose.position.x = W_Pose_exchange.translation().x();
+            msg.pose.pose.position.y = W_Pose_exchange.translation().y();
+            msg.pose.pose.position.z = W_Pose_exchange.translation().z();
+
+            msg.pose.pose.orientation.x = q_exchange.x();
+            msg.pose.pose.orientation.y = q_exchange.y();
+            msg.pose.pose.orientation.z = q_exchange.z();
+            msg.pose.pose.orientation.w = q_exchange.w();
+
+            const Eigen::Matrix<double, 6, 6> covariance_exchange =
+                lidarCovarianceToExchangeCovariance(belief.covariance_);
+
+            static const int internal_to_ros[6] = {3, 4, 5, 0, 1, 2};
+            for (int r = 0; r < 6; ++r) {
+                for (int c = 0; c < 6; ++c) {
+                    msg.pose.covariance[internal_to_ros[r] * 6 + internal_to_ros[c]] =
+                        covariance_exchange(r, c);
+                }
+            }
+
+            std::cerr << std::setprecision(12)
+                      << "[CBS][OutgoingBeliefMean] source=liorf"
+                      << " frame_id=" << belief.pose_index_
+                      << " timestamp_ns=" << belief.timestamp_kf_nsec_
+                      << " key="
+                      << poseKeyFromIndex(static_cast<size_t>(belief.pose_index_))
+                      << " msg_frame_id=" << msg.header.frame_id
+                      << " msg_child_frame_id=" << msg.child_frame_id
+                      << " sender_mean_semantic=world_to_lidar_pose"
+                      << " sender_exchange_frame_semantic="
+                      << (external_exchange_in_body_frame_ ? "world_to_body_pose"
+                                                           : "world_to_lidar_pose")
+                      << " sender_exchange_frame_mode="
+                      << (external_exchange_in_body_frame_ ? "body" : "lidar")
+                      << " sender_extrinsic_applied_to_mean="
+                      << (external_exchange_in_body_frame_ ? 1 : 0)
+                      << " sender_mean_internal_tx="
+                      << belief.W_Pose_L_.translation().x()
+                      << " sender_mean_internal_ty="
+                      << belief.W_Pose_L_.translation().y()
+                      << " sender_mean_internal_tz="
+                      << belief.W_Pose_L_.translation().z()
+                      << " sender_mean_internal_qx=" << q_lidar.x()
+                      << " sender_mean_internal_qy=" << q_lidar.y()
+                      << " sender_mean_internal_qz=" << q_lidar.z()
+                      << " sender_mean_internal_qw=" << q_lidar.w()
+                      << " mean_tx=" << W_Pose_exchange.translation().x()
+                      << " mean_ty=" << W_Pose_exchange.translation().y()
+                      << " mean_tz=" << W_Pose_exchange.translation().z()
+                      << " mean_qx=" << q_exchange.x()
+                      << " mean_qy=" << q_exchange.y()
+                      << " mean_qz=" << q_exchange.z()
+                      << " mean_qw=" << q_exchange.w()
+                      << " extrinsic_tx=" << extTrans.x()
+                      << " extrinsic_ty=" << extTrans.y()
+                      << " extrinsic_tz=" << extTrans.z()
+                      << std::endl;
+
+            pubExternalPoseBelief_.publish(msg);
+        };
+
+        std::vector<ExternalPoseBelief> beliefs_to_publish;
+        size_t dropped_stale_count = 0u;
+        bool held_for_future = false;
+        {
+            std::lock_guard<std::mutex> lock(
+                outgoing_external_pose_belief_reservoir_mutex_);
+            while (!outgoing_external_pose_belief_reservoir_.empty() &&
+                   beliefs_to_publish.size() <
+                       max_outgoing_pose_beliefs_per_publish_call_) {
+                const ExternalPoseBelief& candidate =
+                    outgoing_external_pose_belief_reservoir_.front();
+
+                if (have_watermark && watermark_fresh &&
+                    watermark.recommended_sender_min_timestamp_ns_ > 0 &&
+                    candidate.timestamp_kf_nsec_ +
+                            external_prior_timestamp_tolerance_ns_ <
+                        watermark.recommended_sender_min_timestamp_ns_) {
+                    outgoing_external_pose_belief_reservoir_.pop_front();
+                    ++dropped_stale_count;
+                    continue;
+                }
+
+                if (have_watermark && watermark_fresh &&
+                    watermark.recommended_sender_max_timestamp_ns_ > 0 &&
+                    candidate.timestamp_kf_nsec_ >
+                        watermark.recommended_sender_max_timestamp_ns_) {
+                    held_for_future = true;
+                    break;
+                }
+
+                beliefs_to_publish.push_back(candidate);
+                outgoing_external_pose_belief_reservoir_.pop_front();
+            }
+        }
+
+        for (const auto& belief : beliefs_to_publish) {
+            publish_one_belief(belief);
+        }
+
+        if (dropped_stale_count > 0u || held_for_future) {
+            ROS_DEBUG_STREAM_THROTTLE(
+                1.0,
+                "[CBS][OutgoingBeliefPacing] published="
+                    << beliefs_to_publish.size()
+                    << " dropped_stale=" << dropped_stale_count
+                    << " held_for_future=" << (held_for_future ? 1 : 0)
+                    << " watermark_available=" << (have_watermark ? 1 : 0)
+                    << " watermark_fresh=" << (watermark_fresh ? 1 : 0)
+                    << " watermark_min_ns="
+                    << watermark.recommended_sender_min_timestamp_ns_
+                    << " watermark_max_ns="
+                    << watermark.recommended_sender_max_timestamp_ns_);
+        }
     }
 
 #ifdef LIORF_USE_CBS
