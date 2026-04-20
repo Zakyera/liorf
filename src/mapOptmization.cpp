@@ -204,6 +204,12 @@ public:
     std::map<int64_t, size_t> timestamp_to_pose_idx_map_;
     size_t max_timestamp_to_pose_idx_map_size_ = 20000;
     int64_t external_prior_timestamp_tolerance_ns_ = 2000000;  // 2 ms
+    // Optional soft-match gate: when hard tolerance fails, allow nearest-timestamp
+    // promotion after a minimum wait with bounded per-optimize budget.
+    bool external_prior_soft_matching_enabled_ = true;
+    int64_t external_prior_soft_timestamp_tolerance_ns_ = 300000000;  // 300 ms
+    int64_t external_prior_soft_match_min_wait_ns_ = 200000000;       // 200 ms
+    size_t max_external_soft_matches_per_optimize_ = 20;
     // zy Step 10_a
     // Bounds external-prior freshness and per-cycle ingestion to keep optimization stable under bursty inputs.
     double max_external_prior_age_sec_ = 2.0;
@@ -276,6 +282,8 @@ public:
     bool cbs_diag_force_identity_exchange_to_lidar_ = false;
     // Diagnostic knob: scales only outgoing CBS belief covariance before publish.
     double cbs_outgoing_cov_scale_ = 1.0;
+    // Receiver-side knob: scales incoming external prior covariance before queueing.
+    double cbs_incoming_cov_scale_ = 1.0;
     // zy Step 12_b
     // Tracks last seen sequence per source to drop replayed/out-of-order external priors.
     mutable std::mutex external_source_seq_mutex_;
@@ -439,6 +447,30 @@ public:
                          external_prior_timestamp_tolerance_sec);
         external_prior_timestamp_tolerance_ns_ = static_cast<int64_t>(
             std::max(0.0, external_prior_timestamp_tolerance_sec) * 1e9);
+        nh.param<bool>("liorf/external_prior_soft_matching_enabled",
+                       external_prior_soft_matching_enabled_,
+                       true);
+        double external_prior_soft_timestamp_tolerance_sec =
+            static_cast<double>(external_prior_soft_timestamp_tolerance_ns_) * 1e-9;
+        nh.param<double>("liorf/external_prior_soft_timestamp_tolerance_sec",
+                         external_prior_soft_timestamp_tolerance_sec,
+                         external_prior_soft_timestamp_tolerance_sec);
+        external_prior_soft_timestamp_tolerance_ns_ = static_cast<int64_t>(
+            std::max(0.0, external_prior_soft_timestamp_tolerance_sec) * 1e9);
+        double external_prior_soft_match_min_wait_sec =
+            static_cast<double>(external_prior_soft_match_min_wait_ns_) * 1e-9;
+        nh.param<double>("liorf/external_prior_soft_match_min_wait_sec",
+                         external_prior_soft_match_min_wait_sec,
+                         external_prior_soft_match_min_wait_sec);
+        external_prior_soft_match_min_wait_ns_ = static_cast<int64_t>(
+            std::max(0.0, external_prior_soft_match_min_wait_sec) * 1e9);
+        int max_external_soft_matches_per_optimize_tmp =
+            static_cast<int>(max_external_soft_matches_per_optimize_);
+        nh.param<int>("liorf/max_external_soft_matches_per_optimize",
+                      max_external_soft_matches_per_optimize_tmp,
+                      max_external_soft_matches_per_optimize_tmp);
+        max_external_soft_matches_per_optimize_ = static_cast<size_t>(
+            std::max(0, max_external_soft_matches_per_optimize_tmp));
 
         nh.param<double>("liorf/max_external_prior_age_sec",
                          max_external_prior_age_sec_,
@@ -456,6 +488,14 @@ public:
             static_cast<size_t>(std::max(1, max_external_priors_per_optimize_tmp));
         ROS_INFO_STREAM("LIORF external prior config: tolerance_ns="
                         << external_prior_timestamp_tolerance_ns_
+                        << ", soft_matching_enabled="
+                        << (external_prior_soft_matching_enabled_ ? 1 : 0)
+                        << ", soft_tolerance_ns="
+                        << external_prior_soft_timestamp_tolerance_ns_
+                        << ", soft_min_wait_ns="
+                        << external_prior_soft_match_min_wait_ns_
+                        << ", soft_budget_per_optimize="
+                        << max_external_soft_matches_per_optimize_
                         << ", max_age_sec=" << max_external_prior_age_sec_
                         << ", max_future_lead_sec="
                         << max_external_prior_future_lead_sec_
@@ -489,6 +529,9 @@ public:
         nh.param<double>("liorf/cbs_outgoing_cov_scale",
                          cbs_outgoing_cov_scale_,
                          1.0);
+        nh.param<double>("liorf/cbs_incoming_cov_scale",
+                         cbs_incoming_cov_scale_,
+                         1.0);
         nh.param<bool>("liorf/cbs_local_sidegraph_enabled",
                        cbs_local_sidegraph_enabled_,
                        true);
@@ -503,6 +546,14 @@ public:
                 << cbs_outgoing_cov_scale_ << ")");
             cbs_outgoing_cov_scale_ = 1.0;
         }
+        if (!std::isfinite(cbs_incoming_cov_scale_) ||
+            cbs_incoming_cov_scale_ < 1.0) {
+            ROS_WARN_STREAM(
+                "liorf/cbs_incoming_cov_scale must be finite and >= 1.0. "
+                "Resetting to 1.0 (requested="
+                << cbs_incoming_cov_scale_ << ")");
+            cbs_incoming_cov_scale_ = 1.0;
+        }
         ROS_INFO_STREAM("LIORF CBS incoming-mean alignment diagnostic mode: "
                         << (cbs_diag_align_incoming_mean_ ? "ON" : "OFF"));
         ROS_INFO_STREAM(
@@ -510,6 +561,8 @@ public:
             << (cbs_diag_force_identity_exchange_to_lidar_ ? "ON" : "OFF"));
         ROS_INFO_STREAM("LIORF CBS outgoing covariance scale: "
                         << cbs_outgoing_cov_scale_);
+        ROS_INFO_STREAM("LIORF CBS incoming covariance scale: "
+                        << cbs_incoming_cov_scale_);
         ROS_INFO_STREAM("LIORF CBS local sidegraph mode: "
                         << (cbs_local_sidegraph_enabled_ ? "ON" : "OFF"));
 
@@ -1459,6 +1512,58 @@ public:
         return true;
     }
 
+    // Finds nearest local pose index for a timestamp without tolerance gating.
+    // Used as a bounded fallback when hard matching repeatedly misses.
+    bool findNearestPoseIndexForTimestampUnbounded(
+        const int64_t timestamp_kf_nsec,
+        size_t* pose_idx,
+        int64_t* matched_timestamp_kf_nsec = nullptr,
+        int64_t* matched_abs_dt_nsec = nullptr) const
+    {
+        if (!pose_idx) {
+            return false;
+        }
+
+        std::lock_guard<std::mutex> lock(timestamp_to_pose_idx_map_mutex_);
+        if (timestamp_to_pose_idx_map_.empty()) {
+            return false;
+        }
+
+        auto lower = timestamp_to_pose_idx_map_.lower_bound(timestamp_kf_nsec);
+        auto best = timestamp_to_pose_idx_map_.end();
+        int64_t best_abs_dt = std::numeric_limits<int64_t>::max();
+
+        const auto consider =
+            [&](const std::map<int64_t, size_t>::const_iterator& it) {
+                if (it == timestamp_to_pose_idx_map_.end()) {
+                    return;
+                }
+                const int64_t abs_dt = std::llabs(it->first - timestamp_kf_nsec);
+                if (abs_dt < best_abs_dt) {
+                    best_abs_dt = abs_dt;
+                    best = it;
+                }
+            };
+
+        consider(lower);
+        if (lower != timestamp_to_pose_idx_map_.begin()) {
+            consider(std::prev(lower));
+        }
+
+        if (best == timestamp_to_pose_idx_map_.end()) {
+            return false;
+        }
+
+        *pose_idx = best->second;
+        if (matched_timestamp_kf_nsec) {
+            *matched_timestamp_kf_nsec = best->first;
+        }
+        if (matched_abs_dt_nsec) {
+            *matched_abs_dt_nsec = best_abs_dt;
+        }
+        return true;
+    }
+
     // zy Step 6_c
     // Queues an external pose prior so it can be injected during the next graph update.
     bool enqueueExternalPosePriorFromCovariance(
@@ -1591,6 +1696,8 @@ public:
         // Keeps covariance in the same frame as the converted pose before queueing.
         const Eigen::Matrix<double, 6, 6> covariance_lidar =
             exchangeCovarianceToLidarCovariance(covariance);
+        const Eigen::Matrix<double, 6, 6> covariance_lidar_scaled =
+            covariance_lidar * cbs_incoming_cov_scale_;
         const Eigen::Quaterniond q_raw_exchange(W_Pose_exchange.rotation().matrix());
         const Eigen::Quaterniond q_converted_lidar(W_Pose_L.rotation().matrix());
 
@@ -1638,13 +1745,24 @@ public:
         const double converted_trace = covariance_lidar.trace();
         const double converted_logdet = covarianceLogdet(covariance_lidar);
         const double converted_lambda_min = covarianceLambdaMin(covariance_lidar);
+        const double scaled_trace = covariance_lidar_scaled.trace();
+        const double scaled_logdet = covarianceLogdet(covariance_lidar_scaled);
+        const double scaled_lambda_min = covarianceLambdaMin(covariance_lidar_scaled);
         const double converted_over_raw_trace_ratio =
             safeRatio(converted_trace, raw_trace);
         const double converted_over_raw_lambda_min_ratio =
             safeRatio(converted_lambda_min, raw_lambda_min);
+        const double scaled_over_converted_trace_ratio =
+            safeRatio(scaled_trace, converted_trace);
+        const double scaled_over_converted_lambda_min_ratio =
+            safeRatio(scaled_lambda_min, converted_lambda_min);
         const double converted_minus_raw_logdet_delta =
             (std::isfinite(converted_logdet) && std::isfinite(raw_logdet))
                 ? (converted_logdet - raw_logdet)
+                : std::numeric_limits<double>::quiet_NaN();
+        const double scaled_minus_converted_logdet_delta =
+            (std::isfinite(scaled_logdet) && std::isfinite(converted_logdet))
+                ? (scaled_logdet - converted_logdet)
                 : std::numeric_limits<double>::quiet_NaN();
         std::cerr << std::setprecision(12)
                   << "[CBS][IncomingPriorCov] source=" << source
@@ -1680,6 +1798,16 @@ public:
                   << converted_over_raw_lambda_min_ratio
                   << " converted_minus_raw_logdet_delta="
                   << converted_minus_raw_logdet_delta
+                  << " incoming_cov_scale=" << cbs_incoming_cov_scale_
+                  << " scaled_trace=" << scaled_trace
+                  << " scaled_logdet=" << scaled_logdet
+                  << " scaled_lambda_min=" << scaled_lambda_min
+                  << " scaled_over_converted_trace_ratio="
+                  << scaled_over_converted_trace_ratio
+                  << " scaled_over_converted_lambda_min_ratio="
+                  << scaled_over_converted_lambda_min_ratio
+                  << " scaled_minus_converted_logdet_delta="
+                  << scaled_minus_converted_logdet_delta
                   << " incoming_converted_mean_semantic=world_to_lidar_pose"
                   << " incoming_converted_mean_tx="
                   << W_Pose_L.translation().x()
@@ -1734,7 +1862,7 @@ public:
         }
 
         const bool queued = enqueueExternalPosePriorFromCovariance(
-            ts_nsec, W_Pose_L, covariance_lidar, source, source_seq);
+            ts_nsec, W_Pose_L, covariance_lidar_scaled, source, source_seq);
 
 
         // if (!queued) {
@@ -2058,6 +2186,10 @@ public:
         size_t dropped_unknown_source = 0;
         size_t dropped_missing_key = 0;
         size_t deferred_budget = 0;
+        size_t soft_match_promoted = 0;
+        size_t soft_match_rejected_dt = 0;
+        size_t soft_match_rejected_wait = 0;
+        size_t soft_match_rejected_budget = 0;
 
 #ifdef LIORF_USE_CBS
         std::map<gtsam::Key, std::vector<std::pair<cbs::AgentId, gbp::Gaussian>>>
@@ -2097,22 +2229,105 @@ public:
 
             size_t matched_pose_idx = 0;
             int64_t matched_ts_nsec = -1;
+            bool matched_via_soft_gate = false;
             if (!findNearestPoseIndexForTimestamp(
                     prior.timestamp_kf_nsec_, &matched_pose_idx, &matched_ts_nsec)) {
+                bool nearest_exists = false;
+                size_t nearest_pose_idx = 0;
+                int64_t nearest_ts_nsec = -1;
+                int64_t nearest_abs_dt_nsec = std::numeric_limits<int64_t>::max();
+                if (external_prior_soft_matching_enabled_ &&
+                    findNearestPoseIndexForTimestampUnbounded(
+                        prior.timestamp_kf_nsec_,
+                        &nearest_pose_idx,
+                        &nearest_ts_nsec,
+                        &nearest_abs_dt_nsec)) {
+                    nearest_exists = true;
+                }
                 const bool provably_older_than_active_window =
                     (oldest_local_ts_nsec >= 0) &&
                     (prior.timestamp_kf_nsec_ + external_prior_timestamp_tolerance_ns_ <
                      oldest_local_ts_nsec);
+                const int64_t prior_age_ns = std::max<int64_t>(
+                    0, current_ts_nsec - prior.timestamp_kf_nsec_);
+                const bool soft_dt_ok =
+                    nearest_exists &&
+                    nearest_abs_dt_nsec <= external_prior_soft_timestamp_tolerance_ns_;
+                const bool soft_wait_ok =
+                    prior_age_ns >= external_prior_soft_match_min_wait_ns_;
+                const bool soft_budget_ok =
+                    soft_match_promoted < max_external_soft_matches_per_optimize_;
+
+                if (!provably_older_than_active_window &&
+                    external_prior_soft_matching_enabled_ && soft_dt_ok &&
+                    soft_wait_ok && soft_budget_ok) {
+                    matched_pose_idx = nearest_pose_idx;
+                    matched_ts_nsec = nearest_ts_nsec;
+                    matched_via_soft_gate = true;
+                    ++soft_match_promoted;
+                } else {
+                    if (external_prior_soft_matching_enabled_ && nearest_exists) {
+                        if (!soft_dt_ok) {
+                            ++soft_match_rejected_dt;
+                        } else if (!soft_wait_ok) {
+                            ++soft_match_rejected_wait;
+                        } else if (!soft_budget_ok) {
+                            ++soft_match_rejected_budget;
+                        }
+                    }
+                    if (!provably_older_than_active_window) {
+                        deferred_priors.push_back(prior);
+                        ++deferred;
+                    } else {
+                        ++dropped_old;
+                    }
+                    std::cerr << std::setprecision(12)
+                              << "[CBS][IncomingPriorMatchGate] source="
+                              << prior.source_
+                              << " source_seq=" << prior.source_seq_
+                              << " prior_timestamp_ns=" << prior.timestamp_kf_nsec_
+                              << " current_timestamp_ns=" << current_ts_nsec
+                              << " hard_match=0"
+                              << " nearest_exists=" << (nearest_exists ? 1 : 0)
+                              << " nearest_abs_dt_ns="
+                              << (nearest_exists ? nearest_abs_dt_nsec : -1)
+                              << " hard_tolerance_ns="
+                              << external_prior_timestamp_tolerance_ns_
+                              << " soft_enabled="
+                              << (external_prior_soft_matching_enabled_ ? 1 : 0)
+                              << " soft_tolerance_ns="
+                              << external_prior_soft_timestamp_tolerance_ns_
+                              << " prior_age_ns=" << prior_age_ns
+                              << " soft_min_wait_ns="
+                              << external_prior_soft_match_min_wait_ns_
+                              << " soft_budget_per_optimize="
+                              << max_external_soft_matches_per_optimize_
+                              << " soft_promoted_so_far=" << soft_match_promoted
+                              << " decision="
+                              << (provably_older_than_active_window ? "drop_old"
+                                                                   : "defer")
+                              << std::endl;
+                    continue;
+                }
                 // For asynchronous cross-estimator exchange, a no-match this epoch
                 // is not enough evidence of staleness unless it is provably older
                 // than the oldest surviving local pose window.
-                if (!provably_older_than_active_window) {
-                    deferred_priors.push_back(prior);
-                    ++deferred;
-                } else {
-                    ++dropped_old;
-                }
-                continue;
+                std::cerr << std::setprecision(12)
+                          << "[CBS][IncomingPriorMatchGate] source="
+                          << prior.source_
+                          << " source_seq=" << prior.source_seq_
+                          << " prior_timestamp_ns=" << prior.timestamp_kf_nsec_
+                          << " current_timestamp_ns=" << current_ts_nsec
+                          << " hard_match=0 nearest_exists=" << (nearest_exists ? 1 : 0)
+                          << " nearest_abs_dt_ns="
+                          << (nearest_exists ? nearest_abs_dt_nsec : -1)
+                          << " hard_tolerance_ns=" << external_prior_timestamp_tolerance_ns_
+                          << " soft_enabled="
+                          << (external_prior_soft_matching_enabled_ ? 1 : 0)
+                          << " decision=soft_promoted"
+                          << " matched_pose_idx=" << matched_pose_idx
+                          << " matched_timestamp_ns=" << matched_ts_nsec
+                          << std::endl;
             }
 
             const gtsam::Key pose_key = poseKeyFromIndex(matched_pose_idx);
@@ -2374,6 +2589,7 @@ public:
                       << " prior_timestamp_ns=" << prior.timestamp_kf_nsec_
                       << " matched_timestamp_ns=" << matched_ts_nsec
                       << " dt_ns=" << dt_ns
+                      << " matched_via_soft_gate=" << (matched_via_soft_gate ? 1 : 0)
                       << " matched_pose_idx=" << matched_pose_idx
                       << " pose_key=" << pose_key
                       << " final_used_trace=" << prior.covariance_.trace()
@@ -2591,6 +2807,10 @@ public:
             << ", dropped_unknown_source=" << dropped_unknown_source
             << ", dropped_missing_key=" << dropped_missing_key
             << ", deferred_budget=" << deferred_budget
+            << ", soft_promoted=" << soft_match_promoted
+            << ", soft_reject_dt=" << soft_match_rejected_dt
+            << ", soft_reject_wait=" << soft_match_rejected_wait
+            << ", soft_reject_budget=" << soft_match_rejected_budget
             << ", pruned_ts_index=" << pruned_timestamp_entries
             << ", queue_size_now=" << queue_size_now
             << ", per_optimize_budget=" << max_external_priors_per_optimize_);
