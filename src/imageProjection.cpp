@@ -280,14 +280,33 @@ public:
         // get timestamp
         cloudHeader = currentCloudMsg.header;
         timeScanCur = cloudHeader.stamp.toSec();
-        timeScanEnd = timeScanCur + laserCloudIn->points.back().time;
 
-        // check dense flag
-        if (laserCloudIn->is_dense == false)
+        // S3E clouds can have NaNs and mark is_dense=false. Drop invalid points
+        // instead of shutting down the whole node.
+        if (!laserCloudIn->is_dense)
         {
-            ROS_ERROR("Point cloud is not in dense format, please remove NaN points first!");
-            ros::shutdown();
+            pcl::PointCloud<PointXYZIRT>::Ptr cleanedCloud(new pcl::PointCloud<PointXYZIRT>());
+            std::vector<int> validIndices;
+            pcl::removeNaNFromPointCloud(*laserCloudIn, *cleanedCloud, validIndices);
+
+            if (cleanedCloud->empty())
+            {
+                ROS_WARN_THROTTLE(2.0, "Point cloud has no valid points after NaN removal.");
+                return false;
+            }
+
+            if (cleanedCloud->size() != laserCloudIn->size())
+            {
+                ROS_WARN_THROTTLE(2.0,
+                                  "Point cloud not dense: removed %zu NaN points.",
+                                  laserCloudIn->size() - cleanedCloud->size());
+            }
+
+            laserCloudIn.swap(cleanedCloud);
+            laserCloudIn->is_dense = true;
         }
+
+        timeScanEnd = timeScanCur + laserCloudIn->points.back().time;
 
         // check ring channel
         static int ringFlag = 0;

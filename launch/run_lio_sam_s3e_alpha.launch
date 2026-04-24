@@ -1,0 +1,22 @@
+<launch>
+  <arg name="project" default="liorf"/>
+  <arg name="config_file" default="$(find liorf)/config/s3e_alpha.yaml"/>
+  <arg name="use_rviz" default="false"/>
+  <arg name="publish_static_tf" default="true"/>
+
+  <rosparam file="$(arg config_file)" command="load" />
+
+  <include file="$(find liorf)/launch/include/module_loam.launch">
+    <arg name="project" value="$(arg project)"/>
+  </include>
+
+  <node if="$(arg publish_static_tf)"
+        pkg="tf"
+        type="static_transform_publisher"
+        name="s3e_imu_to_velodyne_tf"
+        args="-0.010822711151 0.039743076742 -0.140797166604 -0.015750643161 0.000318736590 0.004838794353 0.999864190895 imu_link velodyne 100"/>
+
+  <include file="$(find liorf)/launch/include/module_rviz.launch" if="$(arg use_rviz)">
+    <arg name="project" value="$(arg project)"/>
+  </include>
+</launch>

@@ -3,7 +3,7 @@ project(liorf)
 
 set(CMAKE_BUILD_TYPE "Release")
 # set(CMAKE_CXX_FLAGS "-std=c++11")
-set(CMAKE_CXX_STANDARD 14)
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -Wall -g -pthread")
 
 find_package(catkin REQUIRED COMPONENTS
@@ -26,6 +26,12 @@ find_package(OpenMP REQUIRED)
 find_package(PCL REQUIRED QUIET)
 find_package(OpenCV REQUIRED QUIET)
 find_package(GTSAM REQUIRED QUIET)
+# cbsConfig.cmake expects GTSAM_UNSTABLE; derive it from GTSAM_DIR when needed.
+if (NOT GTSAM_UNSTABLE_DIR AND DEFINED GTSAM_DIR)
+  get_filename_component(_gtsam_cmake_parent "${GTSAM_DIR}/.." ABSOLUTE)
+  set(GTSAM_UNSTABLE_DIR "${_gtsam_cmake_parent}/GTSAM_UNSTABLE")
+endif()
+find_package(cbs REQUIRED QUIET)
 find_package(Boost REQUIRED COMPONENTS timer)
 
 set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "/usr/share/cmake/geographiclib/")
@@ -35,6 +41,8 @@ add_message_files(
   DIRECTORY msg
   FILES
   cloud_info.msg
+  pose_belief.msg
+  pose_belief_array.msg
 )
 
 add_service_files(
@@ -99,8 +107,13 @@ target_link_libraries(${PROJECT_NAME}_imageProjection ${catkin_LIBRARIES} ${PCL_
 add_executable(${PROJECT_NAME}_mapOptmization src/mapOptmization.cpp ${common_lib} include/Scancontext.cpp)
 add_dependencies(${PROJECT_NAME}_mapOptmization ${catkin_EXPORTED_TARGETS} ${PROJECT_NAME}_generate_messages_cpp)
 target_compile_options(${PROJECT_NAME}_mapOptmization PRIVATE ${OpenMP_CXX_FLAGS})
-target_link_libraries(${PROJECT_NAME}_mapOptmization Boost::timer ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${OpenCV_LIBRARIES} ${OpenMP_CXX_FLAGS} ${GeographicLib_LIBRARIES} gtsam)
+target_link_libraries(${PROJECT_NAME}_mapOptmization Boost::timer ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${OpenCV_LIBRARIES} ${OpenMP_CXX_FLAGS} ${GeographicLib_LIBRARIES} gtsam cbs)
 
 # IMU Preintegration
 add_executable(${PROJECT_NAME}_imuPreintegration src/imuPreintegration.cpp ${common_lib})
 target_link_libraries(${PROJECT_NAME}_imuPreintegration Boost::timer ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${OpenCV_LIBRARIES} gtsam)
+
+# BPSAM backend smoke test
+add_executable(${PROJECT_NAME}_bpsam_smoke src/bpsamSmoke.cpp)
+add_dependencies(${PROJECT_NAME}_bpsam_smoke ${catkin_EXPORTED_TARGETS} ${PROJECT_NAME}_generate_messages_cpp)
+target_link_libraries(${PROJECT_NAME}_bpsam_smoke ${catkin_LIBRARIES} gtsam cbs)

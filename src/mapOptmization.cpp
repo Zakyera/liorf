@@ -1,5 +1,7 @@
 #include "utility.h"
 #include "liorf/cloud_info.h"
+#include "liorf/pose_belief.h"
+#include "liorf/pose_belief_array.h"
 #include "liorf/save_map.h"
 // <!-- liorf_yjz_lucky_boy -->
 #include <sensor_msgs/NavSatFix.h>
@@ -17,6 +19,13 @@
 #include <gtsam/inference/Symbol.h>
 
 #include <gtsam/nonlinear/ISAM2.h>
+#include <cbs/bpsam/bpsam.h>
+#include <cbs/key.h>
+#include <cctype>
+#include <functional>
+#include <limits>
+#include <memory>
+#include <unordered_map>
 
 #include <GeographicLib/Geocentric.hpp>
 #include <GeographicLib/LocalCartesian.hpp>
@@ -68,9 +77,289 @@ public:
     NonlinearFactorGraph gtSAMgraph;
     Values initialEstimate;
     Values optimizedEstimate;
-    ISAM2 *isam;
+    std::unique_ptr<cbs::BPSAM> bpsam;
     Values isamCurrentEstimate;
-    Eigen::MatrixXd poseCovariance;
+    Eigen::MatrixXd poseCovariance = Eigen::MatrixXd::Identity(6, 6);
+    cbs::AgentId selfAgentId = static_cast<cbs::AgentId>('a');
+    std::vector<Key> localPoseKeys;
+    std::unordered_map<Key, size_t> localPoseKeyToIndex;
+    std::vector<double> localPoseTimestampsSec;
+
+    struct StampedBelief
+    {
+        cbs::AgentId sourceAgent;
+        size_t poseIndex;
+        double stampSec;
+        std::array<double, 6> mu;
+        std::array<double, 36> covariance;
+        double relaxFactor;
+    };
+
+    std::mutex mtxBeliefExchange;
+    std::deque<StampedBelief> incomingStampedBeliefs;
+    std::vector<StampedBelief> outgoingStampedBeliefs;
+    size_t beliefExchangeWindowSize = 30;
+    double beliefTimestampToleranceSec = 0.05;
+    bool cbsBeliefBridgeEnable = true;
+    std::string cbsBeliefInTopic = "liorf/cbs/belief_in";
+    std::string cbsBeliefOutTopic = "liorf/cbs/belief_out";
+
+    cbs::AgentId resolveAgentId(const std::string& id) const
+    {
+        if (!id.empty()) {
+            bool numeric = std::all_of(id.begin(), id.end(), [](unsigned char c) { return std::isdigit(c); });
+            if (numeric) {
+                try {
+                    const int numericId = std::stoi(id);
+                    return static_cast<cbs::AgentId>('a' + ((numericId % 26 + 26) % 26));
+                } catch (const std::exception&) {
+                    ROS_WARN_STREAM("Failed to parse numeric cbsAgentId '" << id << "', falling back to hashed id.");
+                }
+            }
+            if (id.size() == 1) {
+                return static_cast<cbs::AgentId>(id.front());
+            }
+        }
+
+        const size_t hashValue = std::hash<std::string>{}(id);
+        return static_cast<cbs::AgentId>('a' + (hashValue % 26));
+    }
+
+    Key poseKeyFromLocalIndex(size_t localIndex) const
+    {
+        return cbs::toPoseKey(selfAgentId, localIndex);
+    }
+
+    Key ensurePoseKeyForLocalIndex(size_t localIndex)
+    {
+        while (localPoseKeys.size() <= localIndex) {
+            const size_t newIndex = localPoseKeys.size();
+            const Key key = poseKeyFromLocalIndex(newIndex);
+            localPoseKeys.push_back(key);
+            localPoseKeyToIndex[key] = newIndex;
+            localPoseTimestampsSec.push_back(-1.0);
+        }
+        return localPoseKeys[localIndex];
+    }
+
+    bool getPoseKeyForLocalIndex(size_t localIndex, Key* key) const
+    {
+        if (localIndex >= localPoseKeys.size()) {
+            return false;
+        }
+        *key = localPoseKeys[localIndex];
+        return true;
+    }
+
+    void setPoseTimestamp(size_t localIndex, double stampSec)
+    {
+        if (localIndex >= localPoseTimestampsSec.size()) {
+            localPoseTimestampsSec.resize(localIndex + 1, -1.0);
+        }
+        localPoseTimestampsSec[localIndex] = stampSec;
+    }
+
+    bool findClosestLocalIndexByTimestamp(double stampSec, size_t* localIndex) const
+    {
+        if (localPoseTimestampsSec.empty()) {
+            return false;
+        }
+
+        size_t bestIndex = 0;
+        double bestAbsDt = std::numeric_limits<double>::max();
+        for (size_t i = 0; i < localPoseTimestampsSec.size(); ++i) {
+            if (localPoseTimestampsSec[i] < 0.0) {
+                continue;
+            }
+            const double dt = std::abs(localPoseTimestampsSec[i] - stampSec);
+            if (dt < bestAbsDt) {
+                bestAbsDt = dt;
+                bestIndex = i;
+            }
+        }
+
+        if (bestAbsDt > beliefTimestampToleranceSec) {
+            return false;
+        }
+        *localIndex = bestIndex;
+        return true;
+    }
+
+    void enqueueIncomingBelief(const StampedBelief& belief)
+    {
+        std::lock_guard<std::mutex> lock(mtxBeliefExchange);
+        incomingStampedBeliefs.push_back(belief);
+    }
+
+    void poseBeliefInHandler(const liorf::pose_belief_arrayConstPtr& msg)
+    {
+        for (const auto& beliefMsg : msg->beliefs) {
+            const cbs::AgentId sourceAgent = static_cast<cbs::AgentId>(beliefMsg.source_agent);
+            if (sourceAgent == selfAgentId) {
+                continue;
+            }
+
+            StampedBelief belief;
+            belief.sourceAgent = sourceAgent;
+            belief.poseIndex = static_cast<size_t>(beliefMsg.pose_index);
+            belief.stampSec = beliefMsg.stamp_sec > 0.0 ? beliefMsg.stamp_sec : beliefMsg.header.stamp.toSec();
+            belief.relaxFactor = beliefMsg.relax_factor;
+
+            for (size_t i = 0; i < belief.mu.size(); ++i) {
+                belief.mu[i] = beliefMsg.mu[i];
+            }
+            for (size_t i = 0; i < belief.covariance.size(); ++i) {
+                belief.covariance[i] = beliefMsg.covariance[i];
+            }
+
+            enqueueIncomingBelief(belief);
+        }
+    }
+
+    void consumeIncomingBeliefsIntoBpsam()
+    {
+        std::deque<StampedBelief> pendingBeliefs;
+        {
+            std::lock_guard<std::mutex> lock(mtxBeliefExchange);
+            if (incomingStampedBeliefs.empty()) {
+                return;
+            }
+            pendingBeliefs.swap(incomingStampedBeliefs);
+        }
+
+        std::map<Key, std::vector<std::pair<cbs::AgentId, gbp::Gaussian>>> beliefsByKey;
+        size_t numDropped = 0;
+        for (const auto& incoming : pendingBeliefs) {
+            size_t localIndex = 0;
+            bool matched = false;
+            if (incoming.poseIndex < localPoseTimestampsSec.size()) {
+                localIndex = incoming.poseIndex;
+                matched = true;
+            } else {
+                matched = findClosestLocalIndexByTimestamp(incoming.stampSec, &localIndex);
+            }
+
+            if (!matched) {
+                numDropped++;
+                continue;
+            }
+
+            const Key localKey = ensurePoseKeyForLocalIndex(localIndex);
+            Eigen::VectorXd mu(6);
+            Eigen::MatrixXd covariance(6, 6);
+            for (size_t i = 0; i < 6; ++i) {
+                mu(i) = incoming.mu[i];
+            }
+            for (size_t r = 0; r < 6; ++r) {
+                for (size_t c = 0; c < 6; ++c) {
+                    covariance(r, c) = incoming.covariance[r * 6 + c];
+                }
+            }
+            gbp::Gaussian gaussian(localKey, mu, covariance, 1);
+            gaussian.relax_factor() = incoming.relaxFactor;
+            beliefsByKey[localKey].emplace_back(incoming.sourceAgent, gaussian);
+        }
+
+        if (!beliefsByKey.empty()) {
+            bpsam->addBeliefs(std::move(beliefsByKey));
+        }
+
+        if (numDropped > 0) {
+            ROS_WARN_STREAM_THROTTLE(1.0, "Dropped " << numDropped << " incoming beliefs due to timestamp mismatch.");
+        }
+    }
+
+    void publishOutgoingBeliefs()
+    {
+        if (!cbsBeliefBridgeEnable) {
+            return;
+        }
+
+        std::vector<StampedBelief> beliefsToPublish;
+        {
+            std::lock_guard<std::mutex> lock(mtxBeliefExchange);
+            beliefsToPublish = outgoingStampedBeliefs;
+        }
+
+        liorf::pose_belief_array msg;
+        msg.header.stamp = timeLaserInfoStamp;
+        msg.header.frame_id = odometryFrame;
+        msg.beliefs.reserve(beliefsToPublish.size());
+        for (const auto& belief : beliefsToPublish) {
+            liorf::pose_belief beliefMsg;
+            beliefMsg.header = msg.header;
+            beliefMsg.source_agent = static_cast<uint8_t>(belief.sourceAgent);
+            beliefMsg.pose_index = static_cast<uint32_t>(belief.poseIndex);
+            beliefMsg.stamp_sec = belief.stampSec;
+            beliefMsg.relax_factor = belief.relaxFactor;
+            for (size_t i = 0; i < belief.mu.size(); ++i) {
+                beliefMsg.mu[i] = belief.mu[i];
+            }
+            for (size_t i = 0; i < belief.covariance.size(); ++i) {
+                beliefMsg.covariance[i] = belief.covariance[i];
+            }
+            msg.beliefs.push_back(beliefMsg);
+        }
+
+        pubPoseBeliefsOut.publish(msg);
+    }
+
+    void refreshOutgoingBeliefs()
+    {
+        if (localPoseKeys.empty()) {
+            return;
+        }
+
+        const size_t startIndex =
+            localPoseKeys.size() > beliefExchangeWindowSize ? localPoseKeys.size() - beliefExchangeWindowSize : 0;
+        KeySet requestKeys;
+        for (size_t i = startIndex; i < localPoseKeys.size(); ++i) {
+            requestKeys.insert(localPoseKeys[i]);
+        }
+
+        bpsam->setMarginalizationGraph(cbs::BPSAM::MarginalizationType::LOCAL);
+        auto outgoing = bpsam->getBeliefs(requestKeys, true);
+
+        std::vector<StampedBelief> outgoingStamped;
+        outgoingStamped.reserve(outgoing.size());
+        for (const auto& [key, beliefsByAgent] : outgoing) {
+            auto keyIt = localPoseKeyToIndex.find(key);
+            if (keyIt == localPoseKeyToIndex.end()) {
+                continue;
+            }
+
+            const size_t localIndex = keyIt->second;
+            if (localIndex >= localPoseTimestampsSec.size() || localPoseTimestampsSec[localIndex] < 0.0) {
+                continue;
+            }
+
+            for (const auto& [agentId, belief] : beliefsByAgent) {
+                if (agentId != selfAgentId) {
+                    continue;
+                }
+                StampedBelief stampedBelief;
+                stampedBelief.sourceAgent = selfAgentId;
+                stampedBelief.poseIndex = localIndex;
+                stampedBelief.stampSec = localPoseTimestampsSec[localIndex];
+                stampedBelief.relaxFactor = belief.relax_factor();
+                for (size_t i = 0; i < stampedBelief.mu.size(); ++i) {
+                    stampedBelief.mu[i] = belief.mu()(i);
+                }
+                for (size_t r = 0; r < 6; ++r) {
+                    for (size_t c = 0; c < 6; ++c) {
+                        stampedBelief.covariance[r * 6 + c] = belief.Sigma()(r, c);
+                    }
+                }
+                outgoingStamped.push_back(stampedBelief);
+            }
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(mtxBeliefExchange);
+            outgoingStampedBeliefs = std::move(outgoingStamped);
+        }
+        publishOutgoingBeliefs();
+    }
 
     ros::Publisher pubLaserCloudSurround;
     ros::Publisher pubLaserOdometryGlobal;
@@ -87,10 +376,12 @@ public:
 
     ros::Publisher pubSLAMInfo;
     ros::Publisher pubGpsOdom;
+    ros::Publisher pubPoseBeliefsOut;
 
     ros::Subscriber subCloud;
     ros::Subscriber subGPS;
     ros::Subscriber subLoop;
+    ros::Subscriber subPoseBeliefsIn;
 
     ros::ServiceServer srvSaveMap;
 
@@ -163,10 +454,36 @@ public:
 
     mapOptimization()
     {
-        ISAM2Params parameters;
-        parameters.relinearizeThreshold = 0.1;
-        parameters.relinearizeSkip = 1;
-        isam = new ISAM2(parameters);
+        std::string cbsAgentIdStr;
+        nh.param<std::string>("liorf/cbsAgentId", cbsAgentIdStr, robot_id);
+        selfAgentId = resolveAgentId(cbsAgentIdStr);
+
+        bool cbsEnableGkcm = true;
+        bool cbsEnableBeliefDcs = false;
+        double cbsBeliefSimilarityThreshold = 0.01;
+        int cbsBeliefWindow = 30;
+        nh.param<bool>("liorf/cbsEnableGkcm", cbsEnableGkcm, true);
+        nh.param<bool>("liorf/cbsEnableBeliefDcs", cbsEnableBeliefDcs, false);
+        nh.param<double>("liorf/cbsBeliefSimilarityThreshold", cbsBeliefSimilarityThreshold, 0.01);
+        nh.param<int>("liorf/cbsBeliefExchangeWindowSize", cbsBeliefWindow, 30);
+        nh.param<double>("liorf/cbsBeliefTimestampToleranceSec", beliefTimestampToleranceSec, 0.05);
+        nh.param<bool>("liorf/cbsBeliefBridgeEnable", cbsBeliefBridgeEnable, true);
+        nh.param<std::string>("liorf/cbsBeliefInTopic", cbsBeliefInTopic, "liorf/cbs/belief_in");
+        nh.param<std::string>("liorf/cbsBeliefOutTopic", cbsBeliefOutTopic, "liorf/cbs/belief_out");
+        beliefExchangeWindowSize = std::max(1, cbsBeliefWindow);
+
+        cbs::BPSAM::Params parameters;
+        parameters.robot_id = selfAgentId;
+        parameters.sam_params_.relinearizeThreshold = 0.1;
+        parameters.sam_params_.relinearizeSkip = 1;
+        ISAM2GaussNewtonParams gaussNewtonParams;
+        parameters.sam_params_.optimizationParams = gaussNewtonParams;
+        parameters.enable_gkcm = cbsEnableGkcm;
+        parameters.enable_belief_dcs = cbsEnableBeliefDcs;
+        parameters.belief_similarity_threshold = cbsBeliefSimilarityThreshold;
+        bpsam.reset(new cbs::BPSAM(parameters));
+
+        ROS_INFO_STREAM("LiORF BPSAM backend agent id: '" << static_cast<char>(selfAgentId) << "'");
 
         pubKeyPoses                 = nh.advertise<sensor_msgs::PointCloud2>("liorf/mapping/trajectory", 1);
         pubLaserCloudSurround       = nh.advertise<sensor_msgs::PointCloud2>("liorf/mapping/map_global", 1);
@@ -177,6 +494,10 @@ public:
         subCloud = nh.subscribe<liorf::cloud_info>("liorf/deskew/cloud_info", 1, &mapOptimization::laserCloudInfoHandler, this, ros::TransportHints().tcpNoDelay());
         subGPS   = nh.subscribe<sensor_msgs::NavSatFix> (gpsTopic, 200, &mapOptimization::gpsHandler, this, ros::TransportHints().tcpNoDelay());
         subLoop  = nh.subscribe<std_msgs::Float64MultiArray>("lio_loop/loop_closure_detection", 1, &mapOptimization::loopInfoHandler, this, ros::TransportHints().tcpNoDelay());
+        if (cbsBeliefBridgeEnable) {
+            subPoseBeliefsIn = nh.subscribe<liorf::pose_belief_array>(cbsBeliefInTopic, 50, &mapOptimization::poseBeliefInHandler, this, ros::TransportHints().tcpNoDelay());
+            pubPoseBeliefsOut = nh.advertise<liorf::pose_belief_array>(cbsBeliefOutTopic, 50);
+        }
 
         srvSaveMap  = nh.advertiseService("liorf/save_map", &mapOptimization::saveMapService, this);
 
@@ -205,6 +526,11 @@ public:
         cloudKeyPoses6D.reset(new pcl::PointCloud<PointTypePose>());
         copy_cloudKeyPoses3D.reset(new pcl::PointCloud<PointType>());
         copy_cloudKeyPoses6D.reset(new pcl::PointCloud<PointTypePose>());
+        localPoseKeys.clear();
+        localPoseKeyToIndex.clear();
+        localPoseTimestampsSec.clear();
+        incomingStampedBeliefs.clear();
+        outgoingStampedBeliefs.clear();
 
         kdtreeSurroundingKeyPoses.reset(new pcl::KdTreeFLANN<PointType>());
         kdtreeHistoryKeyPoses.reset(new pcl::KdTreeFLANN<PointType>());
@@ -1385,17 +1711,21 @@ public:
 
     void addOdomFactor()
     {
-        if (cloudKeyPoses3D->points.empty())
+        const size_t localPoseIndex = cloudKeyPoses3D->size();
+        const Key currentKey = ensurePoseKeyForLocalIndex(localPoseIndex);
+        const Pose3 poseTo = trans2gtsamPose(transformTobeMapped);
+
+        if (localPoseIndex == 0)
         {
             noiseModel::Diagonal::shared_ptr priorNoise = noiseModel::Diagonal::Variances((Vector(6) << 1e-2, 1e-2, M_PI*M_PI, 1e8, 1e8, 1e8).finished()); // rad*rad, meter*meter
-            gtSAMgraph.add(PriorFactor<Pose3>(0, trans2gtsamPose(transformTobeMapped), priorNoise));
-            initialEstimate.insert(0, trans2gtsamPose(transformTobeMapped));
+            gtSAMgraph.add(PriorFactor<Pose3>(currentKey, poseTo, priorNoise));
+            initialEstimate.insert(currentKey, poseTo);
         }else{
             noiseModel::Diagonal::shared_ptr odometryNoise = noiseModel::Diagonal::Variances((Vector(6) << 1e-6, 1e-6, 1e-6, 1e-4, 1e-4, 1e-4).finished());
+            const Key previousKey = ensurePoseKeyForLocalIndex(localPoseIndex - 1);
             gtsam::Pose3 poseFrom = pclPointTogtsamPose3(cloudKeyPoses6D->points.back());
-            gtsam::Pose3 poseTo   = trans2gtsamPose(transformTobeMapped);
-            gtSAMgraph.add(BetweenFactor<Pose3>(cloudKeyPoses3D->size()-1, cloudKeyPoses3D->size(), poseFrom.between(poseTo), odometryNoise));
-            initialEstimate.insert(cloudKeyPoses3D->size(), poseTo);
+            gtSAMgraph.add(BetweenFactor<Pose3>(previousKey, currentKey, poseFrom.between(poseTo), odometryNoise));
+            initialEstimate.insert(currentKey, poseTo);
         }
     }
 
@@ -1414,6 +1744,9 @@ public:
         }
 
         // pose covariance small, no need to correct
+        if (poseCovariance.rows() < 5 || poseCovariance.cols() < 5)
+            return;
+
         if (poseCovariance(3,3) < poseCovThreshold && poseCovariance(4,4) < poseCovThreshold)
             return;
 
@@ -1470,7 +1803,8 @@ public:
                 gtsam::Vector Vector3(3);
                 Vector3 << max(noise_x, 1.0f), max(noise_y, 1.0f), max(noise_z, 1.0f);
                 noiseModel::Diagonal::shared_ptr gps_noise = noiseModel::Diagonal::Variances(Vector3);
-                gtsam::GPSFactor gps_factor(cloudKeyPoses3D->size(), gtsam::Point3(gps_x, gps_y, gps_z), gps_noise);
+                const Key currentKey = ensurePoseKeyForLocalIndex(cloudKeyPoses3D->size());
+                gtsam::GPSFactor gps_factor(currentKey, gtsam::Point3(gps_x, gps_y, gps_z), gps_noise);
                 gtSAMgraph.add(gps_factor);
 
                 aLoopIsClosed = true;
@@ -1491,7 +1825,18 @@ public:
             gtsam::Pose3 poseBetween = loopPoseQueue[i];
             // gtsam::noiseModel::Diagonal::shared_ptr noiseBetween = loopNoiseQueue[i];
             auto noiseBetween = loopNoiseQueue[i];
-            gtSAMgraph.add(BetweenFactor<Pose3>(indexFrom, indexTo, poseBetween, noiseBetween));
+            if (indexFrom < 0 || indexTo < 0) {
+                continue;
+            }
+
+            Key fromKey = 0;
+            Key toKey = 0;
+            if (!getPoseKeyForLocalIndex(static_cast<size_t>(indexFrom), &fromKey) ||
+                !getPoseKeyForLocalIndex(static_cast<size_t>(indexTo), &toKey)) {
+                ROS_WARN_STREAM_THROTTLE(1.0, "Skipping loop factor with unmapped indices " << indexFrom << " -> " << indexTo);
+                continue;
+            }
+            gtSAMgraph.add(BetweenFactor<Pose3>(fromKey, toKey, poseBetween, noiseBetween));
         }
 
         loopIndexQueue.clear();
@@ -1505,6 +1850,9 @@ public:
         if (saveFrame() == false)
             return;
 
+        const size_t localPoseIndex = cloudKeyPoses3D->size();
+        const Key currentPoseKey = ensurePoseKeyForLocalIndex(localPoseIndex);
+
         // odom factor
         addOdomFactor();
 
@@ -1514,20 +1862,23 @@ public:
         // loop factor
         addLoopFactor();
 
+        // external belief factors (from camera-VIO backend) are pre-matched by timestamp.
+        consumeIncomingBeliefsIntoBpsam();
+
         // cout << "****************************************************" << endl;
         // gtSAMgraph.print("GTSAM Graph:\n");
 
-        // update iSAM
-        isam->update(gtSAMgraph, initialEstimate);
-        isam->update();
+        // update BPSAM backend
+        bpsam->update(gtSAMgraph, initialEstimate);
+        bpsam->update();
 
         if (aLoopIsClosed == true)
         {
-            isam->update();
-            isam->update();
-            isam->update();
-            isam->update();
-            isam->update();
+            bpsam->update();
+            bpsam->update();
+            bpsam->update();
+            bpsam->update();
+            bpsam->update();
         }
 
         gtSAMgraph.resize(0);
@@ -1538,8 +1889,12 @@ public:
         PointTypePose thisPose6D;
         Pose3 latestEstimate;
 
-        isamCurrentEstimate = isam->calculateEstimate();
-        latestEstimate = isamCurrentEstimate.at<Pose3>(isamCurrentEstimate.size()-1);
+        isamCurrentEstimate = bpsam->calculateEstimate();
+        if (!isamCurrentEstimate.exists(currentPoseKey)) {
+            ROS_ERROR_STREAM("Current pose key is missing from estimate: " << currentPoseKey);
+            return;
+        }
+        latestEstimate = isamCurrentEstimate.at<Pose3>(currentPoseKey);
         // cout << "****************************************************" << endl;
         // isamCurrentEstimate.print("Current estimate: ");
 
@@ -1558,11 +1913,16 @@ public:
         thisPose6D.yaw   = latestEstimate.rotation().yaw();
         thisPose6D.time = timeLaserInfoCur;
         cloudKeyPoses6D->push_back(thisPose6D);
+        setPoseTimestamp(localPoseIndex, timeLaserInfoCur);
 
         // cout << "****************************************************" << endl;
         // cout << "Pose covariance:" << endl;
-        // cout << isam->marginalCovariance(isamCurrentEstimate.size()-1) << endl << endl;
-        poseCovariance = isam->marginalCovariance(isamCurrentEstimate.size()-1);
+        // cout << bpsam->marginalCovariance(currentPoseKey) << endl << endl;
+        try {
+            poseCovariance = bpsam->marginalCovariance(currentPoseKey);
+        } catch (const std::exception& e) {
+            ROS_WARN_STREAM("Failed to fetch pose covariance for key " << currentPoseKey << ": " << e.what());
+        }
 
         // save updated transform
         transformTobeMapped[0] = latestEstimate.rotation().roll();
@@ -1606,6 +1966,9 @@ public:
 
         // save path for visualization
         updatePath(thisPose6D);
+
+        // This snapshot is consumed by the future Kimera bridge for phase-1 belief exchange.
+        refreshOutgoingBeliefs();
     }
 
     void correctPoses()
@@ -1620,19 +1983,25 @@ public:
             // clear path
             globalPath.poses.clear();
             // update key poses
-            int numPoses = isamCurrentEstimate.size();
+            int numPoses = cloudKeyPoses3D->size();
             for (int i = 0; i < numPoses; ++i)
             {
-                cloudKeyPoses3D->points[i].x = isamCurrentEstimate.at<Pose3>(i).translation().x();
-                cloudKeyPoses3D->points[i].y = isamCurrentEstimate.at<Pose3>(i).translation().y();
-                cloudKeyPoses3D->points[i].z = isamCurrentEstimate.at<Pose3>(i).translation().z();
+                Key key = 0;
+                if (!getPoseKeyForLocalIndex(static_cast<size_t>(i), &key) || !isamCurrentEstimate.exists(key)) {
+                    continue;
+                }
+                const Pose3 correctedPose = isamCurrentEstimate.at<Pose3>(key);
+
+                cloudKeyPoses3D->points[i].x = correctedPose.translation().x();
+                cloudKeyPoses3D->points[i].y = correctedPose.translation().y();
+                cloudKeyPoses3D->points[i].z = correctedPose.translation().z();
 
                 cloudKeyPoses6D->points[i].x = cloudKeyPoses3D->points[i].x;
                 cloudKeyPoses6D->points[i].y = cloudKeyPoses3D->points[i].y;
                 cloudKeyPoses6D->points[i].z = cloudKeyPoses3D->points[i].z;
-                cloudKeyPoses6D->points[i].roll  = isamCurrentEstimate.at<Pose3>(i).rotation().roll();
-                cloudKeyPoses6D->points[i].pitch = isamCurrentEstimate.at<Pose3>(i).rotation().pitch();
-                cloudKeyPoses6D->points[i].yaw   = isamCurrentEstimate.at<Pose3>(i).rotation().yaw();
+                cloudKeyPoses6D->points[i].roll  = correctedPose.rotation().roll();
+                cloudKeyPoses6D->points[i].pitch = correctedPose.rotation().pitch();
+                cloudKeyPoses6D->points[i].yaw   = correctedPose.rotation().yaw();
 
                 updatePath(cloudKeyPoses6D->points[i]);
             }
