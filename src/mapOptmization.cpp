@@ -21,11 +21,15 @@
 #include <gtsam/nonlinear/ISAM2.h>
 #include <cbs/bpsam/bpsam.h>
 #include <cbs/key.h>
+#include <algorithm>
 #include <cctype>
 #include <functional>
 #include <limits>
 #include <memory>
+#include <sstream>
+#include <atomic>
 #include <unordered_map>
+#include <unordered_set>
 
 #include <GeographicLib/Geocentric.hpp>
 #include <GeographicLib/LocalCartesian.hpp>
@@ -90,8 +94,12 @@ public:
         cbs::AgentId sourceAgent;
         size_t poseIndex;
         double stampSec;
+        uint64_t senderTimestampNs;
+        std::string senderFrameId;
         std::array<double, 6> mu;
         std::array<double, 36> covariance;
+        double sentTrace;
+        double receivedTrace;
         double relaxFactor;
     };
 
@@ -100,9 +108,49 @@ public:
     std::vector<StampedBelief> outgoingStampedBeliefs;
     size_t beliefExchangeWindowSize = 30;
     double beliefTimestampToleranceSec = 0.05;
+    bool cbsBeliefRejectFirstMessage = true;
     bool cbsBeliefBridgeEnable = true;
     std::string cbsBeliefInTopic = "liorf/cbs/belief_in";
     std::string cbsBeliefOutTopic = "liorf/cbs/belief_out";
+    std::atomic<size_t> cbsBeliefsIncomingReceivedTotal{0u};
+    std::atomic<size_t> cbsBeliefsIncomingDequeuedTotal{0u};
+    std::atomic<size_t> cbsBeliefsIncomingMatchedByIndexTotal{0u};
+    std::atomic<size_t> cbsBeliefsIncomingMatchedByTimestampTotal{0u};
+    std::atomic<size_t> cbsBeliefsIncomingDroppedNoLocalTimestampTotal{0u};
+    std::atomic<size_t> cbsBeliefsIncomingDroppedInvalidStampTotal{0u};
+    std::atomic<size_t> cbsBeliefsIncomingDroppedTimestampMismatchTotal{0u};
+    std::atomic<size_t> cbsBeliefsIncomingAddedToBpsamTotal{0u};
+    std::atomic<size_t> cbsBeliefsIncomingRejectedByBpsamTotal{0u};
+    std::atomic<size_t> cbsBeliefsOutgoingPreparedTotal{0u};
+    std::atomic<size_t> cbsBeliefsOutgoingPublishedTotal{0u};
+    std::atomic<size_t> cbsMergeK2LSampleCounter{0u};
+    enum class L2KOutgoingCovMode {
+        kAsIsLocalAnchored = 0,
+        kInitAnchorReplaced = 1,
+        kQueryAnchorOnly = 2,
+    };
+    bool cbsL2KCovAuditEnable = false;
+    size_t cbsL2KCovAuditMaxSamples = 20u;
+    double cbsL2KCovAuditReplacementTransVariance = 1.0;
+    double cbsL2KCovAuditQueryAnchorVariance = 1e6;
+    L2KOutgoingCovMode cbsL2KOutgoingCovMode = L2KOutgoingCovMode::kAsIsLocalAnchored;
+    std::string cbsL2KOutgoingCovModeLabel = "A_as_is_local_anchored";
+    std::string cbsL2KOutgoingCovSourcePath = "LiORF::bpsam_getBeliefs_local_marginalization";
+    std::string cbsL2KOutgoingCovAnchorMode = "local_anchored_perm_init_prior";
+    std::unordered_set<size_t> cbsL2KCovAuditLoggedPoseIndices;
+    std::atomic<size_t> cbsL2KCovAuditSampleCounter{0u};
+    bool cbsExternalExchangeInBodyFrame = true;
+    gtsam::Pose3 cbsLidarPoseBody = gtsam::Pose3();
+    gtsam::Pose3 cbsBodyPoseLidar = gtsam::Pose3();
+    gtsam::Matrix6 cbsAdjointLidarPoseBody = gtsam::Matrix6::Identity();
+    gtsam::Matrix6 cbsAdjointBodyPoseLidar = gtsam::Matrix6::Identity();
+
+    enum class BeliefMatchFailureReason {
+        kNone = 0,
+        kNoLocalTimestamp = 1,
+        kInvalidStamp = 2,
+        kTimestampMismatch = 3,
+    };
 
     cbs::AgentId resolveAgentId(const std::string& id) const
     {
@@ -159,18 +207,36 @@ public:
         localPoseTimestampsSec[localIndex] = stampSec;
     }
 
-    bool findClosestLocalIndexByTimestamp(double stampSec, size_t* localIndex) const
+    bool findClosestLocalIndexByTimestamp(double stampSec,
+                                          size_t* localIndex,
+                                          BeliefMatchFailureReason* reason = nullptr) const
     {
+        if (reason) {
+            *reason = BeliefMatchFailureReason::kNone;
+        }
+
         if (localPoseTimestampsSec.empty()) {
+            if (reason) {
+                *reason = BeliefMatchFailureReason::kNoLocalTimestamp;
+            }
+            return false;
+        }
+
+        if (!std::isfinite(stampSec) || stampSec <= 0.0) {
+            if (reason) {
+                *reason = BeliefMatchFailureReason::kInvalidStamp;
+            }
             return false;
         }
 
         size_t bestIndex = 0;
         double bestAbsDt = std::numeric_limits<double>::max();
+        bool hasCandidate = false;
         for (size_t i = 0; i < localPoseTimestampsSec.size(); ++i) {
             if (localPoseTimestampsSec[i] < 0.0) {
                 continue;
             }
+            hasCandidate = true;
             const double dt = std::abs(localPoseTimestampsSec[i] - stampSec);
             if (dt < bestAbsDt) {
                 bestAbsDt = dt;
@@ -178,11 +244,589 @@ public:
             }
         }
 
+        if (!hasCandidate) {
+            if (reason) {
+                *reason = BeliefMatchFailureReason::kNoLocalTimestamp;
+            }
+            return false;
+        }
+
         if (bestAbsDt > beliefTimestampToleranceSec) {
+            if (reason) {
+                *reason = BeliefMatchFailureReason::kTimestampMismatch;
+            }
             return false;
         }
         *localIndex = bestIndex;
         return true;
+    }
+
+    static gtsam::Matrix6 beliefArrayToMatrix6(const std::array<double, 36>& covarianceArray)
+    {
+        gtsam::Matrix6 covariance = gtsam::Matrix6::Zero();
+        for (size_t r = 0; r < 6; ++r) {
+            for (size_t c = 0; c < 6; ++c) {
+                covariance(r, c) = covarianceArray[r * 6 + c];
+            }
+        }
+        return covariance;
+    }
+
+    static void beliefMatrix6ToArray(const gtsam::Matrix6& covariance,
+                                     std::array<double, 36>* covarianceArray)
+    {
+        if (!covarianceArray) {
+            return;
+        }
+        for (size_t r = 0; r < 6; ++r) {
+            for (size_t c = 0; c < 6; ++c) {
+                (*covarianceArray)[r * 6 + c] = covariance(r, c);
+            }
+        }
+    }
+
+    static gtsam::Vector6 beliefArrayToVector6(const std::array<double, 6>& muArray)
+    {
+        gtsam::Vector6 mu = gtsam::Vector6::Zero();
+        for (size_t i = 0; i < 6; ++i) {
+            mu(i) = muArray[i];
+        }
+        return mu;
+    }
+
+    static void beliefVector6ToArray(const gtsam::Vector6& mu,
+                                     std::array<double, 6>* muArray)
+    {
+        if (!muArray) {
+            return;
+        }
+        for (size_t i = 0; i < 6; ++i) {
+            (*muArray)[i] = mu(i);
+        }
+    }
+
+    static double beliefTraceFromArray(const std::array<double, 36>& covarianceArray)
+    {
+        double trace = 0.0;
+        for (size_t i = 0; i < 6; ++i) {
+            trace += covarianceArray[i * 6 + i];
+        }
+        return trace;
+    }
+
+    static double beliefTraceFromMatrix(const Eigen::MatrixXd& covariance)
+    {
+        return covariance.trace();
+    }
+
+    static std::string sanitizeCsvToken(std::string token)
+    {
+        std::replace(token.begin(), token.end(), ',', '_');
+        std::replace(token.begin(), token.end(), ' ', '_');
+        return token.empty() ? "na" : token;
+    }
+
+    static std::string vector6ToToken(const gtsam::Vector6& vector)
+    {
+        std::ostringstream oss;
+        oss << "v[";
+        for (size_t i = 0u; i < 6u; ++i) {
+            if (i > 0u) {
+                oss << ";";
+            }
+            oss << vector(i);
+        }
+        oss << "]";
+        return oss.str();
+    }
+
+    static std::string matrix6ToToken(const gtsam::Matrix6& matrix)
+    {
+        std::ostringstream oss;
+        oss << "m[";
+        for (size_t r = 0u; r < 6u; ++r) {
+            if (r > 0u) {
+                oss << "|";
+            }
+            for (size_t c = 0u; c < 6u; ++c) {
+                if (c > 0u) {
+                    oss << ";";
+                }
+                oss << matrix(r, c);
+            }
+        }
+        oss << "]";
+        return oss.str();
+    }
+
+    static double minEigenvalueSymmetric(const gtsam::Matrix6& matrix)
+    {
+        Eigen::SelfAdjointEigenSolver<gtsam::Matrix6> eig(0.5 * (matrix + matrix.transpose()));
+        if (eig.info() != Eigen::Success) {
+            return std::numeric_limits<double>::quiet_NaN();
+        }
+        return eig.eigenvalues().minCoeff();
+    }
+
+    static double poseErrorNorm(const gtsam::Pose3& lhs, const gtsam::Pose3& rhs)
+    {
+        try {
+            return gtsam::Pose3::Logmap(lhs.inverse() * rhs).norm();
+        } catch (...) {
+            return std::numeric_limits<double>::quiet_NaN();
+        }
+    }
+
+    static std::string formatPoseKeyToken(cbs::AgentId agent, size_t poseIndex)
+    {
+        const char agentChar = static_cast<char>(agent);
+        return std::string("p:") + agentChar + ":" + std::to_string(poseIndex);
+    }
+
+    static std::string normalizeCovModeToken(std::string modeToken)
+    {
+        std::transform(modeToken.begin(), modeToken.end(), modeToken.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return modeToken;
+    }
+
+    static std::string covModeToLabel(const L2KOutgoingCovMode mode)
+    {
+        switch (mode) {
+            case L2KOutgoingCovMode::kAsIsLocalAnchored:
+                return "A_as_is_local_anchored";
+            case L2KOutgoingCovMode::kInitAnchorReplaced:
+                return "B_init_anchor_replaced_with_query_solve";
+            case L2KOutgoingCovMode::kQueryAnchorOnly:
+                return "C_query_anchor_only_no_perm_init_anchor";
+        }
+        return "A_as_is_local_anchored";
+    }
+
+    static std::pair<std::string, std::string> covModeSemantics(const L2KOutgoingCovMode mode)
+    {
+        switch (mode) {
+            case L2KOutgoingCovMode::kAsIsLocalAnchored:
+                return {"LiORF::bpsam_getBeliefs_local_marginalization",
+                        "local_anchored_perm_init_prior"};
+            case L2KOutgoingCovMode::kInitAnchorReplaced:
+                return {"LiORF::local_graph_init_anchor_replaced_query_solve",
+                        "local_init_anchor_replaced_query_solve"};
+            case L2KOutgoingCovMode::kQueryAnchorOnly:
+                return {"LiORF::local_graph_query_anchor_only",
+                        "local_query_anchor_only_no_perm_init_anchor"};
+        }
+        return {"LiORF::bpsam_getBeliefs_local_marginalization",
+                "local_anchored_perm_init_prior"};
+    }
+
+    static L2KOutgoingCovMode parseCovModeToken(const std::string& modeToken)
+    {
+        const std::string token = normalizeCovModeToken(modeToken);
+        if (token == "a" || token == "as_is" || token == "asis" || token == "baseline" ||
+            token == "as_is_local_anchored" || token == "a_as_is_local_anchored") {
+            return L2KOutgoingCovMode::kAsIsLocalAnchored;
+        }
+        if (token == "b" || token == "init_anchor_replaced" ||
+            token == "b_init_anchor_replaced_with_query_solve") {
+            return L2KOutgoingCovMode::kInitAnchorReplaced;
+        }
+        if (token == "c" || token == "query_anchor_only" ||
+            token == "c_query_anchor_only_no_perm_init_anchor") {
+            return L2KOutgoingCovMode::kQueryAnchorOnly;
+        }
+        return L2KOutgoingCovMode::kAsIsLocalAnchored;
+    }
+
+    static double safeHellingerDistance(const gtsam::Vector6& muA,
+                                        const gtsam::Matrix6& covA,
+                                        const gtsam::Vector6& muB,
+                                        const gtsam::Matrix6& covB)
+    {
+        try {
+            const gtsam::Pose3 poseA = gtsam::Pose3::Expmap(muA);
+            const gtsam::Pose3 poseB = gtsam::Pose3::Expmap(muB);
+            const gtsam::Vector6 delta = gtsam::Pose3::Logmap(poseA.inverse() * poseB);
+            return gbp::Hellinger::hellingerDistanceGaussian(delta, covA, covB);
+        } catch (...) {
+            return std::numeric_limits<double>::quiet_NaN();
+        }
+    }
+
+    static double safeMahalanobisDistance(const gtsam::Vector6& muA,
+                                          const gtsam::Matrix6& covA,
+                                          const gtsam::Vector6& muB)
+    {
+        try {
+            const gtsam::Vector6 delta = muB - muA;
+            const gtsam::Matrix6 covInv = covA.inverse();
+            return static_cast<double>(delta.transpose() * covInv * delta);
+        } catch (...) {
+            return std::numeric_limits<double>::quiet_NaN();
+        }
+    }
+
+    static double safeDeltaNorm(const gtsam::Vector6& muA,
+                                const gtsam::Vector6& muB)
+    {
+        return (muB - muA).norm();
+    }
+
+    static gtsam::Matrix6 sanitizeBeliefCovariance(const gtsam::Matrix6& covariance)
+    {
+        gtsam::Matrix6 sym = 0.5 * (covariance + covariance.transpose());
+        for (size_t i = 0; i < 6; ++i) {
+            if (!std::isfinite(sym(i, i)) || sym(i, i) <= 1e-9) {
+                sym(i, i) = 1e-3;
+            }
+        }
+        return sym;
+    }
+
+    struct L2KOutgoingCovAuditResult
+    {
+        double traceAsIs = std::numeric_limits<double>::quiet_NaN();
+        double traceInitPriorReplaced = std::numeric_limits<double>::quiet_NaN();
+        double traceQueryAnchorOnly = std::numeric_limits<double>::quiet_NaN();
+        std::string modeBStatus = "unavailable";
+        std::string modeCStatus = "unavailable";
+    };
+
+    bool computePoseMarginalCovariance(const gtsam::NonlinearFactorGraph& graph,
+                                       const gtsam::Values& values,
+                                       const Key poseKey,
+                                       gtsam::Matrix6* covarianceOut) const
+    {
+        if (!covarianceOut || graph.empty() || !values.exists(poseKey)) {
+            return false;
+        }
+        try {
+            gtsam::Marginals marginals(graph, values, gtsam::Marginals::Factorization::CHOLESKY);
+            const gtsam::Matrix poseCov = marginals.marginalCovariance(poseKey);
+            if (poseCov.rows() != 6 || poseCov.cols() != 6 || !poseCov.allFinite()) {
+                return false;
+            }
+            *covarianceOut = sanitizeBeliefCovariance(poseCov);
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+
+    bool computePoseMarginalTrace(const gtsam::NonlinearFactorGraph& graph,
+                                  const gtsam::Values& values,
+                                  const Key poseKey,
+                                  double* traceOut) const
+    {
+        if (!traceOut) {
+            return false;
+        }
+        gtsam::Matrix6 cov;
+        if (!computePoseMarginalCovariance(graph, values, poseKey, &cov)) {
+            return false;
+        }
+        *traceOut = cov.trace();
+        return true;
+    }
+
+    bool buildLocalGraphForOutgoingCovAudit(const Key queryPoseKey,
+                                            gtsam::NonlinearFactorGraph* localGraph,
+                                            gtsam::Values* localValues,
+                                            Key* firstPoseKeyOut) const
+    {
+        if (!localGraph || !localValues || !firstPoseKeyOut || !bpsam) {
+            return false;
+        }
+        localGraph->resize(0);
+        localValues->clear();
+        const gtsam::Values allValues = bpsam->calculateEstimate();
+        if (!allValues.exists(queryPoseKey)) {
+            return false;
+        }
+
+        const Key firstPoseKey = localPoseKeys.empty()
+                                     ? static_cast<Key>(cbs::toPoseKey(selfAgentId, 0))
+                                     : localPoseKeys.front();
+        *firstPoseKeyOut = firstPoseKey;
+
+        const auto& factors = bpsam->getFactorsUnsafe();
+        localGraph->reserve(factors.size());
+        for (size_t slot = 0u; slot < factors.size(); ++slot) {
+            if (!factors.exists(slot)) {
+                continue;
+            }
+            const auto& factor = factors.at(slot);
+            if (!factor) {
+                continue;
+            }
+            if (factor->keys().size() == 2 &&
+                (cbs::isPoseBeliefFactor(selfAgentId, factor) ||
+                 cbs::isAnchorBeliefFactor(factor))) {
+                continue;
+            }
+            bool hasValues = true;
+            for (const auto key : factor->keys()) {
+                if (!allValues.exists(key)) {
+                    hasValues = false;
+                    break;
+                }
+            }
+            if (!hasValues) {
+                continue;
+            }
+            localGraph->push_back(factor);
+            for (const auto key : factor->keys()) {
+                localValues->insert_or_assign(key, allValues.at(key));
+            }
+        }
+
+        localValues->insert_or_assign(queryPoseKey, allValues.at(queryPoseKey));
+        if (allValues.exists(firstPoseKey)) {
+            localValues->insert_or_assign(firstPoseKey, allValues.at(firstPoseKey));
+        }
+        return !localGraph->empty();
+    }
+
+    bool buildModeBGraph(const gtsam::NonlinearFactorGraph& localGraph,
+                         const gtsam::Values& localValues,
+                         const Key firstPoseKey,
+                         gtsam::NonlinearFactorGraph* modeGraph,
+                         bool* removedInitPrior) const
+    {
+        if (!modeGraph) {
+            return false;
+        }
+        modeGraph->resize(0);
+        modeGraph->reserve(localGraph.size() + 1u);
+        bool removed = false;
+        for (size_t i = 0u; i < localGraph.size(); ++i) {
+            if (!localGraph.exists(i)) {
+                continue;
+            }
+            const auto& factor = localGraph.at(i);
+            if (!factor) {
+                continue;
+            }
+            const auto* posePrior = dynamic_cast<const gtsam::PriorFactor<gtsam::Pose3>*>(factor.get());
+            if (posePrior && posePrior->key() == firstPoseKey) {
+                removed = true;
+                continue;
+            }
+            modeGraph->push_back(factor);
+        }
+        if (localValues.exists(firstPoseKey)) {
+            gtsam::Vector initVars(6);
+            initVars << 1e-2, 1e-2, M_PI * M_PI,
+                cbsL2KCovAuditReplacementTransVariance,
+                cbsL2KCovAuditReplacementTransVariance,
+                cbsL2KCovAuditReplacementTransVariance;
+            auto replacementNoise = gtsam::noiseModel::Diagonal::Variances(initVars);
+            modeGraph->emplace_shared<gtsam::PriorFactor<gtsam::Pose3>>(
+                firstPoseKey,
+                localValues.at<gtsam::Pose3>(firstPoseKey),
+                replacementNoise);
+        }
+        if (removedInitPrior) {
+            *removedInitPrior = removed;
+        }
+        return !modeGraph->empty();
+    }
+
+    bool buildModeCGraph(const gtsam::NonlinearFactorGraph& localGraph,
+                         const gtsam::Values& localValues,
+                         const Key queryPoseKey,
+                         gtsam::NonlinearFactorGraph* modeGraph) const
+    {
+        if (!modeGraph) {
+            return false;
+        }
+        modeGraph->resize(0);
+        modeGraph->reserve(localGraph.size() + 1u);
+        for (size_t i = 0u; i < localGraph.size(); ++i) {
+            if (!localGraph.exists(i)) {
+                continue;
+            }
+            const auto& factor = localGraph.at(i);
+            if (!factor) {
+                continue;
+            }
+            const auto* posePrior = dynamic_cast<const gtsam::PriorFactor<gtsam::Pose3>*>(factor.get());
+            if (posePrior) {
+                continue;
+            }
+            modeGraph->push_back(factor);
+        }
+        if (localValues.exists(queryPoseKey)) {
+            gtsam::Vector anchorVars = gtsam::Vector::Constant(6, cbsL2KCovAuditQueryAnchorVariance);
+            auto queryAnchorNoise = gtsam::noiseModel::Diagonal::Variances(anchorVars);
+            modeGraph->emplace_shared<gtsam::PriorFactor<gtsam::Pose3>>(
+                queryPoseKey,
+                localValues.at<gtsam::Pose3>(queryPoseKey),
+                queryAnchorNoise);
+        }
+        return !modeGraph->empty();
+    }
+
+    bool computeL2KOutgoingCovarianceForMode(const Key queryPoseKey,
+                                             const gbp::Gaussian& asIsBelief,
+                                             const L2KOutgoingCovMode mode,
+                                             gtsam::Matrix6* covarianceOut,
+                                             std::string* statusOut) const
+    {
+        if (!covarianceOut) {
+            return false;
+        }
+
+        if (mode == L2KOutgoingCovMode::kAsIsLocalAnchored) {
+            *covarianceOut = sanitizeBeliefCovariance(asIsBelief.Sigma());
+            if (statusOut) {
+                *statusOut = "ok_as_is_local_anchored";
+            }
+            return true;
+        }
+
+        gtsam::NonlinearFactorGraph localGraph;
+        gtsam::Values localValues;
+        Key firstPoseKey = queryPoseKey;
+        if (!buildLocalGraphForOutgoingCovAudit(queryPoseKey, &localGraph, &localValues, &firstPoseKey)) {
+            if (statusOut) {
+                *statusOut = "local_graph_unavailable";
+            }
+            return false;
+        }
+
+        gtsam::NonlinearFactorGraph modeGraph;
+        if (mode == L2KOutgoingCovMode::kInitAnchorReplaced) {
+            bool removedInitPrior = false;
+            if (!buildModeBGraph(localGraph, localValues, firstPoseKey, &modeGraph, &removedInitPrior)) {
+                if (statusOut) {
+                    *statusOut = "mode_b_graph_unavailable";
+                }
+                return false;
+            }
+            if (!computePoseMarginalCovariance(modeGraph, localValues, queryPoseKey, covarianceOut)) {
+                if (statusOut) {
+                    *statusOut = removedInitPrior ? "failed_removed_and_replaced" : "failed_replaced_only";
+                }
+                return false;
+            }
+            if (statusOut) {
+                *statusOut = removedInitPrior ? "ok_removed_and_replaced" : "ok_replaced_only";
+            }
+            return true;
+        }
+
+        if (mode == L2KOutgoingCovMode::kQueryAnchorOnly) {
+            if (!buildModeCGraph(localGraph, localValues, queryPoseKey, &modeGraph)) {
+                if (statusOut) {
+                    *statusOut = "mode_c_graph_unavailable";
+                }
+                return false;
+            }
+            if (!computePoseMarginalCovariance(modeGraph, localValues, queryPoseKey, covarianceOut)) {
+                if (statusOut) {
+                    *statusOut = "failed_query_anchor_only";
+                }
+                return false;
+            }
+            if (statusOut) {
+                *statusOut = "ok_query_anchor_only";
+            }
+            return true;
+        }
+
+        if (statusOut) {
+            *statusOut = "unknown_mode";
+        }
+        return false;
+    }
+
+    L2KOutgoingCovAuditResult computeL2KOutgoingCovAudit(const Key queryPoseKey,
+                                                         const gbp::Gaussian& asIsBelief) const
+    {
+        L2KOutgoingCovAuditResult result;
+        gtsam::Matrix6 covA = sanitizeBeliefCovariance(asIsBelief.Sigma());
+        result.traceAsIs = beliefTraceFromMatrix(covA);
+
+        gtsam::Matrix6 covB;
+        if (computeL2KOutgoingCovarianceForMode(queryPoseKey,
+                                                asIsBelief,
+                                                L2KOutgoingCovMode::kInitAnchorReplaced,
+                                                &covB,
+                                                &result.modeBStatus)) {
+            result.traceInitPriorReplaced = covB.trace();
+        }
+
+        gtsam::Matrix6 covC;
+        if (computeL2KOutgoingCovarianceForMode(queryPoseKey,
+                                                asIsBelief,
+                                                L2KOutgoingCovMode::kQueryAnchorOnly,
+                                                &covC,
+                                                &result.modeCStatus)) {
+            result.traceQueryAnchorOnly = covC.trace();
+        }
+
+        return result;
+    }
+
+    static void computeCovarianceLogdetAndLambdaMin(const gtsam::Matrix6& covariance,
+                                                    double* logdetOut,
+                                                    double* lambdaMinOut)
+    {
+        if (logdetOut) {
+            *logdetOut = std::numeric_limits<double>::quiet_NaN();
+        }
+        if (lambdaMinOut) {
+            *lambdaMinOut = std::numeric_limits<double>::quiet_NaN();
+        }
+        Eigen::SelfAdjointEigenSolver<gtsam::Matrix6> eigSolver(0.5 * (covariance + covariance.transpose()));
+        if (eigSolver.info() != Eigen::Success) {
+            return;
+        }
+        gtsam::Vector6 eigvals = eigSolver.eigenvalues();
+        for (size_t i = 0; i < 6; ++i) {
+            if (!std::isfinite(eigvals(i)) || eigvals(i) <= 1e-12) {
+                eigvals(i) = 1e-12;
+            }
+        }
+        if (lambdaMinOut) {
+            *lambdaMinOut = eigvals.minCoeff();
+        }
+        if (logdetOut) {
+            *logdetOut = eigvals.array().log().sum();
+        }
+    }
+
+    void convertIncomingExchangeBeliefToLidarFrame(StampedBelief* belief) const
+    {
+        if (!belief || !cbsExternalExchangeInBodyFrame) {
+            return;
+        }
+
+        const gtsam::Pose3 worldPoseBody = gtsam::Pose3::Expmap(beliefArrayToVector6(belief->mu));
+        const gtsam::Pose3 worldPoseLidar = worldPoseBody.compose(cbsBodyPoseLidar);
+        const gtsam::Matrix6 covarianceBody = sanitizeBeliefCovariance(beliefArrayToMatrix6(belief->covariance));
+        const gtsam::Matrix6 covarianceLidar =
+            sanitizeBeliefCovariance(cbsAdjointBodyPoseLidar * covarianceBody *
+                                     cbsAdjointBodyPoseLidar.transpose());
+        beliefVector6ToArray(gtsam::Pose3::Logmap(worldPoseLidar), &belief->mu);
+        beliefMatrix6ToArray(covarianceLidar, &belief->covariance);
+    }
+
+    void convertOutgoingLidarBeliefToExchangeFrame(StampedBelief* belief) const
+    {
+        if (!belief || !cbsExternalExchangeInBodyFrame) {
+            return;
+        }
+
+        const gtsam::Pose3 worldPoseLidar = gtsam::Pose3::Expmap(beliefArrayToVector6(belief->mu));
+        const gtsam::Pose3 worldPoseBody = worldPoseLidar.compose(cbsLidarPoseBody);
+        const gtsam::Matrix6 covarianceLidar = sanitizeBeliefCovariance(beliefArrayToMatrix6(belief->covariance));
+        const gtsam::Matrix6 covarianceBody =
+            sanitizeBeliefCovariance(cbsAdjointLidarPoseBody * covarianceLidar *
+                                     cbsAdjointLidarPoseBody.transpose());
+        beliefVector6ToArray(gtsam::Pose3::Logmap(worldPoseBody), &belief->mu);
+        beliefMatrix6ToArray(covarianceBody, &belief->covariance);
     }
 
     void enqueueIncomingBelief(const StampedBelief& belief)
@@ -203,6 +847,8 @@ public:
             belief.sourceAgent = sourceAgent;
             belief.poseIndex = static_cast<size_t>(beliefMsg.pose_index);
             belief.stampSec = beliefMsg.stamp_sec > 0.0 ? beliefMsg.stamp_sec : beliefMsg.header.stamp.toSec();
+            belief.senderTimestampNs = beliefMsg.header.stamp.toNSec();
+            belief.senderFrameId = beliefMsg.header.frame_id;
             belief.relaxFactor = beliefMsg.relax_factor;
 
             for (size_t i = 0; i < belief.mu.size(); ++i) {
@@ -211,8 +857,73 @@ public:
             for (size_t i = 0; i < belief.covariance.size(); ++i) {
                 belief.covariance[i] = beliefMsg.covariance[i];
             }
+            belief.sentTrace = beliefTraceFromArray(belief.covariance);
+
+            const gtsam::Pose3 senderPoseRaw = gtsam::Pose3::Expmap(beliefArrayToVector6(belief.mu));
+            const gtsam::Matrix6 senderCovRaw = sanitizeBeliefCovariance(beliefArrayToMatrix6(belief.covariance));
+
+            convertIncomingExchangeBeliefToLidarFrame(&belief);
+            belief.receivedTrace = beliefTraceFromArray(belief.covariance);
+
+            const gtsam::Pose3 convertedPose = gtsam::Pose3::Expmap(beliefArrayToVector6(belief.mu));
+            const gtsam::Matrix6 convertedCov =
+                sanitizeBeliefCovariance(beliefArrayToMatrix6(belief.covariance));
+
+            gtsam::Pose3 reconstructedPose = senderPoseRaw;
+            gtsam::Matrix6 reconstructedCov = senderCovRaw;
+            std::string transformLabel = "identity_exchange_equals_lidar";
+            std::string receiverExpectedFrame = "world_to_lidar_pose";
+            if (cbsExternalExchangeInBodyFrame) {
+                reconstructedPose = senderPoseRaw.compose(cbsBodyPoseLidar);
+                reconstructedCov =
+                    sanitizeBeliefCovariance(cbsAdjointBodyPoseLidar * senderCovRaw *
+                                             cbsAdjointBodyPoseLidar.transpose());
+                transformLabel = "body_to_lidar_compose_adjoint";
+                receiverExpectedFrame = "world_to_body_pose";
+            }
+            const double meanErrorNorm = poseErrorNorm(convertedPose, reconstructedPose);
+            const double covErrorFro = (convertedCov - reconstructedCov).norm();
+            const double covSymmetryError = (convertedCov - convertedCov.transpose()).norm();
+            const double minEigenvalue = minEigenvalueSymmetric(convertedCov);
+
+            gtsam::Pose3 roundtripPose = convertedPose;
+            gtsam::Matrix6 roundtripCov = convertedCov;
+            if (cbsExternalExchangeInBodyFrame) {
+                roundtripPose = convertedPose.compose(cbsLidarPoseBody);
+                roundtripCov =
+                    sanitizeBeliefCovariance(cbsAdjointLidarPoseBody * convertedCov *
+                                             cbsAdjointLidarPoseBody.transpose());
+            }
+            const double meanRoundtripError = poseErrorNorm(roundtripPose, senderPoseRaw);
+            const double covRoundtripError = (roundtripCov - senderCovRaw).norm();
+
+            const std::string keyToken = formatPoseKeyToken(sourceAgent, belief.poseIndex);
+            ROS_INFO_STREAM(
+                "CBS_TRANSPORT_ROW_K2L,"
+                << keyToken << ","
+                << belief.senderTimestampNs << ","
+                << sanitizeCsvToken(belief.senderFrameId) << ","
+                << sanitizeCsvToken(receiverExpectedFrame) << ","
+                << sanitizeCsvToken(transformLabel) << ","
+                << vector6ToToken(gtsam::Pose3::Logmap(senderPoseRaw)) << ","
+                << vector6ToToken(gtsam::Pose3::Logmap(convertedPose)) << ","
+                << vector6ToToken(gtsam::Pose3::Logmap(reconstructedPose)) << ","
+                << meanErrorNorm << ","
+                << matrix6ToToken(senderCovRaw) << ","
+                << matrix6ToToken(convertedCov) << ","
+                << matrix6ToToken(reconstructedCov) << ","
+                << covErrorFro << ","
+                << covSymmetryError << ","
+                << minEigenvalue << ",ok");
+            ROS_INFO_STREAM(
+                "CBS_ROUNDTRIP_ROW_K2L,"
+                << keyToken << ","
+                << belief.senderTimestampNs << ","
+                << meanRoundtripError << ","
+                << covRoundtripError << ",ok");
 
             enqueueIncomingBelief(belief);
+            cbsBeliefsIncomingReceivedTotal.fetch_add(1u, std::memory_order_relaxed);
         }
     }
 
@@ -227,26 +938,149 @@ public:
             pendingBeliefs.swap(incomingStampedBeliefs);
         }
 
-        std::map<Key, std::vector<std::pair<cbs::AgentId, gbp::Gaussian>>> beliefsByKey;
-        size_t numDropped = 0;
+        const size_t pendingCount = pendingBeliefs.size();
+        cbsBeliefsIncomingDequeuedTotal.fetch_add(pendingCount, std::memory_order_relaxed);
+
+        size_t numMatchedByIndex = 0;
+        size_t numMatchedByTimestamp = 0;
+        size_t numDroppedNoLocalTimestamp = 0;
+        size_t numDroppedInvalidStamp = 0;
+        size_t numDroppedTimestampMismatch = 0;
+        size_t numCandidateForBpsam = 0;
+        size_t numRejectedByBpsam = 0;
+        size_t numAddedToBpsam = 0;
+
+        auto fetchAgentLocalBelief = [&](const cbs::AgentId sourceAgent,
+                                         const Key localKey,
+                                         gbp::Gaussian* beliefOut) -> bool {
+            if (!beliefOut) {
+                return false;
+            }
+            try {
+                const auto beliefGraph = bpsam->beliefGraph();
+                const auto agentIt = beliefGraph.find(sourceAgent);
+                if (agentIt == beliefGraph.end()) {
+                    return false;
+                }
+                if (agentIt->second.contains(localKey) == 0) {
+                    return false;
+                }
+                const auto beliefVar = agentIt->second.getVar(localKey);
+                if (!beliefVar) {
+                    return false;
+                }
+                *beliefOut = *beliefVar;
+                return true;
+            } catch (...) {
+                return false;
+            }
+        };
+
+        auto logMergeRow = [&](const StampedBelief& incoming,
+                               const std::string& senderKeyToken,
+                               const std::string& receiverPoseKeyToken,
+                               double receiverLocalBeforeTrace,
+                               double receiverMergedTrace,
+                               double receiverPosteriorPreTrace,
+                               double receiverPosteriorPostTrace,
+                               double hellingerLocalIncoming,
+                               double hellingerLocalMerged,
+                               double mahalLocalIncoming,
+                               const std::string& status,
+                               const std::string& receiverLocalSource,
+                               double receiverLocalRawTrace,
+                               double receiverLocalAnchoredTrace,
+                               double dmuLocalIncoming,
+                               double dmuLocalMerged,
+                               double step,
+                               double dxycurr,
+                               double dxyTarget) {
+            const size_t sampleIdx = cbsMergeK2LSampleCounter.fetch_add(1u, std::memory_order_relaxed);
+            ROS_INFO_STREAM(
+                "CBS_MERGE_ROW_K2L,"
+                << sampleIdx << ","
+                << sanitizeCsvToken(incoming.senderFrameId) << ","
+                << incoming.senderTimestampNs << ","
+                << senderKeyToken << ","
+                << receiverPoseKeyToken << ","
+                << incoming.sentTrace << ","
+                << incoming.receivedTrace << ","
+                << receiverLocalBeforeTrace << ","
+                << receiverMergedTrace << ","
+                << receiverPosteriorPreTrace << ","
+                << receiverPosteriorPostTrace << ","
+                << hellingerLocalIncoming << ","
+                << hellingerLocalMerged << ","
+                << mahalLocalIncoming << ","
+                << sanitizeCsvToken(status) << ","
+                << sanitizeCsvToken(receiverLocalSource) << ","
+                << receiverLocalRawTrace << ","
+                << receiverLocalAnchoredTrace << ","
+                << dmuLocalIncoming << ","
+                << dmuLocalMerged << ","
+                << step << ","
+                << dxycurr << ","
+                << dxyTarget);
+        };
+
         for (const auto& incoming : pendingBeliefs) {
             size_t localIndex = 0;
             bool matched = false;
-            if (incoming.poseIndex < localPoseTimestampsSec.size()) {
-                localIndex = incoming.poseIndex;
-                matched = true;
+            BeliefMatchFailureReason matchReason = BeliefMatchFailureReason::kNone;
+            if (std::isfinite(incoming.stampSec) && incoming.stampSec > 0.0) {
+                matched = findClosestLocalIndexByTimestamp(incoming.stampSec, &localIndex, &matchReason);
+                if (matched) {
+                    numMatchedByTimestamp++;
+                } else if (matchReason == BeliefMatchFailureReason::kNoLocalTimestamp) {
+                    numDroppedNoLocalTimestamp++;
+                } else if (matchReason == BeliefMatchFailureReason::kInvalidStamp) {
+                    numDroppedInvalidStamp++;
+                } else {
+                    numDroppedTimestampMismatch++;
+                }
             } else {
-                matched = findClosestLocalIndexByTimestamp(incoming.stampSec, &localIndex);
+                numDroppedInvalidStamp++;
+                matchReason = BeliefMatchFailureReason::kInvalidStamp;
             }
 
+            const std::string senderKeyToken = formatPoseKeyToken(incoming.sourceAgent, incoming.poseIndex);
             if (!matched) {
-                numDropped++;
+                const std::string status =
+                    (matchReason == BeliefMatchFailureReason::kNoLocalTimestamp)
+                        ? "dropped_no_local_timestamp"
+                        : (matchReason == BeliefMatchFailureReason::kInvalidStamp)
+                              ? "dropped_invalid_stamp"
+                              : "dropped_timestamp_mismatch";
+                const double nan = std::numeric_limits<double>::quiet_NaN();
+                logMergeRow(incoming,
+                            senderKeyToken,
+                            "na",
+                            nan,
+                            nan,
+                            nan,
+                            nan,
+                            nan,
+                            nan,
+                            nan,
+                            status,
+                            "na",
+                            nan,
+                            nan,
+                            nan,
+                            nan,
+                            nan,
+                            nan,
+                            nan);
                 continue;
             }
 
             const Key localKey = ensurePoseKeyForLocalIndex(localIndex);
-            Eigen::VectorXd mu(6);
-            Eigen::MatrixXd covariance(6, 6);
+            const gtsam::LabeledSymbol localSymbol(localKey);
+            const std::string receiverPoseKeyToken =
+                formatPoseKeyToken(static_cast<cbs::AgentId>(localSymbol.chr()), localSymbol.index());
+
+            gtsam::Vector6 mu = gtsam::Vector6::Zero();
+            gtsam::Matrix6 covariance = gtsam::Matrix6::Zero();
             for (size_t i = 0; i < 6; ++i) {
                 mu(i) = incoming.mu[i];
             }
@@ -257,16 +1091,132 @@ public:
             }
             gbp::Gaussian gaussian(localKey, mu, covariance, 1);
             gaussian.relax_factor() = incoming.relaxFactor;
-            beliefsByKey[localKey].emplace_back(incoming.sourceAgent, gaussian);
+            numCandidateForBpsam++;
+
+            gbp::Gaussian localBefore(localKey, gtsam::Vector6::Zero(), gtsam::Matrix6::Identity(), 1);
+            const bool hasLocalBefore = fetchAgentLocalBelief(incoming.sourceAgent, localKey, &localBefore);
+            const double receiverLocalBeforeTrace =
+                hasLocalBefore ? beliefTraceFromMatrix(localBefore.Sigma()) : std::numeric_limits<double>::quiet_NaN();
+            const double hellingerLocalIncoming =
+                hasLocalBefore ? safeHellingerDistance(localBefore.mu(), localBefore.Sigma(), mu, covariance)
+                               : std::numeric_limits<double>::quiet_NaN();
+            const double mahalLocalIncoming =
+                hasLocalBefore ? safeMahalanobisDistance(localBefore.mu(), localBefore.Sigma(), mu)
+                               : std::numeric_limits<double>::quiet_NaN();
+            const double dmuLocalIncoming =
+                hasLocalBefore ? safeDeltaNorm(localBefore.mu(), mu)
+                               : std::numeric_limits<double>::quiet_NaN();
+
+            std::map<Key, std::vector<std::pair<cbs::AgentId, gbp::Gaussian>>> singleBelief;
+            singleBelief[localKey].emplace_back(incoming.sourceAgent, gaussian);
+            const int rejected = bpsam->addBeliefs(std::move(singleBelief));
+            const bool added = rejected == 0;
+            if (added) {
+                numAddedToBpsam++;
+            } else {
+                numRejectedByBpsam++;
+            }
+
+            gbp::Gaussian localAfter(localKey, gtsam::Vector6::Zero(), gtsam::Matrix6::Identity(), 1);
+            const bool hasLocalAfter = fetchAgentLocalBelief(incoming.sourceAgent, localKey, &localAfter);
+            const double receiverMergedTrace =
+                hasLocalAfter ? beliefTraceFromMatrix(localAfter.Sigma()) : std::numeric_limits<double>::quiet_NaN();
+            const double hellingerLocalMerged =
+                (hasLocalBefore && hasLocalAfter)
+                    ? safeHellingerDistance(localBefore.mu(), localBefore.Sigma(),
+                                            localAfter.mu(), localAfter.Sigma())
+                    : std::numeric_limits<double>::quiet_NaN();
+            const double dmuLocalMerged =
+                (hasLocalBefore && hasLocalAfter)
+                    ? safeDeltaNorm(localBefore.mu(), localAfter.mu())
+                    : std::numeric_limits<double>::quiet_NaN();
+            const std::string status =
+                added ? "bpsam_added"
+                      : ((!hasLocalBefore && cbsBeliefRejectFirstMessage)
+                             ? "bpsam_rejected_first_message"
+                             : "bpsam_rejected");
+
+            const double receiverPosteriorPreTrace = receiverLocalBeforeTrace;
+            const double receiverPosteriorPostTrace = receiverMergedTrace;
+            const double receiverLocalRawTrace = receiverLocalBeforeTrace;
+            const double receiverLocalAnchoredTrace = receiverMergedTrace;
+            const double step =
+                hasLocalAfter ? localAfter.contractionStepSize() : std::numeric_limits<double>::quiet_NaN();
+            const double dxycurr =
+                hasLocalAfter ? localAfter.dxycurr() : std::numeric_limits<double>::quiet_NaN();
+            const double dxyTarget =
+                hasLocalAfter ? localAfter.dxy() : std::numeric_limits<double>::quiet_NaN();
+
+            logMergeRow(incoming,
+                        senderKeyToken,
+                        receiverPoseKeyToken,
+                        receiverLocalBeforeTrace,
+                        receiverMergedTrace,
+                        receiverPosteriorPreTrace,
+                        receiverPosteriorPostTrace,
+                        hellingerLocalIncoming,
+                        hellingerLocalMerged,
+                        mahalLocalIncoming,
+                        status,
+                        "gbp_agent_local_prior",
+                        receiverLocalRawTrace,
+                        receiverLocalAnchoredTrace,
+                        dmuLocalIncoming,
+                        dmuLocalMerged,
+                        step,
+                        dxycurr,
+                        dxyTarget);
         }
 
-        if (!beliefsByKey.empty()) {
-            bpsam->addBeliefs(std::move(beliefsByKey));
+        cbsBeliefsIncomingMatchedByIndexTotal.fetch_add(numMatchedByIndex, std::memory_order_relaxed);
+        cbsBeliefsIncomingMatchedByTimestampTotal.fetch_add(numMatchedByTimestamp, std::memory_order_relaxed);
+        cbsBeliefsIncomingDroppedNoLocalTimestampTotal.fetch_add(numDroppedNoLocalTimestamp, std::memory_order_relaxed);
+        cbsBeliefsIncomingDroppedInvalidStampTotal.fetch_add(numDroppedInvalidStamp, std::memory_order_relaxed);
+        cbsBeliefsIncomingDroppedTimestampMismatchTotal.fetch_add(numDroppedTimestampMismatch, std::memory_order_relaxed);
+        cbsBeliefsIncomingAddedToBpsamTotal.fetch_add(numAddedToBpsam, std::memory_order_relaxed);
+        cbsBeliefsIncomingRejectedByBpsamTotal.fetch_add(numRejectedByBpsam, std::memory_order_relaxed);
+
+        const size_t numDroppedTotal =
+            numDroppedNoLocalTimestamp + numDroppedInvalidStamp + numDroppedTimestampMismatch;
+        if (numDroppedTotal > 0) {
+            ROS_WARN_STREAM_THROTTLE(
+                1.0,
+                "Dropped " << numDroppedTotal
+                           << " incoming beliefs (no_local_ts=" << numDroppedNoLocalTimestamp
+                           << ", invalid_stamp=" << numDroppedInvalidStamp
+                           << ", timestamp_mismatch=" << numDroppedTimestampMismatch << ").");
         }
 
-        if (numDropped > 0) {
-            ROS_WARN_STREAM_THROTTLE(1.0, "Dropped " << numDropped << " incoming beliefs due to timestamp mismatch.");
-        }
+        ROS_INFO_STREAM_THROTTLE(
+            1.0,
+            "LiORF CBS incoming flow: dequeued=" << pendingCount
+            << " matched(index=" << numMatchedByIndex
+            << ",timestamp=" << numMatchedByTimestamp << ")"
+            << " dropped(no_local_ts=" << numDroppedNoLocalTimestamp
+            << ",invalid_stamp=" << numDroppedInvalidStamp
+            << ",timestamp_mismatch=" << numDroppedTimestampMismatch << ")"
+            << " bpsam(candidate=" << numCandidateForBpsam
+            << ",added=" << numAddedToBpsam
+            << ",rejected=" << numRejectedByBpsam << ")"
+            << " totals(received="
+            << cbsBeliefsIncomingReceivedTotal.load(std::memory_order_relaxed)
+            << ",dequeued="
+            << cbsBeliefsIncomingDequeuedTotal.load(std::memory_order_relaxed)
+            << ",matched_index="
+            << cbsBeliefsIncomingMatchedByIndexTotal.load(std::memory_order_relaxed)
+            << ",matched_timestamp="
+            << cbsBeliefsIncomingMatchedByTimestampTotal.load(std::memory_order_relaxed)
+            << ",dropped_no_local_ts="
+            << cbsBeliefsIncomingDroppedNoLocalTimestampTotal.load(std::memory_order_relaxed)
+            << ",dropped_invalid_stamp="
+            << cbsBeliefsIncomingDroppedInvalidStampTotal.load(std::memory_order_relaxed)
+            << ",dropped_timestamp_mismatch="
+            << cbsBeliefsIncomingDroppedTimestampMismatchTotal.load(std::memory_order_relaxed)
+            << ",bpsam_added="
+            << cbsBeliefsIncomingAddedToBpsamTotal.load(std::memory_order_relaxed)
+            << ",bpsam_rejected="
+            << cbsBeliefsIncomingRejectedByBpsamTotal.load(std::memory_order_relaxed)
+            << ")");
     }
 
     void publishOutgoingBeliefs()
@@ -302,6 +1252,15 @@ public:
         }
 
         pubPoseBeliefsOut.publish(msg);
+        cbsBeliefsOutgoingPublishedTotal.fetch_add(msg.beliefs.size(), std::memory_order_relaxed);
+        ROS_INFO_STREAM_THROTTLE(
+            1.0,
+            "LiORF CBS outgoing flow: published=" << msg.beliefs.size()
+            << " totals(prepared="
+            << cbsBeliefsOutgoingPreparedTotal.load(std::memory_order_relaxed)
+            << ",published="
+            << cbsBeliefsOutgoingPublishedTotal.load(std::memory_order_relaxed)
+            << ")");
     }
 
     void refreshOutgoingBeliefs()
@@ -319,6 +1278,7 @@ public:
 
         bpsam->setMarginalizationGraph(cbs::BPSAM::MarginalizationType::LOCAL);
         auto outgoing = bpsam->getBeliefs(requestKeys, true);
+        const auto [selectedSourcePath, selectedAnchorMode] = covModeSemantics(cbsL2KOutgoingCovMode);
 
         std::vector<StampedBelief> outgoingStamped;
         outgoingStamped.reserve(outgoing.size());
@@ -345,11 +1305,66 @@ public:
                 for (size_t i = 0; i < stampedBelief.mu.size(); ++i) {
                     stampedBelief.mu[i] = belief.mu()(i);
                 }
-                for (size_t r = 0; r < 6; ++r) {
-                    for (size_t c = 0; c < 6; ++c) {
-                        stampedBelief.covariance[r * 6 + c] = belief.Sigma()(r, c);
+
+                gtsam::Matrix6 outgoingCovariance = sanitizeBeliefCovariance(belief.Sigma());
+                std::string outgoingCovStatus = "ok_as_is_local_anchored";
+                if (cbsL2KOutgoingCovMode != L2KOutgoingCovMode::kAsIsLocalAnchored) {
+                    gtsam::Matrix6 modeCovariance;
+                    std::string modeStatus;
+                    if (computeL2KOutgoingCovarianceForMode(key,
+                                                            belief,
+                                                            cbsL2KOutgoingCovMode,
+                                                            &modeCovariance,
+                                                            &modeStatus)) {
+                        outgoingCovariance = modeCovariance;
+                        outgoingCovStatus = modeStatus;
+                    } else {
+                        outgoingCovStatus = "fallback_as_is_" + modeStatus;
                     }
                 }
+                for (size_t r = 0; r < 6; ++r) {
+                    for (size_t c = 0; c < 6; ++c) {
+                        stampedBelief.covariance[r * 6 + c] = outgoingCovariance(r, c);
+                    }
+                }
+                if (cbsL2KCovAuditEnable &&
+                    cbsL2KCovAuditLoggedPoseIndices.size() < cbsL2KCovAuditMaxSamples &&
+                    cbsL2KCovAuditLoggedPoseIndices.find(localIndex) == cbsL2KCovAuditLoggedPoseIndices.end()) {
+                    const L2KOutgoingCovAuditResult auditResult =
+                        computeL2KOutgoingCovAudit(key, belief);
+                    const uint64_t stampNs = static_cast<uint64_t>(std::llround(stampedBelief.stampSec * 1e9));
+                    const size_t sampleIdx =
+                        cbsL2KCovAuditSampleCounter.fetch_add(1u, std::memory_order_relaxed);
+                    ROS_INFO_STREAM(
+                        "CBS_L2K_OUT_COV_AUDIT,"
+                        << sampleIdx << ","
+                        << formatPoseKeyToken(selfAgentId, localIndex) << ","
+                        << stampNs << ","
+                        << auditResult.traceAsIs << ","
+                        << auditResult.traceInitPriorReplaced << ","
+                        << auditResult.traceQueryAnchorOnly << ","
+                        << sanitizeCsvToken(auditResult.modeBStatus) << ","
+                        << sanitizeCsvToken(auditResult.modeCStatus) << ","
+                        << cbsL2KCovAuditReplacementTransVariance << ","
+                        << cbsL2KCovAuditQueryAnchorVariance);
+                    double covLogdet = std::numeric_limits<double>::quiet_NaN();
+                    double covLambdaMin = std::numeric_limits<double>::quiet_NaN();
+                    computeCovarianceLogdetAndLambdaMin(outgoingCovariance, &covLogdet, &covLambdaMin);
+                    ROS_INFO_STREAM(
+                        "CBS_L2K_OUT_COV_APPLIED,"
+                        << sampleIdx << ","
+                        << formatPoseKeyToken(selfAgentId, localIndex) << ","
+                        << stampNs << ","
+                        << sanitizeCsvToken(cbsL2KOutgoingCovModeLabel) << ","
+                        << sanitizeCsvToken(selectedSourcePath) << ","
+                        << sanitizeCsvToken(selectedAnchorMode) << ","
+                        << sanitizeCsvToken(outgoingCovStatus) << ","
+                        << outgoingCovariance.trace() << ","
+                        << covLogdet << ","
+                        << covLambdaMin);
+                    cbsL2KCovAuditLoggedPoseIndices.insert(localIndex);
+                }
+                convertOutgoingLidarBeliefToExchangeFrame(&stampedBelief);
                 outgoingStamped.push_back(stampedBelief);
             }
         }
@@ -358,6 +1373,7 @@ public:
             std::lock_guard<std::mutex> lock(mtxBeliefExchange);
             outgoingStampedBeliefs = std::move(outgoingStamped);
         }
+        cbsBeliefsOutgoingPreparedTotal.fetch_add(outgoingStampedBeliefs.size(), std::memory_order_relaxed);
         publishOutgoingBeliefs();
     }
 
@@ -467,10 +1483,47 @@ public:
         nh.param<double>("liorf/cbsBeliefSimilarityThreshold", cbsBeliefSimilarityThreshold, 0.01);
         nh.param<int>("liorf/cbsBeliefExchangeWindowSize", cbsBeliefWindow, 30);
         nh.param<double>("liorf/cbsBeliefTimestampToleranceSec", beliefTimestampToleranceSec, 0.05);
+        nh.param<bool>("liorf/cbsBeliefRejectFirstMessage", cbsBeliefRejectFirstMessage, true);
         nh.param<bool>("liorf/cbsBeliefBridgeEnable", cbsBeliefBridgeEnable, true);
         nh.param<std::string>("liorf/cbsBeliefInTopic", cbsBeliefInTopic, "liorf/cbs/belief_in");
         nh.param<std::string>("liorf/cbsBeliefOutTopic", cbsBeliefOutTopic, "liorf/cbs/belief_out");
+        nh.param<bool>("liorf/cbsExternalExchangeInBodyFrame", cbsExternalExchangeInBodyFrame, true);
+        nh.param<bool>("liorf/cbsL2KCovAuditEnable", cbsL2KCovAuditEnable, false);
+        int cbsL2KCovAuditMaxSamplesInt = 20;
+        nh.param<int>("liorf/cbsL2KCovAuditMaxSamples", cbsL2KCovAuditMaxSamplesInt, 20);
+        nh.param<double>("liorf/cbsL2KCovAuditReplacementTransVariance",
+                         cbsL2KCovAuditReplacementTransVariance,
+                         1.0);
+        nh.param<double>("liorf/cbsL2KCovAuditQueryAnchorVariance",
+                         cbsL2KCovAuditQueryAnchorVariance,
+                         1e6);
+        std::string cbsL2KOutgoingCovModeToken = "A_as_is_local_anchored";
+        nh.param<std::string>("liorf/cbsL2KOutgoingCovarianceMode",
+                              cbsL2KOutgoingCovModeToken,
+                              "A_as_is_local_anchored");
+        cbsL2KOutgoingCovMode = parseCovModeToken(cbsL2KOutgoingCovModeToken);
+        cbsL2KOutgoingCovModeLabel = covModeToLabel(cbsL2KOutgoingCovMode);
+        const auto [covSourcePath, covAnchorMode] = covModeSemantics(cbsL2KOutgoingCovMode);
+        cbsL2KOutgoingCovSourcePath = covSourcePath;
+        cbsL2KOutgoingCovAnchorMode = covAnchorMode;
+        cbsL2KCovAuditMaxSamples = static_cast<size_t>(std::max(1, cbsL2KCovAuditMaxSamplesInt));
         beliefExchangeWindowSize = std::max(1, cbsBeliefWindow);
+
+        if (cbsExternalExchangeInBodyFrame) {
+            cbsLidarPoseBody = gtsam::Pose3(gtsam::Rot3(extRot), gtsam::Point3(extTrans.x(), extTrans.y(), extTrans.z()));
+            cbsBodyPoseLidar = cbsLidarPoseBody.inverse();
+            cbsAdjointLidarPoseBody = cbsLidarPoseBody.AdjointMap();
+            cbsAdjointBodyPoseLidar = cbsBodyPoseLidar.AdjointMap();
+            ROS_INFO_STREAM("LiORF CBS exchange semantic: world->body (imu). "
+                            << "Using lidar->body extrinsic from config. t_l_b=["
+                            << extTrans.x() << ", " << extTrans.y() << ", " << extTrans.z() << "]");
+        } else {
+            cbsLidarPoseBody = gtsam::Pose3();
+            cbsBodyPoseLidar = gtsam::Pose3();
+            cbsAdjointLidarPoseBody = gtsam::Matrix6::Identity();
+            cbsAdjointBodyPoseLidar = gtsam::Matrix6::Identity();
+            ROS_INFO("LiORF CBS exchange semantic: world->lidar (legacy pass-through).");
+        }
 
         cbs::BPSAM::Params parameters;
         parameters.robot_id = selfAgentId;
@@ -480,10 +1533,22 @@ public:
         parameters.sam_params_.optimizationParams = gaussNewtonParams;
         parameters.enable_gkcm = cbsEnableGkcm;
         parameters.enable_belief_dcs = cbsEnableBeliefDcs;
+        parameters.reject_first_message = cbsBeliefRejectFirstMessage;
         parameters.belief_similarity_threshold = cbsBeliefSimilarityThreshold;
         bpsam.reset(new cbs::BPSAM(parameters));
 
         ROS_INFO_STREAM("LiORF BPSAM backend agent id: '" << static_cast<char>(selfAgentId) << "'");
+        ROS_INFO_STREAM("LiORF BPSAM reject-first-message gate: "
+                        << (cbsBeliefRejectFirstMessage ? "ON" : "OFF"));
+        ROS_INFO_STREAM("LiORF L2K covariance decomposition audit: "
+                        << (cbsL2KCovAuditEnable ? "ENABLED" : "DISABLED")
+                        << " max_samples=" << cbsL2KCovAuditMaxSamples
+                        << " replacement_trans_variance=" << cbsL2KCovAuditReplacementTransVariance
+                        << " query_anchor_variance=" << cbsL2KCovAuditQueryAnchorVariance);
+        ROS_INFO_STREAM("LiORF L2K outgoing covariance mode: "
+                        << cbsL2KOutgoingCovModeLabel
+                        << " source_path=" << cbsL2KOutgoingCovSourcePath
+                        << " anchor_mode=" << cbsL2KOutgoingCovAnchorMode);
 
         pubKeyPoses                 = nh.advertise<sensor_msgs::PointCloud2>("liorf/mapping/trajectory", 1);
         pubLaserCloudSurround       = nh.advertise<sensor_msgs::PointCloud2>("liorf/mapping/map_global", 1);
@@ -531,6 +1596,19 @@ public:
         localPoseTimestampsSec.clear();
         incomingStampedBeliefs.clear();
         outgoingStampedBeliefs.clear();
+        cbsBeliefsIncomingReceivedTotal.store(0u, std::memory_order_relaxed);
+        cbsBeliefsIncomingDequeuedTotal.store(0u, std::memory_order_relaxed);
+        cbsBeliefsIncomingMatchedByIndexTotal.store(0u, std::memory_order_relaxed);
+        cbsBeliefsIncomingMatchedByTimestampTotal.store(0u, std::memory_order_relaxed);
+        cbsBeliefsIncomingDroppedNoLocalTimestampTotal.store(0u, std::memory_order_relaxed);
+        cbsBeliefsIncomingDroppedInvalidStampTotal.store(0u, std::memory_order_relaxed);
+        cbsBeliefsIncomingDroppedTimestampMismatchTotal.store(0u, std::memory_order_relaxed);
+        cbsBeliefsIncomingAddedToBpsamTotal.store(0u, std::memory_order_relaxed);
+        cbsBeliefsIncomingRejectedByBpsamTotal.store(0u, std::memory_order_relaxed);
+        cbsBeliefsOutgoingPreparedTotal.store(0u, std::memory_order_relaxed);
+        cbsBeliefsOutgoingPublishedTotal.store(0u, std::memory_order_relaxed);
+        cbsL2KCovAuditSampleCounter.store(0u, std::memory_order_relaxed);
+        cbsL2KCovAuditLoggedPoseIndices.clear();
 
         kdtreeSurroundingKeyPoses.reset(new pcl::KdTreeFLANN<PointType>());
         kdtreeHistoryKeyPoses.reset(new pcl::KdTreeFLANN<PointType>());

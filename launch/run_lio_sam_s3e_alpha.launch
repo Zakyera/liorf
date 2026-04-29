@@ -1,10 +1,34 @@
 <launch>
   <arg name="project" default="liorf"/>
   <arg name="config_file" default="$(find liorf)/config/s3e_alpha.yaml"/>
+  <arg name="cbs_belief_timestamp_tolerance_sec" default="0.12"/>
+  <arg name="cbs_belief_reject_first_message" default="true"/>
+  <arg name="cbs_belief_exchange_window_size" default="30"/>
+  <arg name="cbs_l2k_cov_audit_enable" default="false"/>
+  <arg name="cbs_l2k_cov_audit_max_samples" default="20"/>
+  <arg name="cbs_l2k_cov_audit_replacement_trans_variance" default="1.0"/>
+  <arg name="cbs_l2k_cov_audit_query_anchor_variance" default="1000000.0"/>
+  <arg name="cbs_l2k_outgoing_covariance_mode" default="A_as_is_local_anchored"/>
   <arg name="use_rviz" default="false"/>
   <arg name="publish_static_tf" default="true"/>
 
   <rosparam file="$(arg config_file)" command="load" />
+  <param name="/liorf/cbsBeliefTimestampToleranceSec"
+         value="$(arg cbs_belief_timestamp_tolerance_sec)"/>
+  <param name="/liorf/cbsBeliefRejectFirstMessage"
+         value="$(arg cbs_belief_reject_first_message)"/>
+  <param name="/liorf/cbsBeliefExchangeWindowSize"
+         value="$(arg cbs_belief_exchange_window_size)"/>
+  <param name="/liorf/cbsL2KCovAuditEnable"
+         value="$(arg cbs_l2k_cov_audit_enable)"/>
+  <param name="/liorf/cbsL2KCovAuditMaxSamples"
+         value="$(arg cbs_l2k_cov_audit_max_samples)"/>
+  <param name="/liorf/cbsL2KCovAuditReplacementTransVariance"
+         value="$(arg cbs_l2k_cov_audit_replacement_trans_variance)"/>
+  <param name="/liorf/cbsL2KCovAuditQueryAnchorVariance"
+         value="$(arg cbs_l2k_cov_audit_query_anchor_variance)"/>
+  <param name="/liorf/cbsL2KOutgoingCovarianceMode"
+         value="$(arg cbs_l2k_outgoing_covariance_mode)"/>
 
   <include file="$(find liorf)/launch/include/module_loam.launch">
     <arg name="project" value="$(arg project)"/>

@@ -51,6 +51,8 @@ liorf:
   surroundingKeyframeMapLeafSize: 0.5
   loopClosureICPSurfLeafSize: 0.5
   mappingProcessInterval: 0.0
+  surroundingkeyframeAddingDistThreshold: 0.3   # meters, keyframe insertion gate
+  surroundingkeyframeAddingAngleThreshold: 0.1  # radians, keyframe insertion gate
   loopClosureEnableFlag: false
 
   # CBS/BPSAM bridge settings
@@ -59,7 +61,8 @@ liorf:
   cbsEnableBeliefDcs: false
   cbsBeliefSimilarityThreshold: 0.01
   cbsBeliefBridgeEnable: true
+  cbsExternalExchangeInBodyFrame: true
   cbsBeliefExchangeWindowSize: 30
-  cbsBeliefTimestampToleranceSec: 0.05
+  cbsBeliefTimestampToleranceSec: 0.12
   cbsBeliefInTopic: "/kimera/cbs/belief_out"
   cbsBeliefOutTopic: "/kimera/cbs/belief_in"
