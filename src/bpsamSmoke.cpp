@@ -21,7 +21,6 @@ cbs::BPSAM::Ptr makeSam(cbs::AgentId id) {
   params.sam_params_.relinearizeSkip = 1;
   ISAM2GaussNewtonParams gn_params;
   params.sam_params_.optimizationParams = gn_params;
-  params.enable_gkcm = false;
   params.enable_belief_dcs = false;
   params.belief_similarity_threshold = 0.0;
   return std::make_shared<cbs::BPSAM>(params);

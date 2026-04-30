@@ -25,6 +25,8 @@
 #include <cbs/utils/gtsam_compat.h>
 #include <algorithm>
 #include <cctype>
+#include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <functional>
 #include <fstream>
@@ -101,6 +103,26 @@ std::string defaultRerunHost()
     }
 
     return "rerun+http://host.docker.internal:9876/proxy";
+}
+
+double elapsedMs(const std::chrono::steady_clock::time_point& start)
+{
+    return std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - start).count();
+}
+
+void atomicAddRelaxed(std::atomic<double>* target, double value)
+{
+    if (!target || !std::isfinite(value) || value < 0.0) {
+        return;
+    }
+
+    double current = target->load(std::memory_order_relaxed);
+    while (!target->compare_exchange_weak(current,
+                                          current + value,
+                                          std::memory_order_relaxed,
+                                          std::memory_order_relaxed)) {
+    }
 }
 
 template <typename PointCloudT>
@@ -205,6 +227,12 @@ public:
     std::atomic<size_t> cbsBeliefsIncomingRejectedByBpsamTotal{0u};
     std::atomic<size_t> cbsBeliefsOutgoingPreparedTotal{0u};
     std::atomic<size_t> cbsBeliefsOutgoingPublishedTotal{0u};
+    std::atomic<size_t> cbsBeliefsIncomingReceivedPerRerunFrame{0u};
+    std::atomic<size_t> cbsBeliefsIncomingAddedToBpsamPerRerunFrame{0u};
+    std::atomic<size_t> cbsBeliefsOutgoingPublishedPerRerunFrame{0u};
+    std::atomic<double> bpsamOptimizationTimeMsPerRerunFrame{0.0};
+    std::atomic<double> cbsBeliefGenerationTimeMsPerRerunFrame{0.0};
+    std::atomic<size_t> cbsMarginalizationGraphFactorCountPerRerunFrame{0u};
     std::atomic<size_t> cbsMergeK2LSampleCounter{0u};
     enum class L2KOutgoingCovMode {
         kAsIsLocalAnchored = 0,
@@ -1035,6 +1063,7 @@ public:
 
             enqueueIncomingBelief(belief);
             cbsBeliefsIncomingReceivedTotal.fetch_add(1u, std::memory_order_relaxed);
+            cbsBeliefsIncomingReceivedPerRerunFrame.fetch_add(1u, std::memory_order_relaxed);
         }
     }
 
@@ -1285,6 +1314,7 @@ public:
         cbsBeliefsIncomingDroppedInvalidStampTotal.fetch_add(numDroppedInvalidStamp, std::memory_order_relaxed);
         cbsBeliefsIncomingDroppedTimestampMismatchTotal.fetch_add(numDroppedTimestampMismatch, std::memory_order_relaxed);
         cbsBeliefsIncomingAddedToBpsamTotal.fetch_add(numAddedToBpsam, std::memory_order_relaxed);
+        cbsBeliefsIncomingAddedToBpsamPerRerunFrame.fetch_add(numAddedToBpsam, std::memory_order_relaxed);
         cbsBeliefsIncomingRejectedByBpsamTotal.fetch_add(numRejectedByBpsam, std::memory_order_relaxed);
 
         const size_t numDroppedTotal =
@@ -1364,6 +1394,7 @@ public:
 
         pubPoseBeliefsOut.publish(msg);
         cbsBeliefsOutgoingPublishedTotal.fetch_add(msg.beliefs.size(), std::memory_order_relaxed);
+        cbsBeliefsOutgoingPublishedPerRerunFrame.fetch_add(msg.beliefs.size(), std::memory_order_relaxed);
         ROS_INFO_STREAM_THROTTLE(
             1.0,
             "LiORF CBS outgoing flow: published=" << msg.beliefs.size()
@@ -1388,7 +1419,13 @@ public:
         }
 
         bpsam->setMarginalizationGraph(cbs::BPSAM::MarginalizationType::LOCAL);
+        cbsMarginalizationGraphFactorCountPerRerunFrame.store(
+            bpsam->marginalizationGraphFactorCount(),
+            std::memory_order_relaxed);
+        const auto cbsGetBeliefsStart = std::chrono::steady_clock::now();
         auto outgoing = bpsam->getBeliefs(requestKeys, true);
+        atomicAddRelaxed(&cbsBeliefGenerationTimeMsPerRerunFrame,
+                         elapsedMs(cbsGetBeliefsStart));
         const auto [selectedSourcePath, selectedAnchorMode] = covModeSemantics(cbsL2KOutgoingCovMode);
 
         std::vector<StampedBelief> outgoingStamped;
@@ -1590,11 +1627,9 @@ public:
         nh.param<std::string>("liorf/cbsAgentId", cbsAgentIdStr, robot_id);
         selfAgentId = resolveAgentId(cbsAgentIdStr);
 
-        bool cbsEnableGkcm = true;
         bool cbsEnableBeliefDcs = false;
         double cbsBeliefSimilarityThreshold = 0.01;
         int cbsBeliefWindow = 30;
-        nh.param<bool>("liorf/cbsEnableGkcm", cbsEnableGkcm, true);
         nh.param<bool>("liorf/cbsEnableBeliefDcs", cbsEnableBeliefDcs, false);
         nh.param<double>("liorf/cbsBeliefSimilarityThreshold", cbsBeliefSimilarityThreshold, 0.01);
         nh.param<int>("liorf/cbsBeliefExchangeWindowSize", cbsBeliefWindow, 30);
@@ -1684,7 +1719,6 @@ public:
         parameters.sam_params_.relinearizeSkip = 1;
         ISAM2GaussNewtonParams gaussNewtonParams;
         parameters.sam_params_.optimizationParams = gaussNewtonParams;
-        parameters.enable_gkcm = cbsEnableGkcm;
         parameters.enable_belief_dcs = cbsEnableBeliefDcs;
         parameters.reject_first_message = cbsBeliefRejectFirstMessage;
         parameters.belief_similarity_threshold = cbsBeliefSimilarityThreshold;
@@ -1762,6 +1796,12 @@ public:
         cbsBeliefsIncomingRejectedByBpsamTotal.store(0u, std::memory_order_relaxed);
         cbsBeliefsOutgoingPreparedTotal.store(0u, std::memory_order_relaxed);
         cbsBeliefsOutgoingPublishedTotal.store(0u, std::memory_order_relaxed);
+        cbsBeliefsIncomingReceivedPerRerunFrame.store(0u, std::memory_order_relaxed);
+        cbsBeliefsIncomingAddedToBpsamPerRerunFrame.store(0u, std::memory_order_relaxed);
+        cbsBeliefsOutgoingPublishedPerRerunFrame.store(0u, std::memory_order_relaxed);
+        bpsamOptimizationTimeMsPerRerunFrame.store(0.0, std::memory_order_relaxed);
+        cbsBeliefGenerationTimeMsPerRerunFrame.store(0.0, std::memory_order_relaxed);
+        cbsMarginalizationGraphFactorCountPerRerunFrame.store(0u, std::memory_order_relaxed);
         cbsL2KCovAuditSampleCounter.store(0u, std::memory_order_relaxed);
         cbsL2KCovAuditLoggedPoseIndices.clear();
 
@@ -1945,6 +1985,26 @@ public:
         rerunVisualizer->drawScalar(
             "liorf/current_pose/liorf_uncertainty_frobenius_norm",
             currentPoseCovariance.norm());
+        rerunVisualizer->drawScalar(
+            "liorf/timing/optimization_ms",
+            bpsamOptimizationTimeMsPerRerunFrame.exchange(0.0, std::memory_order_relaxed));
+        if (cbsBeliefBridgeEnable) {
+            rerunVisualizer->drawScalar(
+                "liorf/cbs/beliefs/published_per_update",
+                cbsBeliefsOutgoingPublishedPerRerunFrame.exchange(0u, std::memory_order_relaxed));
+            rerunVisualizer->drawScalar(
+                "liorf/cbs/beliefs/received_per_update",
+                cbsBeliefsIncomingReceivedPerRerunFrame.exchange(0u, std::memory_order_relaxed));
+            rerunVisualizer->drawScalar(
+                "liorf/cbs/beliefs/added_to_factor_graph_per_update",
+                cbsBeliefsIncomingAddedToBpsamPerRerunFrame.exchange(0u, std::memory_order_relaxed));
+            rerunVisualizer->drawScalar(
+                "liorf/cbs/timing/belief_generation_ms",
+                cbsBeliefGenerationTimeMsPerRerunFrame.exchange(0.0, std::memory_order_relaxed));
+            rerunVisualizer->drawScalar(
+                "liorf/cbs/marginalization_graph/factor_count",
+                cbsMarginalizationGraphFactorCountPerRerunFrame.exchange(0u, std::memory_order_relaxed));
+        }
 
         const auto trajectory = toRerunPoints(*cloudKeyPoses3D, 5000u);
         if (!trajectory.empty()) {
@@ -3188,6 +3248,7 @@ public:
         // gtSAMgraph.print("GTSAM Graph:\n");
 
         // update BPSAM backend
+        const auto bpsamOptimizationStart = std::chrono::steady_clock::now();
         bpsam->update(gtSAMgraph, initialEstimate);
         bpsam->update();
 
@@ -3199,6 +3260,8 @@ public:
             bpsam->update();
             bpsam->update();
         }
+        atomicAddRelaxed(&bpsamOptimizationTimeMsPerRerunFrame,
+                         elapsedMs(bpsamOptimizationStart));
 
         gtSAMgraph.resize(0);
         initialEstimate.clear();
