@@ -10,6 +10,11 @@
   <arg name="cbs_l2k_cov_audit_query_anchor_variance" default="1000000.0"/>
   <arg name="cbs_l2k_outgoing_covariance_mode" default="A_as_is_local_anchored"/>
   <arg name="use_rviz" default="false"/>
+  <arg name="rerun_visualizer_enable" default="true"/>
+  <arg name="rerun_recording_id" default=""/>
+  <arg name="rerun_host" default="rerun+http://172.18.0.1:9876/proxy"/>
+  <arg name="rerun_local_map_leaf_size" default="1.0"/>
+  <arg name="rerun_local_map_max_points" default="10000"/>
   <arg name="publish_static_tf" default="true"/>
 
   <rosparam file="$(arg config_file)" command="load" />
@@ -29,6 +34,14 @@
          value="$(arg cbs_l2k_cov_audit_query_anchor_variance)"/>
   <param name="/liorf/cbsL2KOutgoingCovarianceMode"
          value="$(arg cbs_l2k_outgoing_covariance_mode)"/>
+  <param name="/liorf/rerunVisualizerEnable"
+         value="$(arg rerun_visualizer_enable)"/>
+  <param name="/liorf/rerunRecordingId" value="$(arg rerun_recording_id)"/>
+  <param name="/liorf/rerunHost" value="$(arg rerun_host)"/>
+  <param name="/liorf/rerunLocalMapLeafSize"
+         value="$(arg rerun_local_map_leaf_size)"/>
+  <param name="/liorf/rerunLocalMapMaxPoints"
+         value="$(arg rerun_local_map_max_points)"/>
 
   <include file="$(find liorf)/launch/include/module_loam.launch">
     <arg name="project" value="$(arg project)"/>

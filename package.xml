@@ -46,5 +46,7 @@
   <run_depend>GTSAM</run_depend>
   <build_depend>cbs</build_depend>
   <run_depend>cbs</run_depend>
+  <build_depend>aria_viz</build_depend>
+  <run_depend>aria_viz</run_depend>
 
 </package>

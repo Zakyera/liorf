@@ -26,12 +26,14 @@ find_package(OpenMP REQUIRED)
 find_package(PCL REQUIRED QUIET)
 find_package(OpenCV REQUIRED QUIET)
 find_package(GTSAM REQUIRED QUIET)
+find_package(Eigen3 REQUIRED)
 # cbsConfig.cmake expects GTSAM_UNSTABLE; derive it from GTSAM_DIR when needed.
 if (NOT GTSAM_UNSTABLE_DIR AND DEFINED GTSAM_DIR)
   get_filename_component(_gtsam_cmake_parent "${GTSAM_DIR}/.." ABSOLUTE)
   set(GTSAM_UNSTABLE_DIR "${_gtsam_cmake_parent}/GTSAM_UNSTABLE")
 endif()
 find_package(cbs REQUIRED QUIET)
+find_package(aria_viz REQUIRED)
 find_package(Boost REQUIRED COMPONENTS timer)
 
 set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "/usr/share/cmake/geographiclib/")
@@ -107,7 +109,7 @@ target_link_libraries(${PROJECT_NAME}_imageProjection ${catkin_LIBRARIES} ${PCL_
 add_executable(${PROJECT_NAME}_mapOptmization src/mapOptmization.cpp ${common_lib} include/Scancontext.cpp)
 add_dependencies(${PROJECT_NAME}_mapOptmization ${catkin_EXPORTED_TARGETS} ${PROJECT_NAME}_generate_messages_cpp)
 target_compile_options(${PROJECT_NAME}_mapOptmization PRIVATE ${OpenMP_CXX_FLAGS})
-target_link_libraries(${PROJECT_NAME}_mapOptmization Boost::timer ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${OpenCV_LIBRARIES} ${OpenMP_CXX_FLAGS} ${GeographicLib_LIBRARIES} gtsam cbs)
+target_link_libraries(${PROJECT_NAME}_mapOptmization Boost::timer ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${OpenCV_LIBRARIES} ${OpenMP_CXX_FLAGS} ${GeographicLib_LIBRARIES} gtsam cbs aria_viz)
 
 # IMU Preintegration
 add_executable(${PROJECT_NAME}_imuPreintegration src/imuPreintegration.cpp ${common_lib})

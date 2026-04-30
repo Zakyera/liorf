@@ -19,11 +19,15 @@
 #include <gtsam/inference/Symbol.h>
 
 #include <gtsam/nonlinear/ISAM2.h>
+#include <aria_viz/visualizer_rerun.h>
 #include <cbs/bpsam/bpsam.h>
 #include <cbs/key.h>
+#include <cbs/utils/gtsam_compat.h>
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 #include <functional>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <sstream>
@@ -42,6 +46,84 @@ using symbol_shorthand::X; // Pose3 (x,y,z,r,p,y)
 using symbol_shorthand::V; // Vel   (xdot,ydot,zdot)
 using symbol_shorthand::B; // Bias  (ax,ay,az,gx,gy,gz)
 using symbol_shorthand::G; // GPS pose
+
+namespace {
+std::string makeRerunRecordingId(const std::string& prefix)
+{
+    std::time_t now = std::time(nullptr);
+    std::tm local_time{};
+    localtime_r(&now, &local_time);
+
+    char buffer[32];
+    std::strftime(buffer, sizeof(buffer), "%Y%m%d_%H%M%S", &local_time);
+    return prefix + "_" + buffer;
+}
+
+std::string getDockerGatewayIp()
+{
+    std::ifstream route_file("/proc/net/route");
+    std::string line;
+    std::getline(route_file, line);
+    while (std::getline(route_file, line)) {
+        std::istringstream iss(line);
+        std::string iface;
+        std::string destination;
+        std::string gateway;
+        unsigned int flags = 0u;
+        if (!(iss >> iface >> destination >> gateway >> std::hex >> flags)) {
+            continue;
+        }
+        if (destination != "00000000" || gateway.size() != 8u) {
+            continue;
+        }
+
+        const unsigned long raw_gateway = std::stoul(gateway, nullptr, 16);
+        std::ostringstream ip;
+        ip << (raw_gateway & 0xfful) << "."
+           << ((raw_gateway >> 8u) & 0xfful) << "."
+           << ((raw_gateway >> 16u) & 0xfful) << "."
+           << ((raw_gateway >> 24u) & 0xfful);
+        return ip.str();
+    }
+    return "";
+}
+
+std::string defaultRerunHost()
+{
+    const char* env_host = std::getenv("CBSMS_RERUN_HOST");
+    if (env_host != nullptr && std::string(env_host).empty() == false) {
+        return env_host;
+    }
+
+    const std::string gateway_ip = getDockerGatewayIp();
+    if (!gateway_ip.empty()) {
+        return "rerun+http://" + gateway_ip + ":9876/proxy";
+    }
+
+    return "rerun+http://host.docker.internal:9876/proxy";
+}
+
+template <typename PointCloudT>
+std::vector<gtsam::Point3> toRerunPoints(const PointCloudT& cloud, size_t max_points)
+{
+    std::vector<gtsam::Point3> points;
+    if (cloud.points.empty() || max_points == 0u) {
+        return points;
+    }
+
+    const size_t stride = std::max<size_t>(
+        1u, (cloud.points.size() + max_points - 1u) / max_points);
+    points.reserve(std::min(cloud.points.size(), max_points));
+
+    for (size_t i = 0u; i < cloud.points.size(); i += stride) {
+        const auto& point = cloud.points[i];
+        if (std::isfinite(point.x) && std::isfinite(point.y) && std::isfinite(point.z)) {
+            points.emplace_back(point.x, point.y, point.z);
+        }
+    }
+    return points;
+}
+} // namespace
 
 /*
     * A point cloud type that has 6D pose info ([x,y,z,roll,pitch,yaw] intensity is time stamp)
@@ -144,6 +226,12 @@ public:
     gtsam::Pose3 cbsBodyPoseLidar = gtsam::Pose3();
     gtsam::Matrix6 cbsAdjointLidarPoseBody = gtsam::Matrix6::Identity();
     gtsam::Matrix6 cbsAdjointBodyPoseLidar = gtsam::Matrix6::Identity();
+    bool rerunVisualizerEnable = false;
+    std::string rerunRecordingId;
+    std::string rerunHost = "auto";
+    float rerunLocalMapLeafSize = 1.0f;
+    size_t rerunLocalMapMaxPoints = 10000u;
+    std::unique_ptr<aria::viz::VisualizerRerun> rerunVisualizer;
 
     enum class BeliefMatchFailureReason {
         kNone = 0,
@@ -576,13 +664,13 @@ public:
             }
             localGraph->push_back(factor);
             for (const auto key : factor->keys()) {
-                localValues->insert_or_assign(key, allValues.at(key));
+                cbs::insertOrAssign(*localValues, key, allValues.at(key));
             }
         }
 
-        localValues->insert_or_assign(queryPoseKey, allValues.at(queryPoseKey));
+        cbs::insertOrAssign(*localValues, queryPoseKey, allValues.at(queryPoseKey));
         if (allValues.exists(firstPoseKey)) {
-            localValues->insert_or_assign(firstPoseKey, allValues.at(firstPoseKey));
+            cbs::insertOrAssign(*localValues, firstPoseKey, allValues.at(firstPoseKey));
         }
         return !localGraph->empty();
     }
@@ -1509,6 +1597,40 @@ public:
         cbsL2KCovAuditMaxSamples = static_cast<size_t>(std::max(1, cbsL2KCovAuditMaxSamplesInt));
         beliefExchangeWindowSize = std::max(1, cbsBeliefWindow);
 
+        nh.param<bool>("liorf/rerunVisualizerEnable", rerunVisualizerEnable, false);
+        nh.param<std::string>("liorf/rerunRecordingId", rerunRecordingId, "");
+        nh.param<std::string>(
+            "liorf/rerunHost",
+            rerunHost,
+            "auto");
+        if (rerunHost.empty() || rerunHost == "auto") {
+            rerunHost = defaultRerunHost();
+        }
+        double rerunLocalMapLeafSizeParam = 1.0;
+        int rerunLocalMapMaxPointsParam = 10000;
+        nh.param<double>("liorf/rerunLocalMapLeafSize",
+                         rerunLocalMapLeafSizeParam,
+                         1.0);
+        nh.param<int>("liorf/rerunLocalMapMaxPoints",
+                      rerunLocalMapMaxPointsParam,
+                      10000);
+        rerunLocalMapLeafSize = static_cast<float>(
+            std::max(0.0, rerunLocalMapLeafSizeParam));
+        rerunLocalMapMaxPoints =
+            static_cast<size_t>(std::max(1, rerunLocalMapMaxPointsParam));
+        if (rerunRecordingId.empty()) {
+            ros::param::param<std::string>("/cbsms/rerun_recording_id", rerunRecordingId, "");
+        }
+        if (rerunRecordingId.empty()) {
+            rerunRecordingId = makeRerunRecordingId("liorf");
+        }
+        if (rerunVisualizerEnable) {
+            aria::viz::VisualizerRerun::Params rerunParams("cbsms", rerunRecordingId, rerunHost);
+            rerunVisualizer.reset(new aria::viz::VisualizerRerun(rerunParams));
+            ROS_INFO_STREAM("LiORF Rerun visualizer enabled. recording_id='"
+                            << rerunRecordingId << "', host='" << rerunHost << "'.");
+        }
+
         if (cbsExternalExchangeInBodyFrame) {
             cbsLidarPoseBody = gtsam::Pose3(gtsam::Rot3(extRot), gtsam::Point3(extTrans.x(), extTrans.y(), extTrans.z()));
             cbsBodyPoseLidar = cbsLidarPoseBody.inverse();
@@ -1766,7 +1888,60 @@ public:
         return thisPose6D;
     }
 
-    
+    void publishRerunFrame()
+    {
+        if (!rerunVisualizer || cloudKeyPoses3D->points.empty()) {
+            return;
+        }
+
+        PointTypePose thisPose6D = trans2PointTypePose(transformTobeMapped);
+        rerunVisualizer->setTimeNSec(timeLaserInfoStamp.toNSec());
+        rerunVisualizer->drawTf(
+            "liorf/lidar_link", pclPointTogtsamPose3(thisPose6D), 0.75f);
+
+        const auto trajectory = toRerunPoints(*cloudKeyPoses3D, 5000u);
+        if (!trajectory.empty()) {
+            rerunVisualizer->drawPoints(
+                "liorf/trajectory",
+                trajectory,
+                Eigen::Vector4f(255.f, 160.f, 0.f, 255.f),
+                3.f);
+        }
+
+        if (laserCloudSurfFromMapDS && !laserCloudSurfFromMapDS->empty()) {
+            pcl::PointCloud<PointType>::Ptr rerunLocalMap(new pcl::PointCloud<PointType>());
+            if (rerunLocalMapLeafSize > 0.f) {
+                pcl::VoxelGrid<PointType> rerunLocalMapFilter;
+                rerunLocalMapFilter.setLeafSize(rerunLocalMapLeafSize,
+                                                rerunLocalMapLeafSize,
+                                                rerunLocalMapLeafSize);
+                rerunLocalMapFilter.setInputCloud(laserCloudSurfFromMapDS);
+                rerunLocalMapFilter.filter(*rerunLocalMap);
+            } else {
+                *rerunLocalMap = *laserCloudSurfFromMapDS;
+            }
+
+            const auto local_map = toRerunPoints(*rerunLocalMap, rerunLocalMapMaxPoints);
+            if (!local_map.empty()) {
+                rerunVisualizer->drawPoints(
+                    "liorf/local_map",
+                    local_map,
+                    Eigen::Vector4f(80.f, 180.f, 255.f, 90.f),
+                    1.f);
+            }
+        }
+
+        if (laserCloudSurfLastDS && !laserCloudSurfLastDS->empty()) {
+            const auto registered_cloud =
+                transformPointCloud(laserCloudSurfLastDS, &thisPose6D);
+            const auto current_scan = toRerunPoints(*registered_cloud, 20000u);
+            rerunVisualizer->drawPoints(
+                "liorf/current_scan",
+                current_scan,
+                Eigen::Vector4f(255.f, 255.f, 255.f, 180.f),
+                1.5f);
+        }
+    }
 
 
 
@@ -3227,6 +3402,7 @@ public:
                 lastSLAMInfoPubSize = cloudKeyPoses6D->size();
             }
         }
+        publishRerunFrame();
     }
 };
 
