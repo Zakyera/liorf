@@ -1476,6 +1476,7 @@ public:
 
         bool cbsEnableGkcm = true;
         bool cbsEnableBeliefDcs = false;
+        bool cbsEnableSoftReset = false;
         double cbsBeliefSimilarityThreshold = 0.01;
         int cbsBeliefWindow = 30;
         nh.param<bool>("liorf/cbsEnableGkcm", cbsEnableGkcm, true);
@@ -1484,11 +1485,16 @@ public:
         nh.param<int>("liorf/cbsBeliefExchangeWindowSize", cbsBeliefWindow, 30);
         nh.param<double>("liorf/cbsBeliefTimestampToleranceSec", beliefTimestampToleranceSec, 0.05);
         nh.param<bool>("liorf/cbsBeliefRejectFirstMessage", cbsBeliefRejectFirstMessage, true);
+        nh.param<bool>("liorf/cbsEnableSoftReset", cbsEnableSoftReset, false);
         nh.param<bool>("liorf/cbsBeliefBridgeEnable", cbsBeliefBridgeEnable, true);
         nh.param<std::string>("liorf/cbsBeliefInTopic", cbsBeliefInTopic, "liorf/cbs/belief_in");
         nh.param<std::string>("liorf/cbsBeliefOutTopic", cbsBeliefOutTopic, "liorf/cbs/belief_out");
         nh.param<bool>("liorf/cbsExternalExchangeInBodyFrame", cbsExternalExchangeInBodyFrame, true);
         nh.param<bool>("liorf/cbsL2KCovAuditEnable", cbsL2KCovAuditEnable, false);
+        std::string cbsStaticTfImuToLidarArgs;
+        nh.param<std::string>("liorf/cbsStaticTfImuToLidarArgs",
+                              cbsStaticTfImuToLidarArgs,
+                              std::string(""));
         int cbsL2KCovAuditMaxSamplesInt = 20;
         nh.param<int>("liorf/cbsL2KCovAuditMaxSamples", cbsL2KCovAuditMaxSamplesInt, 20);
         nh.param<double>("liorf/cbsL2KCovAuditReplacementTransVariance",
@@ -1525,6 +1531,96 @@ public:
             ROS_INFO("LiORF CBS exchange semantic: world->lidar (legacy pass-through).");
         }
 
+        {
+            // Diagnostic only: compare config extrinsic, launch static-TF extrinsic,
+            // and active CBS conversion extrinsic without changing behavior.
+            auto rotationToRpy = [](const Eigen::Matrix3d& rotation) {
+                tf::Matrix3x3 tf_rotation(
+                    rotation(0, 0), rotation(0, 1), rotation(0, 2),
+                    rotation(1, 0), rotation(1, 1), rotation(1, 2),
+                    rotation(2, 0), rotation(2, 1), rotation(2, 2));
+                double roll = 0.0;
+                double pitch = 0.0;
+                double yaw = 0.0;
+                tf_rotation.getRPY(roll, pitch, yaw);
+                return std::array<double, 3>{roll, pitch, yaw};
+            };
+
+            const auto cfg_rpy = rotationToRpy(extRot);
+            const auto cbs_rpy = rotationToRpy(cbsLidarPoseBody.rotation().matrix());
+            ROS_INFO_STREAM("LiORF extrinsic diagnostics (config): "
+                            << "R_l_b_rpy(rad)=[" << cfg_rpy[0] << ", "
+                            << cfg_rpy[1] << ", " << cfg_rpy[2] << "], "
+                            << "t_l_b=[" << extTrans.x() << ", "
+                            << extTrans.y() << ", " << extTrans.z() << "]");
+            ROS_INFO_STREAM("LiORF extrinsic diagnostics (CBS active conversion): "
+                            << "R_l_b_rpy(rad)=[" << cbs_rpy[0] << ", "
+                            << cbs_rpy[1] << ", " << cbs_rpy[2] << "], "
+                            << "t_l_b=[" << cbsLidarPoseBody.translation().x() << ", "
+                            << cbsLidarPoseBody.translation().y() << ", "
+                            << cbsLidarPoseBody.translation().z() << "]");
+
+            if (!cbsStaticTfImuToLidarArgs.empty()) {
+                std::istringstream static_tf_stream(cbsStaticTfImuToLidarArgs);
+                double tx = 0.0;
+                double ty = 0.0;
+                double tz = 0.0;
+                double qx = 0.0;
+                double qy = 0.0;
+                double qz = 0.0;
+                double qw = 1.0;
+                if (static_tf_stream >> tx >> ty >> tz >> qx >> qy >> qz >> qw) {
+                    Eigen::Quaterniond q_imu_lidar(qw, qx, qy, qz);
+                    if (q_imu_lidar.norm() > 1e-12) {
+                        q_imu_lidar.normalize();
+                        const Eigen::Matrix3d R_imu_lidar_static = q_imu_lidar.toRotationMatrix();
+                        const Eigen::Vector3d t_imu_lidar_static(tx, ty, tz);
+                        const Eigen::Matrix3d R_lidar_body_static_equiv = R_imu_lidar_static.transpose();
+                        const Eigen::Vector3d t_lidar_body_static_equiv =
+                            -R_imu_lidar_static.transpose() * t_imu_lidar_static;
+
+                        const auto static_imu_lidar_rpy = rotationToRpy(R_imu_lidar_static);
+                        const auto static_lidar_body_rpy = rotationToRpy(R_lidar_body_static_equiv);
+
+                        const Eigen::Matrix3d R_diff =
+                            extRot * R_lidar_body_static_equiv.transpose();
+                        const double angle_diff_rad = Eigen::AngleAxisd(R_diff).angle();
+                        const double angle_diff_deg = angle_diff_rad * 180.0 / M_PI;
+                        const double translation_diff =
+                            (extTrans - t_lidar_body_static_equiv).norm();
+
+                        ROS_INFO_STREAM("LiORF extrinsic diagnostics (static TF raw): "
+                                        << "T_imu_lidar_rpy(rad)=[" << static_imu_lidar_rpy[0]
+                                        << ", " << static_imu_lidar_rpy[1]
+                                        << ", " << static_imu_lidar_rpy[2] << "], "
+                                        << "t_imu_lidar=[" << tx << ", " << ty
+                                        << ", " << tz << "]");
+                        ROS_INFO_STREAM("LiORF extrinsic diagnostics (static TF equivalent in lidar->body convention): "
+                                        << "R_l_b_rpy(rad)=[" << static_lidar_body_rpy[0]
+                                        << ", " << static_lidar_body_rpy[1]
+                                        << ", " << static_lidar_body_rpy[2] << "], "
+                                        << "t_l_b=[" << t_lidar_body_static_equiv.x() << ", "
+                                        << t_lidar_body_static_equiv.y() << ", "
+                                        << t_lidar_body_static_equiv.z() << "]");
+                        ROS_INFO_STREAM("LiORF extrinsic diagnostics (config vs static-equivalent): "
+                                        << "angle_diff_rad=" << angle_diff_rad
+                                        << " (" << angle_diff_deg << " deg), "
+                                        << "translation_diff=" << translation_diff << " m");
+                    } else {
+                        ROS_WARN_STREAM("LiORF extrinsic diagnostics: invalid quaternion norm in "
+                                        << "liorf/cbsStaticTfImuToLidarArgs='"
+                                        << cbsStaticTfImuToLidarArgs << "'");
+                    }
+                } else {
+                    ROS_WARN_STREAM("LiORF extrinsic diagnostics: failed to parse "
+                                    << "liorf/cbsStaticTfImuToLidarArgs='"
+                                    << cbsStaticTfImuToLidarArgs << "'");
+                }
+            } else {
+                ROS_INFO("LiORF extrinsic diagnostics: liorf/cbsStaticTfImuToLidarArgs not set.");
+            }
+        }
+
         cbs::BPSAM::Params parameters;
         parameters.robot_id = selfAgentId;
         parameters.sam_params_.relinearizeThreshold = 0.1;
@@ -1534,12 +1630,15 @@ public:
         parameters.enable_gkcm = cbsEnableGkcm;
         parameters.enable_belief_dcs = cbsEnableBeliefDcs;
         parameters.reject_first_message = cbsBeliefRejectFirstMessage;
+        parameters.gbp_update_params.enable_soft_reset = cbsEnableSoftReset;
         parameters.belief_similarity_threshold = cbsBeliefSimilarityThreshold;
         bpsam.reset(new cbs::BPSAM(parameters));
 
         ROS_INFO_STREAM("LiORF BPSAM backend agent id: '" << static_cast<char>(selfAgentId) << "'");
         ROS_INFO_STREAM("LiORF BPSAM reject-first-message gate: "
                         << (cbsBeliefRejectFirstMessage ? "ON" : "OFF"));
+        ROS_INFO_STREAM("LiORF BPSAM soft reset: "
+                        << (cbsEnableSoftReset ? "ON" : "OFF"));
         ROS_INFO_STREAM("LiORF L2K covariance decomposition audit: "
                         << (cbsL2KCovAuditEnable ? "ENABLED" : "DISABLED")
                         << " max_samples=" << cbsL2KCovAuditMaxSamples

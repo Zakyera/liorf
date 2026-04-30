@@ -190,6 +190,13 @@ public:
     bool doneFirstOpt = false;
     double lastImuT_imu = -1;
     double lastImuT_opt = -1;
+    uint64_t imuToLidarPoseConversionCount = 0;
+    uint64_t lidarToImuPoseConversionCount = 0;
+    bool imuPreintExtrinsicSemanticsLogged = false;
+    bool imuPreintIdentityRotationUsed = true;
+    bool imuPreintUseRotationalPoseExtrinsic = false;
+    std::array<double, 3> imu2LidarRpyRad{0.0, 0.0, 0.0};
+    std::array<double, 3> lidar2ImuRpyRad{0.0, 0.0, 0.0};
 
     gtsam::ISAM2 optimizer;
     gtsam::NonlinearFactorGraph graphFactors;
@@ -206,6 +213,96 @@ public:
 
     IMUPreintegration()
     {
+        nh.param<bool>("liorf/imuPreintUseRotationalPoseExtrinsic",
+                       imuPreintUseRotationalPoseExtrinsic,
+                       false);
+        if (imuPreintUseRotationalPoseExtrinsic) {
+            lidar2Imu = gtsam::Pose3(gtsam::Rot3(extRot),
+                                     gtsam::Point3(extTrans.x(), extTrans.y(), extTrans.z()));
+            imu2Lidar = lidar2Imu.inverse();
+        } else {
+            imu2Lidar = gtsam::Pose3(gtsam::Rot3(1, 0, 0, 0),
+                                     gtsam::Point3(-extTrans.x(), -extTrans.y(), -extTrans.z()));
+            lidar2Imu = gtsam::Pose3(gtsam::Rot3(1, 0, 0, 0),
+                                     gtsam::Point3(extTrans.x(), extTrans.y(), extTrans.z()));
+        }
+
+        auto rotationToRpy = [](const Eigen::Matrix3d& rotation) {
+            tf::Matrix3x3 tf_rotation(
+                rotation(0, 0), rotation(0, 1), rotation(0, 2),
+                rotation(1, 0), rotation(1, 1), rotation(1, 2),
+                rotation(2, 0), rotation(2, 1), rotation(2, 2));
+            double roll = 0.0;
+            double pitch = 0.0;
+            double yaw = 0.0;
+            tf_rotation.getRPY(roll, pitch, yaw);
+            return std::array<double, 3>{roll, pitch, yaw};
+        };
+        const Eigen::Matrix3d identity = Eigen::Matrix3d::Identity();
+        imu2LidarRpyRad = rotationToRpy(imu2Lidar.rotation().matrix());
+        lidar2ImuRpyRad = rotationToRpy(lidar2Imu.rotation().matrix());
+        imuPreintIdentityRotationUsed =
+            imu2Lidar.rotation().matrix().isApprox(identity, 1e-12) &&
+            lidar2Imu.rotation().matrix().isApprox(identity, 1e-12);
+
+        const auto cfgExtrinsicRpyRad = rotationToRpy(extRot);
+        ROS_INFO_STREAM("LiORF IMU-preintegration extrinsic semantics: "
+                        << "imuConverter() rotates IMU accel/gyro by config extRot before integration; "
+                        << "pose conversion uses imu2Lidar/lidar2Imu compose transforms. "
+                        << "imu_preint_use_rotational_pose_extrinsic="
+                        << (imuPreintUseRotationalPoseExtrinsic ? "true" : "false"));
+        ROS_INFO_STREAM("LiORF IMU-preintegration extrinsic diagnostics (config extRot): "
+                        << "R_l_b_rpy(rad)=[" << cfgExtrinsicRpyRad[0] << ", "
+                        << cfgExtrinsicRpyRad[1] << ", " << cfgExtrinsicRpyRad[2] << "], "
+                        << "t_l_b=[" << extTrans.x() << ", " << extTrans.y() << ", " << extTrans.z() << "]");
+        ROS_INFO_STREAM("LiORF IMU-preintegration pose conversion transforms: "
+                        << "imu2Lidar_rpy(rad)=[" << imu2LidarRpyRad[0] << ", "
+                        << imu2LidarRpyRad[1] << ", " << imu2LidarRpyRad[2] << "], "
+                        << "imu2Lidar_t=[" << imu2Lidar.translation().x() << ", "
+                        << imu2Lidar.translation().y() << ", " << imu2Lidar.translation().z() << "], "
+                        << "lidar2Imu_rpy(rad)=[" << lidar2ImuRpyRad[0] << ", "
+                        << lidar2ImuRpyRad[1] << ", " << lidar2ImuRpyRad[2] << "], "
+                        << "lidar2Imu_t=[" << lidar2Imu.translation().x() << ", "
+                        << lidar2Imu.translation().y() << ", " << lidar2Imu.translation().z() << "], "
+                        << "identity_rotation_used=" << (imuPreintIdentityRotationUsed ? "true" : "false"));
+
+        std::string staticTfImuToLidarArgs;
+        nh.param<std::string>("liorf/cbsStaticTfImuToLidarArgs",
+                              staticTfImuToLidarArgs,
+                              std::string(""));
+        if (!staticTfImuToLidarArgs.empty()) {
+            std::istringstream staticTfStream(staticTfImuToLidarArgs);
+            double tx = 0.0;
+            double ty = 0.0;
+            double tz = 0.0;
+            double qx = 0.0;
+            double qy = 0.0;
+            double qz = 0.0;
+            double qw = 1.0;
+            if (staticTfStream >> tx >> ty >> tz >> qx >> qy >> qz >> qw) {
+                Eigen::Quaterniond qImuLidar(qw, qx, qy, qz);
+                if (qImuLidar.norm() > 1e-12) {
+                    qImuLidar.normalize();
+                    const Eigen::Matrix3d rImuLidarStatic = qImuLidar.toRotationMatrix();
+                    const auto staticTfRpyRad = rotationToRpy(rImuLidarStatic);
+                    ROS_INFO_STREAM("LiORF IMU-preintegration extrinsic diagnostics (static TF raw T_imu_lidar): "
+                                    << "R_i_l_rpy(rad)=[" << staticTfRpyRad[0] << ", "
+                                    << staticTfRpyRad[1] << ", " << staticTfRpyRad[2] << "], "
+                                    << "t_i_l=[" << tx << ", " << ty << ", " << tz << "]");
+                } else {
+                    ROS_WARN_STREAM("LiORF IMU-preintegration extrinsic diagnostics: invalid static TF quaternion norm for "
+                                    << "liorf/cbsStaticTfImuToLidarArgs='"
+                                    << staticTfImuToLidarArgs << "'");
+                }
+            } else {
+                ROS_WARN_STREAM("LiORF IMU-preintegration extrinsic diagnostics: failed to parse "
+                                << "liorf/cbsStaticTfImuToLidarArgs='"
+                                << staticTfImuToLidarArgs << "'");
+            }
+        } else {
+            ROS_INFO("LiORF IMU-preintegration extrinsic diagnostics: no static TF arg param found at liorf/cbsStaticTfImuToLidarArgs.");
+        }
+
         subImu      = nh.subscribe<sensor_msgs::Imu>  (imuTopic,                   2000, &IMUPreintegration::imuHandler,      this, ros::TransportHints().tcpNoDelay());
         subOdometry = nh.subscribe<nav_msgs::Odometry>("liorf/mapping/odometry_incremental", 5,    &IMUPreintegration::odometryHandler, this, ros::TransportHints().tcpNoDelay());
 
@@ -268,6 +365,13 @@ public:
         float r_w = odomMsg->pose.pose.orientation.w;
         bool degenerate = (int)odomMsg->pose.covariance[0] == 1 ? true : false;
         gtsam::Pose3 lidarPose = gtsam::Pose3(gtsam::Rot3::Quaternion(r_w, r_x, r_y, r_z), gtsam::Point3(p_x, p_y, p_z));
+        ++lidarToImuPoseConversionCount;
+        if (lidarToImuPoseConversionCount <= 3 || lidarToImuPoseConversionCount % 500 == 0) {
+            ROS_INFO_STREAM("LiORF IMU-preintegration lidar->imu pose conversion sample "
+                            << lidarToImuPoseConversionCount
+                            << ": input semantic world->lidar (mapping odometry), output semantic world->imu via lidarPose.compose(lidar2Imu), "
+                            << "identity_rotation_used=" << (imuPreintIdentityRotationUsed ? "true" : "false"));
+        }
 
 
         // 0. initialize system
@@ -487,6 +591,19 @@ public:
         // transform imu pose to ldiar
         gtsam::Pose3 imuPose = gtsam::Pose3(currentState.quaternion(), currentState.position());
         gtsam::Pose3 lidarPose = imuPose.compose(imu2Lidar);
+        ++imuToLidarPoseConversionCount;
+        if (imuToLidarPoseConversionCount <= 3 || imuToLidarPoseConversionCount % 1000 == 0) {
+            ROS_INFO_STREAM("LiORF IMU-preintegration imu->lidar pose conversion sample "
+                            << imuToLidarPoseConversionCount
+                            << ": input semantic world->imu (preintegrated state), output semantic world->lidar via imuPose.compose(imu2Lidar), "
+                            << "identity_rotation_used=" << (imuPreintIdentityRotationUsed ? "true" : "false"));
+        }
+        if (!imuPreintExtrinsicSemanticsLogged) {
+            ROS_INFO_STREAM("LiORF IMU-preintegration conversion counters initialized: "
+                            << "lidar_to_imu_conversions=" << lidarToImuPoseConversionCount
+                            << ", imu_to_lidar_conversions=" << imuToLidarPoseConversionCount);
+            imuPreintExtrinsicSemanticsLogged = true;
+        }
 
         odometry.pose.pose.position.x = lidarPose.translation().x();
         odometry.pose.pose.position.y = lidarPose.translation().y();

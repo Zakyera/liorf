@@ -3,20 +3,26 @@
   <arg name="config_file" default="$(find liorf)/config/s3e_alpha.yaml"/>
   <arg name="cbs_belief_timestamp_tolerance_sec" default="0.12"/>
   <arg name="cbs_belief_reject_first_message" default="true"/>
+  <arg name="cbs_enable_soft_reset" default="false"/>
   <arg name="cbs_belief_exchange_window_size" default="30"/>
   <arg name="cbs_l2k_cov_audit_enable" default="false"/>
   <arg name="cbs_l2k_cov_audit_max_samples" default="20"/>
   <arg name="cbs_l2k_cov_audit_replacement_trans_variance" default="1.0"/>
   <arg name="cbs_l2k_cov_audit_query_anchor_variance" default="1000000.0"/>
   <arg name="cbs_l2k_outgoing_covariance_mode" default="A_as_is_local_anchored"/>
+  <arg name="imu_preint_use_rotational_pose_extrinsic" default="false"/>
   <arg name="use_rviz" default="false"/>
   <arg name="publish_static_tf" default="true"/>
+  <arg name="cbs_static_tf_imu_to_velodyne_args"
+       default="-0.010822711151 0.039743076742 -0.140797166604 -0.015750643161 0.000318736590 0.004838794353 0.999864190895 imu_link velodyne 100"/>
 
   <rosparam file="$(arg config_file)" command="load" />
   <param name="/liorf/cbsBeliefTimestampToleranceSec"
          value="$(arg cbs_belief_timestamp_tolerance_sec)"/>
   <param name="/liorf/cbsBeliefRejectFirstMessage"
          value="$(arg cbs_belief_reject_first_message)"/>
+  <param name="/liorf/cbsEnableSoftReset"
+         value="$(arg cbs_enable_soft_reset)"/>
   <param name="/liorf/cbsBeliefExchangeWindowSize"
          value="$(arg cbs_belief_exchange_window_size)"/>
   <param name="/liorf/cbsL2KCovAuditEnable"
@@ -29,6 +35,10 @@
          value="$(arg cbs_l2k_cov_audit_query_anchor_variance)"/>
   <param name="/liorf/cbsL2KOutgoingCovarianceMode"
          value="$(arg cbs_l2k_outgoing_covariance_mode)"/>
+  <param name="/liorf/imuPreintUseRotationalPoseExtrinsic"
+         value="$(arg imu_preint_use_rotational_pose_extrinsic)"/>
+  <param name="/liorf/cbsStaticTfImuToLidarArgs"
+         value="$(arg cbs_static_tf_imu_to_velodyne_args)"/>
 
   <include file="$(find liorf)/launch/include/module_loam.launch">
     <arg name="project" value="$(arg project)"/>
@@ -38,7 +48,7 @@
         pkg="tf"
         type="static_transform_publisher"
         name="s3e_imu_to_velodyne_tf"
-        args="-0.010822711151 0.039743076742 -0.140797166604 -0.015750643161 0.000318736590 0.004838794353 0.999864190895 imu_link velodyne 100"/>
+        args="$(arg cbs_static_tf_imu_to_velodyne_args)"/>
 
   <include file="$(find liorf)/launch/include/module_rviz.launch" if="$(arg use_rviz)">
     <arg name="project" value="$(arg project)"/>
