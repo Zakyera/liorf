@@ -3,6 +3,7 @@
   <arg name="config_file" default="$(find liorf)/config/s3e_alpha.yaml"/>
   <arg name="cbs_belief_timestamp_tolerance_sec" default="0.12"/>
   <arg name="cbs_belief_reject_first_message" default="true"/>
+  <arg name="cbs_enable_soft_reset" default="true"/>
   <arg name="cbs_belief_bridge_enable" default="true"/>
   <arg name="cbs_belief_exchange_window_size" default="30"/>
   <arg name="cbs_l2k_cov_audit_enable" default="false"/>
@@ -25,6 +26,8 @@
          value="$(arg cbs_belief_timestamp_tolerance_sec)"/>
   <param name="/liorf/cbsBeliefRejectFirstMessage"
          value="$(arg cbs_belief_reject_first_message)"/>
+  <param name="/liorf/cbsEnableSoftReset"
+         value="$(arg cbs_enable_soft_reset)"/>
   <param name="/liorf/cbsBeliefBridgeEnable"
          value="$(arg cbs_belief_bridge_enable)"/>
   <param name="/liorf/cbsBeliefExchangeWindowSize"

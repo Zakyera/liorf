@@ -67,6 +67,7 @@ liorf:
   # CBS/BPSAM bridge settings
   cbsAgentId: "l"
   cbsEnableBeliefDcs: false
+  cbsEnableSoftReset: true
   cbsBeliefSimilarityThreshold: 0.01
   cbsBeliefBridgeEnable: true
   cbsExternalExchangeInBodyFrame: true

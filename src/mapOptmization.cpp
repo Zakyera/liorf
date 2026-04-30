@@ -214,6 +214,7 @@ public:
     size_t cbsBeliefMaxRootSize = 60;
     double beliefTimestampToleranceSec = 0.05;
     bool cbsBeliefRejectFirstMessage = true;
+    bool cbsEnableSoftReset = true;
     bool cbsBeliefBridgeEnable = true;
     std::string cbsBeliefInTopic = "liorf/cbs/belief_in";
     std::string cbsBeliefOutTopic = "liorf/cbs/belief_out";
@@ -226,10 +227,18 @@ public:
     std::atomic<size_t> cbsBeliefsIncomingDroppedTimestampMismatchTotal{0u};
     std::atomic<size_t> cbsBeliefsIncomingAddedToBpsamTotal{0u};
     std::atomic<size_t> cbsBeliefsIncomingRejectedByBpsamTotal{0u};
+    std::atomic<size_t> cbsBeliefsIncomingRejectedFirstMessageTotal{0u};
+    std::atomic<size_t> cbsBeliefsIncomingRejectedUpdateStatusTotal{0u};
+    std::atomic<size_t> cbsBeliefsIncomingRejectedShapeTotal{0u};
+    std::atomic<size_t> cbsBeliefsIncomingRejectedExceptionTotal{0u};
     std::atomic<size_t> cbsBeliefsOutgoingPreparedTotal{0u};
     std::atomic<size_t> cbsBeliefsOutgoingPublishedTotal{0u};
     std::atomic<size_t> cbsBeliefsIncomingReceivedPerRerunFrame{0u};
     std::atomic<size_t> cbsBeliefsIncomingAddedToBpsamPerRerunFrame{0u};
+    std::atomic<size_t> cbsBeliefsIncomingRejectedFirstMessagePerRerunFrame{0u};
+    std::atomic<size_t> cbsBeliefsIncomingRejectedUpdateStatusPerRerunFrame{0u};
+    std::atomic<size_t> cbsBeliefsIncomingRejectedShapePerRerunFrame{0u};
+    std::atomic<size_t> cbsBeliefsIncomingRejectedExceptionPerRerunFrame{0u};
     std::atomic<size_t> cbsBeliefsOutgoingPublishedPerRerunFrame{0u};
     std::atomic<double> bpsamOptimizationTimeMsPerRerunFrame{0.0};
     std::atomic<double> cbsBeliefGenerationTimeMsPerRerunFrame{0.0};
@@ -463,6 +472,8 @@ public:
     {
         std::replace(token.begin(), token.end(), ',', '_');
         std::replace(token.begin(), token.end(), ' ', '_');
+        std::replace(token.begin(), token.end(), '\n', '_');
+        std::replace(token.begin(), token.end(), '\r', '_');
         return token.empty() ? "na" : token;
     }
 
@@ -1114,6 +1125,10 @@ public:
         size_t numAddedToBpsam = 0;
         size_t numRejectedInactiveWindow = 0;
         size_t numRejectedRootSize = 0;
+        size_t numRejectedFirstMessage = 0;
+        size_t numRejectedUpdateStatus = 0;
+        size_t numRejectedShape = 0;
+        size_t numRejectedException = 0;
 
         auto fetchAgentLocalBelief = [&](const cbs::AgentId sourceAgent,
                                          const Key localKey,
@@ -1187,6 +1202,45 @@ public:
                 << dxycurr << ","
                 << dxyTarget);
         };
+
+        auto statusForBpsamDetail = [](const cbs::BPSAM::AddBeliefStatus status) {
+            switch (status) {
+                case cbs::BPSAM::AddBeliefStatus::Accepted:
+                    return std::string("bpsam_added");
+                case cbs::BPSAM::AddBeliefStatus::RejectedFirstMessage:
+                    return std::string("bpsam_rejected_first_message");
+                case cbs::BPSAM::AddBeliefStatus::RejectedUpdateStatus:
+                    return std::string("bpsam_rejected_update_status");
+                case cbs::BPSAM::AddBeliefStatus::RejectedShape:
+                    return std::string("bpsam_rejected_shape");
+                case cbs::BPSAM::AddBeliefStatus::RejectedInactiveWindow:
+                    return std::string("bpsam_rejected_inactive_window");
+                case cbs::BPSAM::AddBeliefStatus::Exception:
+                    return std::string("bpsam_rejected_exception");
+            }
+            return std::string("bpsam_rejected");
+        };
+
+        auto logBpsamAddRow =
+            [&](const cbs::BPSAM::AddBeliefDetail& detail,
+                const std::string& senderKeyToken,
+                const std::string& receiverPoseKeyToken) {
+                ROS_INFO_STREAM(
+                    "CBS_BPSAM_ADD_ROW_K2L,"
+                    << senderKeyToken << ","
+                    << receiverPoseKeyToken << ","
+                    << cbs::BPSAM::addBeliefStatusName(detail.status) << ","
+                    << (detail.enable_soft_reset ? "true" : "false") << ","
+                    << cbs::BPSAM::metricTypeName(detail.metric_type) << ","
+                    << detail.d_reset << ","
+                    << detail.contract_alpha << ","
+                    << (detail.existing_gbp_var ? "true" : "false") << ","
+                    << (detail.is_first_message ? "true" : "false") << ","
+                    << detail.dxycurr << ","
+                    << detail.dxy << ","
+                    << detail.contraction_step_size << ","
+                    << sanitizeCsvToken(detail.message));
+            };
 
         for (const auto& incoming : pendingBeliefs) {
             size_t localIndex = 0;
@@ -1327,12 +1381,18 @@ public:
 
             std::map<Key, std::vector<std::pair<cbs::AgentId, gbp::Gaussian>>> singleBelief;
             singleBelief[localKey].emplace_back(incoming.sourceAgent, gaussian);
-            const int rejected = bpsam->addBeliefs(std::move(singleBelief));
-            const bool added = rejected == 0;
-            if (added) {
-                numAddedToBpsam++;
-            } else {
-                numRejectedByBpsam++;
+            const auto addResult = bpsam->addBeliefsDetailed(std::move(singleBelief));
+            const bool added = addResult.accepted > 0u;
+            numAddedToBpsam += addResult.accepted;
+            numRejectedByBpsam += addResult.rejected();
+            numRejectedFirstMessage += addResult.rejected_first_message;
+            numRejectedUpdateStatus += addResult.rejected_update_status;
+            numRejectedShape += addResult.rejected_shape;
+            numRejectedException += addResult.rejected_exception;
+            const cbs::BPSAM::AddBeliefDetail* addDetail =
+                addResult.details.empty() ? nullptr : &addResult.details.front();
+            if (addDetail) {
+                logBpsamAddRow(*addDetail, senderKeyToken, receiverPoseKeyToken);
             }
 
             gbp::Gaussian localAfter(localKey, gtsam::Vector6::Zero(), gtsam::Matrix6::Identity(), 1);
@@ -1349,10 +1409,8 @@ public:
                     ? safeDeltaNorm(localBefore.mu(), localAfter.mu())
                     : std::numeric_limits<double>::quiet_NaN();
             const std::string status =
-                added ? "bpsam_added"
-                      : ((!hasLocalBefore && cbsBeliefRejectFirstMessage)
-                             ? "bpsam_rejected_first_message"
-                             : "bpsam_rejected");
+                addDetail ? statusForBpsamDetail(addDetail->status)
+                          : (added ? "bpsam_added" : "bpsam_rejected");
 
             const double receiverPosteriorPreTrace = receiverLocalBeforeTrace;
             const double receiverPosteriorPostTrace = receiverMergedTrace;
@@ -1394,6 +1452,14 @@ public:
         cbsBeliefsIncomingAddedToBpsamTotal.fetch_add(numAddedToBpsam, std::memory_order_relaxed);
         cbsBeliefsIncomingAddedToBpsamPerRerunFrame.fetch_add(numAddedToBpsam, std::memory_order_relaxed);
         cbsBeliefsIncomingRejectedByBpsamTotal.fetch_add(numRejectedByBpsam, std::memory_order_relaxed);
+        cbsBeliefsIncomingRejectedFirstMessageTotal.fetch_add(numRejectedFirstMessage, std::memory_order_relaxed);
+        cbsBeliefsIncomingRejectedUpdateStatusTotal.fetch_add(numRejectedUpdateStatus, std::memory_order_relaxed);
+        cbsBeliefsIncomingRejectedShapeTotal.fetch_add(numRejectedShape, std::memory_order_relaxed);
+        cbsBeliefsIncomingRejectedExceptionTotal.fetch_add(numRejectedException, std::memory_order_relaxed);
+        cbsBeliefsIncomingRejectedFirstMessagePerRerunFrame.fetch_add(numRejectedFirstMessage, std::memory_order_relaxed);
+        cbsBeliefsIncomingRejectedUpdateStatusPerRerunFrame.fetch_add(numRejectedUpdateStatus, std::memory_order_relaxed);
+        cbsBeliefsIncomingRejectedShapePerRerunFrame.fetch_add(numRejectedShape, std::memory_order_relaxed);
+        cbsBeliefsIncomingRejectedExceptionPerRerunFrame.fetch_add(numRejectedException, std::memory_order_relaxed);
 
         const size_t numDroppedTotal =
             numDroppedNoLocalTimestamp + numDroppedInvalidStamp + numDroppedTimestampMismatch;
@@ -1419,6 +1485,11 @@ public:
             << ",rejected=" << numRejectedByBpsam
             << ",inactive_window=" << numRejectedInactiveWindow
             << ",root_size=" << numRejectedRootSize
+            << ",first_message=" << numRejectedFirstMessage
+            << ",update_status=" << numRejectedUpdateStatus
+            << ",shape=" << numRejectedShape
+            << ",exception=" << numRejectedException
+            << ",soft_reset=" << (cbsEnableSoftReset ? "true" : "false")
             << ",root=" << (bpsam ? bpsam->rootFrontalKeyCount() : 0u)
             << ",max_root=" << cbsBeliefMaxRootSize
             << ",active_priors="
@@ -1441,6 +1512,14 @@ public:
             << cbsBeliefsIncomingAddedToBpsamTotal.load(std::memory_order_relaxed)
             << ",bpsam_rejected="
             << cbsBeliefsIncomingRejectedByBpsamTotal.load(std::memory_order_relaxed)
+            << ",rejected_first_message="
+            << cbsBeliefsIncomingRejectedFirstMessageTotal.load(std::memory_order_relaxed)
+            << ",rejected_update_status="
+            << cbsBeliefsIncomingRejectedUpdateStatusTotal.load(std::memory_order_relaxed)
+            << ",rejected_shape="
+            << cbsBeliefsIncomingRejectedShapeTotal.load(std::memory_order_relaxed)
+            << ",rejected_exception="
+            << cbsBeliefsIncomingRejectedExceptionTotal.load(std::memory_order_relaxed)
             << ")");
     }
 
@@ -1716,6 +1795,7 @@ public:
         nh.param<int>("liorf/cbsBeliefMaxRootSize", cbsBeliefMaxRootSizeParam, 60);
         nh.param<double>("liorf/cbsBeliefTimestampToleranceSec", beliefTimestampToleranceSec, 0.05);
         nh.param<bool>("liorf/cbsBeliefRejectFirstMessage", cbsBeliefRejectFirstMessage, true);
+        nh.param<bool>("liorf/cbsEnableSoftReset", cbsEnableSoftReset, true);
         nh.param<bool>("liorf/cbsBeliefBridgeEnable", cbsBeliefBridgeEnable, true);
         nh.param<std::string>("liorf/cbsBeliefInTopic", cbsBeliefInTopic, "liorf/cbs/belief_in");
         nh.param<std::string>("liorf/cbsBeliefOutTopic", cbsBeliefOutTopic, "liorf/cbs/belief_out");
@@ -1805,6 +1885,7 @@ public:
         parameters.enable_belief_dcs = cbsEnableBeliefDcs;
         parameters.reject_first_message = cbsBeliefRejectFirstMessage;
         parameters.belief_similarity_threshold = cbsBeliefSimilarityThreshold;
+        parameters.gbp_update_params.enable_soft_reset = cbsEnableSoftReset;
         bpsam.reset(new cbs::BPSAM(parameters));
 
         ROS_INFO_STREAM("LiORF BPSAM backend agent id: '" << static_cast<char>(selfAgentId) << "'");
@@ -1813,6 +1894,8 @@ public:
                         << " Hz (interval=" << mappingProcessInterval << " s)");
         ROS_INFO_STREAM("LiORF BPSAM reject-first-message gate: "
                         << (cbsBeliefRejectFirstMessage ? "ON" : "OFF"));
+        ROS_INFO_STREAM("LiORF BPSAM soft reset: "
+                        << (cbsEnableSoftReset ? "ON" : "OFF"));
         ROS_INFO_STREAM("LiORF CBS belief window: " << beliefExchangeWindowSize
                         << " poses, max iSAM2 root size="
                         << cbsBeliefMaxRootSize);
@@ -1883,10 +1966,18 @@ public:
         cbsBeliefsIncomingDroppedTimestampMismatchTotal.store(0u, std::memory_order_relaxed);
         cbsBeliefsIncomingAddedToBpsamTotal.store(0u, std::memory_order_relaxed);
         cbsBeliefsIncomingRejectedByBpsamTotal.store(0u, std::memory_order_relaxed);
+        cbsBeliefsIncomingRejectedFirstMessageTotal.store(0u, std::memory_order_relaxed);
+        cbsBeliefsIncomingRejectedUpdateStatusTotal.store(0u, std::memory_order_relaxed);
+        cbsBeliefsIncomingRejectedShapeTotal.store(0u, std::memory_order_relaxed);
+        cbsBeliefsIncomingRejectedExceptionTotal.store(0u, std::memory_order_relaxed);
         cbsBeliefsOutgoingPreparedTotal.store(0u, std::memory_order_relaxed);
         cbsBeliefsOutgoingPublishedTotal.store(0u, std::memory_order_relaxed);
         cbsBeliefsIncomingReceivedPerRerunFrame.store(0u, std::memory_order_relaxed);
         cbsBeliefsIncomingAddedToBpsamPerRerunFrame.store(0u, std::memory_order_relaxed);
+        cbsBeliefsIncomingRejectedFirstMessagePerRerunFrame.store(0u, std::memory_order_relaxed);
+        cbsBeliefsIncomingRejectedUpdateStatusPerRerunFrame.store(0u, std::memory_order_relaxed);
+        cbsBeliefsIncomingRejectedShapePerRerunFrame.store(0u, std::memory_order_relaxed);
+        cbsBeliefsIncomingRejectedExceptionPerRerunFrame.store(0u, std::memory_order_relaxed);
         cbsBeliefsOutgoingPublishedPerRerunFrame.store(0u, std::memory_order_relaxed);
         bpsamOptimizationTimeMsPerRerunFrame.store(0.0, std::memory_order_relaxed);
         cbsBeliefGenerationTimeMsPerRerunFrame.store(0.0, std::memory_order_relaxed);
@@ -2089,6 +2180,18 @@ public:
             rerunVisualizer->drawScalar(
                 "liorf/cbs/beliefs/added_to_factor_graph_per_update",
                 cbsBeliefsIncomingAddedToBpsamPerRerunFrame.exchange(0u, std::memory_order_relaxed));
+            rerunVisualizer->drawScalar(
+                "liorf/cbs/beliefs/rejected_first_message_per_update",
+                cbsBeliefsIncomingRejectedFirstMessagePerRerunFrame.exchange(0u, std::memory_order_relaxed));
+            rerunVisualizer->drawScalar(
+                "liorf/cbs/beliefs/rejected_update_status_per_update",
+                cbsBeliefsIncomingRejectedUpdateStatusPerRerunFrame.exchange(0u, std::memory_order_relaxed));
+            rerunVisualizer->drawScalar(
+                "liorf/cbs/beliefs/rejected_shape_per_update",
+                cbsBeliefsIncomingRejectedShapePerRerunFrame.exchange(0u, std::memory_order_relaxed));
+            rerunVisualizer->drawScalar(
+                "liorf/cbs/beliefs/rejected_exception_per_update",
+                cbsBeliefsIncomingRejectedExceptionPerRerunFrame.exchange(0u, std::memory_order_relaxed));
             rerunVisualizer->drawScalar(
                 "liorf/cbs/timing/belief_generation_ms",
                 cbsBeliefGenerationTimeMsPerRerunFrame.exchange(0.0, std::memory_order_relaxed));
