@@ -139,6 +139,7 @@ public:
 
     // CPU Params
     int numberOfCores;
+    double mappingOptimizationFrequency;
     double mappingProcessInterval;
 
     // Surrounding map
@@ -247,7 +248,12 @@ public:
         nh.param<float>("liorf/rotation_tollerance", rotation_tollerance, FLT_MAX);
 
         nh.param<int>("liorf/numberOfCores", numberOfCores, 2);
-        nh.param<double>("liorf/mappingProcessInterval", mappingProcessInterval, 0.15);
+        nh.param<double>("liorf/mappingOptimizationFrequency", mappingOptimizationFrequency, 5.0);
+        if (mappingOptimizationFrequency > 0.0) {
+            mappingProcessInterval = 1.0 / mappingOptimizationFrequency;
+        } else {
+            nh.param<double>("liorf/mappingProcessInterval", mappingProcessInterval, 0.15);
+        }
 
         nh.param<float>("liorf/surroundingkeyframeAddingDistThreshold", surroundingkeyframeAddingDistThreshold, 1.0);
         nh.param<float>("liorf/surroundingkeyframeAddingAngleThreshold", surroundingkeyframeAddingAngleThreshold, 0.2);

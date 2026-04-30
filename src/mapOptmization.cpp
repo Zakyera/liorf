@@ -211,6 +211,7 @@ public:
     std::deque<StampedBelief> incomingStampedBeliefs;
     std::vector<StampedBelief> outgoingStampedBeliefs;
     size_t beliefExchangeWindowSize = 30;
+    size_t cbsBeliefMaxRootSize = 60;
     double beliefTimestampToleranceSec = 0.05;
     bool cbsBeliefRejectFirstMessage = true;
     bool cbsBeliefBridgeEnable = true;
@@ -233,6 +234,8 @@ public:
     std::atomic<double> bpsamOptimizationTimeMsPerRerunFrame{0.0};
     std::atomic<double> cbsBeliefGenerationTimeMsPerRerunFrame{0.0};
     std::atomic<size_t> cbsMarginalizationGraphFactorCountPerRerunFrame{0u};
+    std::atomic<size_t> cbsBpsamRootSizePerRerunFrame{0u};
+    std::atomic<size_t> cbsBpsamActivePriorSlotsPerRerunFrame{0u};
     std::atomic<size_t> cbsMergeK2LSampleCounter{0u};
     enum class L2KOutgoingCovMode {
         kAsIsLocalAnchored = 0,
@@ -322,6 +325,26 @@ public:
             localPoseTimestampsSec.resize(localIndex + 1, -1.0);
         }
         localPoseTimestampsSec[localIndex] = stampSec;
+    }
+
+    size_t activeBeliefWindowStartIndex() const
+    {
+        return localPoseKeys.size() > beliefExchangeWindowSize ? localPoseKeys.size() - beliefExchangeWindowSize : 0u;
+    }
+
+    bool isLocalIndexInBeliefWindow(size_t localIndex) const
+    {
+        return localIndex >= activeBeliefWindowStartIndex() && localIndex < localPoseKeys.size();
+    }
+
+    KeySet activeBeliefWindowKeys() const
+    {
+        KeySet keys;
+        const size_t startIndex = activeBeliefWindowStartIndex();
+        for (size_t i = startIndex; i < localPoseKeys.size(); ++i) {
+            keys.insert(localPoseKeys[i]);
+        }
+        return keys;
     }
 
     bool findClosestLocalIndexByTimestamp(double stampSec,
@@ -1089,6 +1112,8 @@ public:
         size_t numCandidateForBpsam = 0;
         size_t numRejectedByBpsam = 0;
         size_t numAddedToBpsam = 0;
+        size_t numRejectedInactiveWindow = 0;
+        size_t numRejectedRootSize = 0;
 
         auto fetchAgentLocalBelief = [&](const cbs::AgentId sourceAgent,
                                          const Key localKey,
@@ -1219,6 +1244,59 @@ public:
             const std::string receiverPoseKeyToken =
                 formatPoseKeyToken(static_cast<cbs::AgentId>(localSymbol.chr()), localSymbol.index());
 
+            if (!isLocalIndexInBeliefWindow(localIndex)) {
+                ++numRejectedByBpsam;
+                ++numRejectedInactiveWindow;
+                const double nan = std::numeric_limits<double>::quiet_NaN();
+                logMergeRow(incoming,
+                            senderKeyToken,
+                            receiverPoseKeyToken,
+                            nan,
+                            nan,
+                            nan,
+                            nan,
+                            nan,
+                            nan,
+                            nan,
+                            "bpsam_rejected_inactive_window",
+                            "na",
+                            nan,
+                            nan,
+                            nan,
+                            nan,
+                            nan,
+                            nan,
+                            nan);
+                continue;
+            }
+
+            if (cbsBeliefMaxRootSize > 0u && bpsam &&
+                bpsam->rootFrontalKeyCount() >= cbsBeliefMaxRootSize) {
+                ++numRejectedByBpsam;
+                ++numRejectedRootSize;
+                const double nan = std::numeric_limits<double>::quiet_NaN();
+                logMergeRow(incoming,
+                            senderKeyToken,
+                            receiverPoseKeyToken,
+                            nan,
+                            nan,
+                            nan,
+                            nan,
+                            nan,
+                            nan,
+                            nan,
+                            "bpsam_rejected_root_size",
+                            "na",
+                            nan,
+                            nan,
+                            nan,
+                            nan,
+                            nan,
+                            nan,
+                            nan);
+                continue;
+            }
+
             gtsam::Vector6 mu = gtsam::Vector6::Zero();
             gtsam::Matrix6 covariance = gtsam::Matrix6::Zero();
             for (size_t i = 0; i < 6; ++i) {
@@ -1338,7 +1416,13 @@ public:
             << ",timestamp_mismatch=" << numDroppedTimestampMismatch << ")"
             << " bpsam(candidate=" << numCandidateForBpsam
             << ",added=" << numAddedToBpsam
-            << ",rejected=" << numRejectedByBpsam << ")"
+            << ",rejected=" << numRejectedByBpsam
+            << ",inactive_window=" << numRejectedInactiveWindow
+            << ",root_size=" << numRejectedRootSize
+            << ",root=" << (bpsam ? bpsam->rootFrontalKeyCount() : 0u)
+            << ",max_root=" << cbsBeliefMaxRootSize
+            << ",active_priors="
+            << (bpsam ? bpsam->trackedCbsPriorSlotCount() : 0u) << ")"
             << " totals(received="
             << cbsBeliefsIncomingReceivedTotal.load(std::memory_order_relaxed)
             << ",dequeued="
@@ -1411,12 +1495,7 @@ public:
             return;
         }
 
-        const size_t startIndex =
-            localPoseKeys.size() > beliefExchangeWindowSize ? localPoseKeys.size() - beliefExchangeWindowSize : 0;
-        KeySet requestKeys;
-        for (size_t i = startIndex; i < localPoseKeys.size(); ++i) {
-            requestKeys.insert(localPoseKeys[i]);
-        }
+        KeySet requestKeys = activeBeliefWindowKeys();
 
         bpsam->setMarginalizationGraph(cbs::BPSAM::MarginalizationType::LOCAL);
         cbsMarginalizationGraphFactorCountPerRerunFrame.store(
@@ -1630,9 +1709,11 @@ public:
         bool cbsEnableBeliefDcs = false;
         double cbsBeliefSimilarityThreshold = 0.01;
         int cbsBeliefWindow = 30;
+        int cbsBeliefMaxRootSizeParam = 60;
         nh.param<bool>("liorf/cbsEnableBeliefDcs", cbsEnableBeliefDcs, false);
         nh.param<double>("liorf/cbsBeliefSimilarityThreshold", cbsBeliefSimilarityThreshold, 0.01);
         nh.param<int>("liorf/cbsBeliefExchangeWindowSize", cbsBeliefWindow, 30);
+        nh.param<int>("liorf/cbsBeliefMaxRootSize", cbsBeliefMaxRootSizeParam, 60);
         nh.param<double>("liorf/cbsBeliefTimestampToleranceSec", beliefTimestampToleranceSec, 0.05);
         nh.param<bool>("liorf/cbsBeliefRejectFirstMessage", cbsBeliefRejectFirstMessage, true);
         nh.param<bool>("liorf/cbsBeliefBridgeEnable", cbsBeliefBridgeEnable, true);
@@ -1659,6 +1740,8 @@ public:
         cbsL2KOutgoingCovAnchorMode = covAnchorMode;
         cbsL2KCovAuditMaxSamples = static_cast<size_t>(std::max(1, cbsL2KCovAuditMaxSamplesInt));
         beliefExchangeWindowSize = std::max(1, cbsBeliefWindow);
+        cbsBeliefMaxRootSize =
+            static_cast<size_t>(std::max(0, cbsBeliefMaxRootSizeParam));
 
         nh.param<bool>("liorf/rerunVisualizerEnable", rerunVisualizerEnable, false);
         nh.param<std::string>("liorf/rerunRecordingId", rerunRecordingId, "");
@@ -1725,8 +1808,14 @@ public:
         bpsam.reset(new cbs::BPSAM(parameters));
 
         ROS_INFO_STREAM("LiORF BPSAM backend agent id: '" << static_cast<char>(selfAgentId) << "'");
+        ROS_INFO_STREAM("LiORF mapping optimization frequency: "
+                        << mappingOptimizationFrequency
+                        << " Hz (interval=" << mappingProcessInterval << " s)");
         ROS_INFO_STREAM("LiORF BPSAM reject-first-message gate: "
                         << (cbsBeliefRejectFirstMessage ? "ON" : "OFF"));
+        ROS_INFO_STREAM("LiORF CBS belief window: " << beliefExchangeWindowSize
+                        << " poses, max iSAM2 root size="
+                        << cbsBeliefMaxRootSize);
         ROS_INFO_STREAM("LiORF L2K covariance decomposition audit: "
                         << (cbsL2KCovAuditEnable ? "ENABLED" : "DISABLED")
                         << " max_samples=" << cbsL2KCovAuditMaxSamples
@@ -1802,6 +1891,8 @@ public:
         bpsamOptimizationTimeMsPerRerunFrame.store(0.0, std::memory_order_relaxed);
         cbsBeliefGenerationTimeMsPerRerunFrame.store(0.0, std::memory_order_relaxed);
         cbsMarginalizationGraphFactorCountPerRerunFrame.store(0u, std::memory_order_relaxed);
+        cbsBpsamRootSizePerRerunFrame.store(0u, std::memory_order_relaxed);
+        cbsBpsamActivePriorSlotsPerRerunFrame.store(0u, std::memory_order_relaxed);
         cbsL2KCovAuditSampleCounter.store(0u, std::memory_order_relaxed);
         cbsL2KCovAuditLoggedPoseIndices.clear();
 
@@ -2004,6 +2095,12 @@ public:
             rerunVisualizer->drawScalar(
                 "liorf/cbs/marginalization_graph/factor_count",
                 cbsMarginalizationGraphFactorCountPerRerunFrame.exchange(0u, std::memory_order_relaxed));
+            rerunVisualizer->drawScalar(
+                "liorf/cbs/isam2/root_size",
+                cbsBpsamRootSizePerRerunFrame.exchange(0u, std::memory_order_relaxed));
+            rerunVisualizer->drawScalar(
+                "liorf/cbs/isam2/active_cbs_prior_slots",
+                cbsBpsamActivePriorSlotsPerRerunFrame.exchange(0u, std::memory_order_relaxed));
         }
 
         const auto trajectory = toRerunPoints(*cloudKeyPoses3D, 5000u);
@@ -3244,12 +3341,26 @@ public:
         // external belief factors (from camera-VIO backend) are pre-matched by timestamp.
         consumeIncomingBeliefsIntoBpsam();
 
+        const KeySet activeCbsPriorKeys = activeBeliefWindowKeys();
+        const FactorIndices staleCbsPriorSlots =
+            bpsam->cbsPriorFactorSlotsOutsideKeys(activeCbsPriorKeys);
+        if (!staleCbsPriorSlots.empty()) {
+            ROS_INFO_STREAM_THROTTLE(
+                1.0,
+                "LiORF CBS pruning " << staleCbsPriorSlots.size()
+                                     << " stale prior factors outside the "
+                                     << beliefExchangeWindowSize
+                                     << "-pose active window.");
+        }
+
         // cout << "****************************************************" << endl;
         // gtSAMgraph.print("GTSAM Graph:\n");
 
         // update BPSAM backend
         const auto bpsamOptimizationStart = std::chrono::steady_clock::now();
-        bpsam->update(gtSAMgraph, initialEstimate);
+        cbs::BPSAM::UpdateParams bpsamUpdateParams;
+        bpsamUpdateParams.removeFactorIndices = staleCbsPriorSlots;
+        bpsam->update(gtSAMgraph, initialEstimate, bpsamUpdateParams);
         bpsam->update();
 
         if (aLoopIsClosed == true)
@@ -3262,6 +3373,17 @@ public:
         }
         atomicAddRelaxed(&bpsamOptimizationTimeMsPerRerunFrame,
                          elapsedMs(bpsamOptimizationStart));
+        cbsBpsamRootSizePerRerunFrame.store(
+            bpsam->rootFrontalKeyCount(), std::memory_order_relaxed);
+        cbsBpsamActivePriorSlotsPerRerunFrame.store(
+            bpsam->trackedCbsPriorSlotCount(), std::memory_order_relaxed);
+        ROS_INFO_STREAM_THROTTLE(
+            1.0,
+            "LiORF BPSAM root: size=" << bpsam->rootFrontalKeyCount()
+                                      << " cliques=" << bpsam->rootCliqueCount()
+                                      << " active_cbs_priors="
+                                      << bpsam->trackedCbsPriorSlotCount()
+                                      << " max_root=" << cbsBeliefMaxRootSize);
 
         gtSAMgraph.resize(0);
         initialEstimate.clear();
