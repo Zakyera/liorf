@@ -12,6 +12,7 @@ liorf:
   mapFrame: "map"
 
   # GPS settings
+  useGPS: false
   useImuHeadingInitialization: false
   useGpsElevation: false
   gpsCovThreshold: 2.0
@@ -35,6 +36,14 @@ liorf:
   imuGyrBiasN: 8.1770009351257180e-05
   imuGravity: 9.81
   imuRPYWeight: 0.01
+  # IMU preintegration and initialization sigmas matched to Kimera S3E Alpha.
+  imuIntegrationSigma: 1.0e-08
+  imuInitialPositionSigma: 1.0e-05
+  imuInitialRollPitchSigma: 0.174533
+  imuInitialYawSigma: 0.174533
+  imuInitialVelocitySigma: 0.1
+  imuInitialAccBiasSigma: 0.1
+  imuInitialGyrBiasSigma: 0.1
 
   # Rotation mapping IMU vectors into lidar frame (R_l_i).
   extrinsicRot: [0.999952964977, -0.009686314531, 0.000484956926,

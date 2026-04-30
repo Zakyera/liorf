@@ -214,12 +214,22 @@ public:
         boost::shared_ptr<gtsam::PreintegrationParams> p = gtsam::PreintegrationParams::MakeSharedU(imuGravity);
         p->accelerometerCovariance  = gtsam::Matrix33::Identity(3,3) * pow(imuAccNoise, 2); // acc white noise in continuous
         p->gyroscopeCovariance      = gtsam::Matrix33::Identity(3,3) * pow(imuGyrNoise, 2); // gyro white noise in continuous
-        p->integrationCovariance    = gtsam::Matrix33::Identity(3,3) * pow(1e-4, 2); // error committed in integrating position from velocities
+        p->integrationCovariance    = gtsam::Matrix33::Identity(3,3) * pow(imuIntegrationSigma, 2); // error committed in integrating position from velocities
         gtsam::imuBias::ConstantBias prior_imu_bias((gtsam::Vector(6) << 0, 0, 0, 0, 0, 0).finished());; // assume zero initial bias
 
-        priorPoseNoise  = gtsam::noiseModel::Diagonal::Sigmas((gtsam::Vector(6) << 1e-2, 1e-2, 1e-2, 1e-2, 1e-2, 1e-2).finished()); // rad,rad,rad,m, m, m
-        priorVelNoise   = gtsam::noiseModel::Isotropic::Sigma(3, 1e4); // m/s
-        priorBiasNoise  = gtsam::noiseModel::Isotropic::Sigma(6, 1e-3); // 1e-2 ~ 1e-3 seems to be good
+        priorPoseNoise  = gtsam::noiseModel::Diagonal::Sigmas(
+            (gtsam::Vector(6) << imuInitialRollPitchSigma,
+             imuInitialRollPitchSigma, imuInitialYawSigma,
+             imuInitialPositionSigma, imuInitialPositionSigma,
+             imuInitialPositionSigma)
+                .finished()); // rad,rad,rad,m, m, m
+        priorVelNoise   = gtsam::noiseModel::Isotropic::Sigma(3, imuInitialVelocitySigma); // m/s
+        priorBiasNoise  = gtsam::noiseModel::Diagonal::Sigmas(
+            (gtsam::Vector(6) << imuInitialAccBiasSigma,
+             imuInitialAccBiasSigma, imuInitialAccBiasSigma,
+             imuInitialGyrBiasSigma, imuInitialGyrBiasSigma,
+             imuInitialGyrBiasSigma)
+                .finished());
         correctionNoise = gtsam::noiseModel::Diagonal::Sigmas((gtsam::Vector(6) << 0.05, 0.05, 0.05, 0.1, 0.1, 0.1).finished()); // rad,rad,rad,m, m, m
         correctionNoise2 = gtsam::noiseModel::Diagonal::Sigmas((gtsam::Vector(6) << 1, 1, 1, 1, 1, 1).finished()); // rad,rad,rad,m, m, m
         noiseModelBetweenBias = (gtsam::Vector(6) << imuAccBiasN, imuAccBiasN, imuAccBiasN, imuGyrBiasN, imuGyrBiasN, imuGyrBiasN).finished();

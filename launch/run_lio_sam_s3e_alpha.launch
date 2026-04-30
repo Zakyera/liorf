@@ -3,6 +3,7 @@
   <arg name="config_file" default="$(find liorf)/config/s3e_alpha.yaml"/>
   <arg name="cbs_belief_timestamp_tolerance_sec" default="0.12"/>
   <arg name="cbs_belief_reject_first_message" default="true"/>
+  <arg name="cbs_belief_bridge_enable" default="true"/>
   <arg name="cbs_belief_exchange_window_size" default="30"/>
   <arg name="cbs_l2k_cov_audit_enable" default="false"/>
   <arg name="cbs_l2k_cov_audit_max_samples" default="20"/>
@@ -15,6 +16,8 @@
   <arg name="rerun_host" default="rerun+http://172.18.0.1:9876/proxy"/>
   <arg name="rerun_local_map_leaf_size" default="1.0"/>
   <arg name="rerun_local_map_max_points" default="10000"/>
+  <arg name="rerun_factor_graph_enable" default="true"/>
+  <arg name="use_gps" default="false"/>
   <arg name="publish_static_tf" default="true"/>
 
   <rosparam file="$(arg config_file)" command="load" />
@@ -22,6 +25,8 @@
          value="$(arg cbs_belief_timestamp_tolerance_sec)"/>
   <param name="/liorf/cbsBeliefRejectFirstMessage"
          value="$(arg cbs_belief_reject_first_message)"/>
+  <param name="/liorf/cbsBeliefBridgeEnable"
+         value="$(arg cbs_belief_bridge_enable)"/>
   <param name="/liorf/cbsBeliefExchangeWindowSize"
          value="$(arg cbs_belief_exchange_window_size)"/>
   <param name="/liorf/cbsL2KCovAuditEnable"
@@ -42,6 +47,9 @@
          value="$(arg rerun_local_map_leaf_size)"/>
   <param name="/liorf/rerunLocalMapMaxPoints"
          value="$(arg rerun_local_map_max_points)"/>
+  <param name="/liorf/rerunFactorGraphEnable"
+         value="$(arg rerun_factor_graph_enable)"/>
+  <param name="/liorf/useGPS" value="$(arg use_gps)"/>
 
   <include file="$(find liorf)/launch/include/module_loam.launch">
     <arg name="project" value="$(arg project)"/>

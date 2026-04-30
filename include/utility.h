@@ -86,6 +86,7 @@ public:
     string mapFrame;
 
     // GPS Settings
+    bool useGPS;
     bool useImuHeadingInitialization;
     bool useGpsElevation;
     float gpsCovThreshold;
@@ -113,6 +114,13 @@ public:
     float imuGyrBiasN;
     float imuGravity;
     float imuRPYWeight;
+    float imuIntegrationSigma;
+    float imuInitialPositionSigma;
+    float imuInitialRollPitchSigma;
+    float imuInitialYawSigma;
+    float imuInitialVelocitySigma;
+    float imuInitialAccBiasSigma;
+    float imuInitialGyrBiasSigma;
     vector<double> extRotV;
     vector<double> extRPYV;
     vector<double> extTransV;
@@ -167,6 +175,7 @@ public:
         nh.param<std::string>("liorf/odometryFrame", odometryFrame, "odom");
         nh.param<std::string>("liorf/mapFrame", mapFrame, "map");
 
+        nh.param<bool>("liorf/useGPS", useGPS, false);
         nh.param<bool>("liorf/useImuHeadingInitialization", useImuHeadingInitialization, false);
         nh.param<bool>("liorf/useGpsElevation", useGpsElevation, false);
         nh.param<float>("liorf/gpsCovThreshold", gpsCovThreshold, 2.0);
@@ -216,6 +225,13 @@ public:
         nh.param<float>("liorf/imuGyrBiasN", imuGyrBiasN, 0.00003);
         nh.param<float>("liorf/imuGravity", imuGravity, 9.80511);
         nh.param<float>("liorf/imuRPYWeight", imuRPYWeight, 0.01);
+        nh.param<float>("liorf/imuIntegrationSigma", imuIntegrationSigma, 1e-4);
+        nh.param<float>("liorf/imuInitialPositionSigma", imuInitialPositionSigma, 1e-2);
+        nh.param<float>("liorf/imuInitialRollPitchSigma", imuInitialRollPitchSigma, 1e-2);
+        nh.param<float>("liorf/imuInitialYawSigma", imuInitialYawSigma, 1e-2);
+        nh.param<float>("liorf/imuInitialVelocitySigma", imuInitialVelocitySigma, 1e4);
+        nh.param<float>("liorf/imuInitialAccBiasSigma", imuInitialAccBiasSigma, 1e-3);
+        nh.param<float>("liorf/imuInitialGyrBiasSigma", imuInitialGyrBiasSigma, 1e-3);
         nh.param<vector<double>>("liorf/extrinsicRot", extRotV, vector<double>());
         nh.param<vector<double>>("liorf/extrinsicRPY", extRPYV, vector<double>());
         nh.param<vector<double>>("liorf/extrinsicTrans", extTransV, vector<double>());

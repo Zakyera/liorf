@@ -231,6 +231,7 @@ public:
     std::string rerunHost = "auto";
     float rerunLocalMapLeafSize = 1.0f;
     size_t rerunLocalMapMaxPoints = 10000u;
+    bool rerunFactorGraphEnable = true;
     std::unique_ptr<aria::viz::VisualizerRerun> rerunVisualizer;
 
     enum class BeliefMatchFailureReason {
@@ -569,6 +570,28 @@ public:
             }
         }
         return sym;
+    }
+
+    static Eigen::Matrix3d sanitizeTranslationCovariance(const Eigen::MatrixXd& poseCovariance)
+    {
+        Eigen::Matrix3d covariance = Eigen::Matrix3d::Identity() * 1e-3;
+        if (poseCovariance.rows() >= 6 && poseCovariance.cols() >= 6) {
+            covariance = poseCovariance.block<3, 3>(3, 3);
+        }
+
+        covariance = 0.5 * (covariance + covariance.transpose());
+        if (!covariance.allFinite()) {
+            return Eigen::Matrix3d::Identity() * 1e-3;
+        }
+
+        Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> eig(covariance);
+        if (eig.info() != Eigen::Success) {
+            return Eigen::Matrix3d::Identity() * 1e-3;
+        }
+
+        const Eigen::Vector3d eigenvalues =
+            eig.eigenvalues().array().max(1e-9).matrix();
+        return eig.eigenvectors() * eigenvalues.asDiagonal() * eig.eigenvectors().transpose();
     }
 
     struct L2KOutgoingCovAuditResult
@@ -1558,6 +1581,11 @@ public:
 
     mapOptimization()
     {
+        CHECK(!useGPS,
+              "LiORF GPS factors are not supported with the tight initial "
+              "pose prior used for CBSMS uncertainty visualization. Disable "
+              "/liorf/useGPS or restore a GPS-compatible initial prior.");
+
         std::string cbsAgentIdStr;
         nh.param<std::string>("liorf/cbsAgentId", cbsAgentIdStr, robot_id);
         selfAgentId = resolveAgentId(cbsAgentIdStr);
@@ -1614,6 +1642,9 @@ public:
         nh.param<int>("liorf/rerunLocalMapMaxPoints",
                       rerunLocalMapMaxPointsParam,
                       10000);
+        nh.param<bool>("liorf/rerunFactorGraphEnable",
+                       rerunFactorGraphEnable,
+                       true);
         rerunLocalMapLeafSize = static_cast<float>(
             std::max(0.0, rerunLocalMapLeafSizeParam));
         rerunLocalMapMaxPoints =
@@ -1679,7 +1710,9 @@ public:
         pubPath                     = nh.advertise<nav_msgs::Path>("liorf/mapping/path", 1);
 
         subCloud = nh.subscribe<liorf::cloud_info>("liorf/deskew/cloud_info", 1, &mapOptimization::laserCloudInfoHandler, this, ros::TransportHints().tcpNoDelay());
-        subGPS   = nh.subscribe<sensor_msgs::NavSatFix> (gpsTopic, 200, &mapOptimization::gpsHandler, this, ros::TransportHints().tcpNoDelay());
+        if (useGPS) {
+            subGPS = nh.subscribe<sensor_msgs::NavSatFix>(gpsTopic, 200, &mapOptimization::gpsHandler, this, ros::TransportHints().tcpNoDelay());
+        }
         subLoop  = nh.subscribe<std_msgs::Float64MultiArray>("lio_loop/loop_closure_detection", 1, &mapOptimization::loopInfoHandler, this, ros::TransportHints().tcpNoDelay());
         if (cbsBeliefBridgeEnable) {
             subPoseBeliefsIn = nh.subscribe<liorf::pose_belief_array>(cbsBeliefInTopic, 50, &mapOptimization::poseBeliefInHandler, this, ros::TransportHints().tcpNoDelay());
@@ -1802,6 +1835,9 @@ public:
 
     void gpsHandler(const sensor_msgs::NavSatFixConstPtr& gpsMsg)
     {
+        if (!useGPS)
+            return;
+
         if (gpsMsg->status.status != 0)
             return;
 
@@ -1898,6 +1934,17 @@ public:
         rerunVisualizer->setTimeNSec(timeLaserInfoStamp.toNSec());
         rerunVisualizer->drawTf(
             "liorf/lidar_link", pclPointTogtsamPose3(thisPose6D), 0.75f);
+        const Eigen::Matrix3d currentPoseCovariance =
+            sanitizeTranslationCovariance(poseCovariance);
+        rerunVisualizer->drawUncertainty(
+            "liorf/current_pose/uncertainty",
+            pclPointTogtsamPose3(thisPose6D),
+            currentPoseCovariance,
+            Eigen::Vector4f(255.f, 160.f, 0.f, 160.f),
+            1.25f);
+        rerunVisualizer->drawScalar(
+            "liorf/current_pose/liorf_uncertainty_frobenius_norm",
+            currentPoseCovariance.norm());
 
         const auto trajectory = toRerunPoints(*cloudKeyPoses3D, 5000u);
         if (!trajectory.empty()) {
@@ -1906,6 +1953,22 @@ public:
                 trajectory,
                 Eigen::Vector4f(255.f, 160.f, 0.f, 255.f),
                 3.f);
+        }
+
+        if (rerunFactorGraphEnable && bpsam && isamCurrentEstimate.size() > 0u) {
+            const auto& factorGraph = bpsam->getFactorsUnsafe();
+            if (factorGraph.size() > 0u) {
+                rerunVisualizer->drawFactors(
+                    "liorf/factor_graph",
+                    factorGraph,
+                    isamCurrentEstimate,
+                    Eigen::Vector4f(255.f, 160.f, 0.f, 180.f),
+                    0.75f,
+                    false,
+                    true);
+                rerunVisualizer->drawScalar("liorf/factor_graph/factors_total",
+                                            factorGraph.size());
+            }
         }
 
         if (laserCloudSurfFromMapDS && !laserCloudSurfFromMapDS->empty()) {
@@ -2970,7 +3033,7 @@ public:
 
         if (localPoseIndex == 0)
         {
-            noiseModel::Diagonal::shared_ptr priorNoise = noiseModel::Diagonal::Variances((Vector(6) << 1e-2, 1e-2, M_PI*M_PI, 1e8, 1e8, 1e8).finished()); // rad*rad, meter*meter
+            noiseModel::Diagonal::shared_ptr priorNoise = noiseModel::Diagonal::Variances((Vector(6) << 1e-2, 1e-2, M_PI*M_PI, 1e-10, 1e-10, 1e-10).finished()); // rad*rad, meter*meter
             gtSAMgraph.add(PriorFactor<Pose3>(currentKey, poseTo, priorNoise));
             initialEstimate.insert(currentKey, poseTo);
         }else{
@@ -2984,6 +3047,9 @@ public:
 
     void addGPSFactor()
     {
+        if (!useGPS)
+            return;
+
         if (gpsQueue.empty())
             return;
 
