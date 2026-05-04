@@ -5,6 +5,12 @@
   <arg name="cbs_belief_reject_first_message" default="true"/>
   <arg name="cbs_enable_soft_reset" default="true"/>
   <arg name="cbs_use_raw_previous_belief_gate" default="false"/>
+  <arg name="cbs_use_temporary_cbs_prior_factors" default="false"/>
+  <arg name="cbs_use_temporary_cbs_linear_priors" default="true"/>
+  <arg name="cbs_temporary_linear_already_applied_gate_enable" default="true"/>
+  <arg name="cbs_temporary_linear_already_applied_metric_threshold" default="0.01"/>
+  <arg name="cbs_temporary_linear_already_applied_dmu_threshold" default="0.001"/>
+  <arg name="cbs_temporary_linear_already_applied_cov_rel_threshold" default="0.001"/>
   <arg name="cbs_d_reset" default="0.1"/>
   <arg name="cbs_k2l_prior_factor_covariance_scale" default="1.0"/>
   <arg name="cbs_belief_bridge_enable" default="true"/>
@@ -15,6 +21,7 @@
   <arg name="cbs_l2k_cov_audit_query_anchor_variance" default="1000000.0"/>
   <arg name="cbs_l2k_outgoing_covariance_mode" default="A_as_is_local_anchored"/>
   <arg name="cbs_l2k_outgoing_covariance_scale" default="1.0"/>
+  <arg name="cbs_conjugate_body_frame_conversion" default="true"/>
   <arg name="use_rviz" default="false"/>
   <arg name="rerun_visualizer_enable" default="true"/>
   <arg name="rerun_recording_id" default=""/>
@@ -34,6 +41,18 @@
          value="$(arg cbs_enable_soft_reset)"/>
   <param name="/liorf/cbsUseRawPreviousBeliefGate"
          value="$(arg cbs_use_raw_previous_belief_gate)"/>
+  <param name="/liorf/cbsUseTemporaryCbsPriorFactors"
+         value="$(arg cbs_use_temporary_cbs_prior_factors)"/>
+  <param name="/liorf/cbsUseTemporaryCbsLinearPriors"
+         value="$(arg cbs_use_temporary_cbs_linear_priors)"/>
+  <param name="/liorf/cbsTemporaryLinearAlreadyAppliedGateEnable"
+         value="$(arg cbs_temporary_linear_already_applied_gate_enable)"/>
+  <param name="/liorf/cbsTemporaryLinearAlreadyAppliedMetricThreshold"
+         value="$(arg cbs_temporary_linear_already_applied_metric_threshold)"/>
+  <param name="/liorf/cbsTemporaryLinearAlreadyAppliedDmuThreshold"
+         value="$(arg cbs_temporary_linear_already_applied_dmu_threshold)"/>
+  <param name="/liorf/cbsTemporaryLinearAlreadyAppliedCovRelThreshold"
+         value="$(arg cbs_temporary_linear_already_applied_cov_rel_threshold)"/>
   <param name="/liorf/cbsDReset" value="$(arg cbs_d_reset)"/>
   <param name="/liorf/cbsK2LPriorFactorCovarianceScale"
          value="$(arg cbs_k2l_prior_factor_covariance_scale)"/>
@@ -53,6 +72,8 @@
          value="$(arg cbs_l2k_outgoing_covariance_mode)"/>
   <param name="/liorf/cbsL2KOutgoingCovarianceScale"
          value="$(arg cbs_l2k_outgoing_covariance_scale)"/>
+  <param name="/liorf/cbsConjugateBodyFrameConversion"
+         value="$(arg cbs_conjugate_body_frame_conversion)"/>
   <param name="/liorf/rerunVisualizerEnable"
          value="$(arg rerun_visualizer_enable)"/>
   <param name="/liorf/rerunRecordingId" value="$(arg rerun_recording_id)"/>

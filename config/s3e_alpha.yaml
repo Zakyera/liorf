@@ -71,6 +71,7 @@ liorf:
   cbsBeliefSimilarityThreshold: 0.01
   cbsBeliefBridgeEnable: true
   cbsExternalExchangeInBodyFrame: true
+  cbsConjugateBodyFrameConversion: true
   cbsBeliefExchangeWindowSize: 30
   cbsBeliefMaxRootSize: 60
   cbsBeliefTimestampToleranceSec: 0.12

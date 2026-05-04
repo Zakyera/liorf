@@ -216,6 +216,12 @@ public:
     bool cbsBeliefRejectFirstMessage = true;
     bool cbsEnableSoftReset = true;
     bool cbsUseRawPreviousBeliefGate = false;
+    bool cbsUseTemporaryCbsPriorFactors = false;
+    bool cbsUseTemporaryCbsLinearPriors = true;
+    bool cbsTemporaryLinearAlreadyAppliedGateEnable = true;
+    double cbsTemporaryLinearAlreadyAppliedMetricThreshold = 0.01;
+    double cbsTemporaryLinearAlreadyAppliedDmuThreshold = 1e-3;
+    double cbsTemporaryLinearAlreadyAppliedCovRelThreshold = 1e-3;
     bool cbsBeliefBridgeEnable = true;
     std::string cbsBeliefInTopic = "liorf/cbs/belief_in";
     std::string cbsBeliefOutTopic = "liorf/cbs/belief_out";
@@ -264,6 +270,7 @@ public:
     std::unordered_set<size_t> cbsL2KCovAuditLoggedPoseIndices;
     std::atomic<size_t> cbsL2KCovAuditSampleCounter{0u};
     bool cbsExternalExchangeInBodyFrame = true;
+    bool cbsConjugateBodyFrameConversion = true;
     gtsam::Pose3 cbsLidarPoseBody = gtsam::Pose3();
     gtsam::Pose3 cbsBodyPoseLidar = gtsam::Pose3();
     gtsam::Matrix6 cbsAdjointLidarPoseBody = gtsam::Matrix6::Identity();
@@ -978,12 +985,20 @@ public:
             return;
         }
 
-        const gtsam::Pose3 worldPoseBody = gtsam::Pose3::Expmap(beliefArrayToVector6(belief->mu));
-        const gtsam::Pose3 worldPoseLidar = worldPoseBody.compose(cbsBodyPoseLidar);
+        const gtsam::Pose3 worldPoseBody =
+            gtsam::Pose3::Expmap(beliefArrayToVector6(belief->mu));
+        const gtsam::Pose3 worldPoseLidar =
+            cbsConjugateBodyFrameConversion
+                ? cbsLidarPoseBody.compose(worldPoseBody).compose(cbsBodyPoseLidar)
+                : worldPoseBody.compose(cbsBodyPoseLidar);
         const gtsam::Matrix6 covarianceBody = sanitizeBeliefCovariance(beliefArrayToMatrix6(belief->covariance));
+        const gtsam::Matrix6& exchangeToLidarAdjoint =
+            cbsConjugateBodyFrameConversion
+                ? cbsAdjointLidarPoseBody
+                : cbsAdjointBodyPoseLidar;
         const gtsam::Matrix6 covarianceLidar =
-            sanitizeBeliefCovariance(cbsAdjointBodyPoseLidar * covarianceBody *
-                                     cbsAdjointBodyPoseLidar.transpose());
+            sanitizeBeliefCovariance(exchangeToLidarAdjoint * covarianceBody *
+                                     exchangeToLidarAdjoint.transpose());
         beliefVector6ToArray(gtsam::Pose3::Logmap(worldPoseLidar), &belief->mu);
         beliefMatrix6ToArray(covarianceLidar, &belief->covariance);
     }
@@ -994,12 +1009,20 @@ public:
             return;
         }
 
-        const gtsam::Pose3 worldPoseLidar = gtsam::Pose3::Expmap(beliefArrayToVector6(belief->mu));
-        const gtsam::Pose3 worldPoseBody = worldPoseLidar.compose(cbsLidarPoseBody);
+        const gtsam::Pose3 worldPoseLidar =
+            gtsam::Pose3::Expmap(beliefArrayToVector6(belief->mu));
+        const gtsam::Pose3 worldPoseBody =
+            cbsConjugateBodyFrameConversion
+                ? cbsBodyPoseLidar.compose(worldPoseLidar).compose(cbsLidarPoseBody)
+                : worldPoseLidar.compose(cbsLidarPoseBody);
         const gtsam::Matrix6 covarianceLidar = sanitizeBeliefCovariance(beliefArrayToMatrix6(belief->covariance));
+        const gtsam::Matrix6& lidarToExchangeAdjoint =
+            cbsConjugateBodyFrameConversion
+                ? cbsAdjointBodyPoseLidar
+                : cbsAdjointLidarPoseBody;
         const gtsam::Matrix6 covarianceBody =
-            sanitizeBeliefCovariance(cbsAdjointLidarPoseBody * covarianceLidar *
-                                     cbsAdjointLidarPoseBody.transpose());
+            sanitizeBeliefCovariance(lidarToExchangeAdjoint * covarianceLidar *
+                                     lidarToExchangeAdjoint.transpose());
         beliefVector6ToArray(gtsam::Pose3::Logmap(worldPoseBody), &belief->mu);
         beliefMatrix6ToArray(covarianceBody, &belief->covariance);
     }
@@ -1049,11 +1072,20 @@ public:
             std::string transformLabel = "identity_exchange_equals_lidar";
             std::string receiverExpectedFrame = "world_to_lidar_pose";
             if (cbsExternalExchangeInBodyFrame) {
-                reconstructedPose = senderPoseRaw.compose(cbsBodyPoseLidar);
+                reconstructedPose =
+                    cbsConjugateBodyFrameConversion
+                        ? cbsLidarPoseBody.compose(senderPoseRaw).compose(cbsBodyPoseLidar)
+                        : senderPoseRaw.compose(cbsBodyPoseLidar);
+                const gtsam::Matrix6& exchangeToLidarAdjoint =
+                    cbsConjugateBodyFrameConversion
+                        ? cbsAdjointLidarPoseBody
+                        : cbsAdjointBodyPoseLidar;
                 reconstructedCov =
-                    sanitizeBeliefCovariance(cbsAdjointBodyPoseLidar * senderCovRaw *
-                                             cbsAdjointBodyPoseLidar.transpose());
-                transformLabel = "body_to_lidar_compose_adjoint";
+                    sanitizeBeliefCovariance(exchangeToLidarAdjoint * senderCovRaw *
+                                             exchangeToLidarAdjoint.transpose());
+                transformLabel = cbsConjugateBodyFrameConversion
+                                     ? "body_to_lidar_conjugate_adjoint"
+                                     : "body_to_lidar_compose_adjoint";
                 receiverExpectedFrame = "world_to_body_pose";
             }
             const double meanErrorNorm = poseErrorNorm(convertedPose, reconstructedPose);
@@ -1064,10 +1096,17 @@ public:
             gtsam::Pose3 roundtripPose = convertedPose;
             gtsam::Matrix6 roundtripCov = convertedCov;
             if (cbsExternalExchangeInBodyFrame) {
-                roundtripPose = convertedPose.compose(cbsLidarPoseBody);
+                roundtripPose =
+                    cbsConjugateBodyFrameConversion
+                        ? cbsBodyPoseLidar.compose(convertedPose).compose(cbsLidarPoseBody)
+                        : convertedPose.compose(cbsLidarPoseBody);
+                const gtsam::Matrix6& lidarToExchangeAdjoint =
+                    cbsConjugateBodyFrameConversion
+                        ? cbsAdjointBodyPoseLidar
+                        : cbsAdjointLidarPoseBody;
                 roundtripCov =
-                    sanitizeBeliefCovariance(cbsAdjointLidarPoseBody * convertedCov *
-                                             cbsAdjointLidarPoseBody.transpose());
+                    sanitizeBeliefCovariance(lidarToExchangeAdjoint * convertedCov *
+                                             lidarToExchangeAdjoint.transpose());
             }
             const double meanRoundtripError = poseErrorNorm(roundtripPose, senderPoseRaw);
             const double covRoundtripError = (roundtripCov - senderCovRaw).norm();
@@ -1209,6 +1248,8 @@ public:
             switch (status) {
                 case cbs::BPSAM::AddBeliefStatus::Accepted:
                     return std::string("bpsam_added");
+                case cbs::BPSAM::AddBeliefStatus::AcceptedButSkippedAlreadyApplied:
+                    return std::string("bpsam_accepted_but_skipped_already_applied");
                 case cbs::BPSAM::AddBeliefStatus::RejectedFirstMessage:
                     return std::string("bpsam_rejected_first_message");
                 case cbs::BPSAM::AddBeliefStatus::RejectedUpdateStatus:
@@ -1494,6 +1535,8 @@ public:
             << ",soft_reset=" << (cbsEnableSoftReset ? "true" : "false")
             << ",raw_previous_gate="
             << (cbsUseRawPreviousBeliefGate ? "true" : "false")
+            << ",temporary_linear_priors="
+            << (cbsUseTemporaryCbsLinearPriors ? "true" : "false")
             << ",root=" << (bpsam ? bpsam->rootFrontalKeyCount() : 0u)
             << ",max_root=" << cbsBeliefMaxRootSize
             << ",active_priors="
@@ -1579,6 +1622,9 @@ public:
         }
 
         KeySet requestKeys = activeBeliefWindowKeys();
+        if (requestKeys.empty()) {
+            return;
+        }
 
         bpsam->setMarginalizationGraph(cbs::BPSAM::MarginalizationType::LOCAL);
         cbsMarginalizationGraphFactorCountPerRerunFrame.store(
@@ -1812,6 +1858,24 @@ public:
         nh.param<bool>("liorf/cbsBeliefRejectFirstMessage", cbsBeliefRejectFirstMessage, true);
         nh.param<bool>("liorf/cbsEnableSoftReset", cbsEnableSoftReset, true);
         nh.param<bool>("liorf/cbsUseRawPreviousBeliefGate", cbsUseRawPreviousBeliefGate, false);
+        nh.param<bool>("liorf/cbsUseTemporaryCbsPriorFactors",
+                       cbsUseTemporaryCbsPriorFactors,
+                       false);
+        nh.param<bool>("liorf/cbsUseTemporaryCbsLinearPriors",
+                       cbsUseTemporaryCbsLinearPriors,
+                       true);
+        nh.param<bool>("liorf/cbsTemporaryLinearAlreadyAppliedGateEnable",
+                       cbsTemporaryLinearAlreadyAppliedGateEnable,
+                       true);
+        nh.param<double>("liorf/cbsTemporaryLinearAlreadyAppliedMetricThreshold",
+                         cbsTemporaryLinearAlreadyAppliedMetricThreshold,
+                         0.01);
+        nh.param<double>("liorf/cbsTemporaryLinearAlreadyAppliedDmuThreshold",
+                         cbsTemporaryLinearAlreadyAppliedDmuThreshold,
+                         1e-3);
+        nh.param<double>("liorf/cbsTemporaryLinearAlreadyAppliedCovRelThreshold",
+                         cbsTemporaryLinearAlreadyAppliedCovRelThreshold,
+                         1e-3);
         nh.param<double>("liorf/cbsDReset", cbsDReset, 0.1);
         nh.param<double>("liorf/cbsK2LPriorFactorCovarianceScale",
                          cbsK2LPriorFactorCovarianceScale,
@@ -1820,6 +1884,9 @@ public:
         nh.param<std::string>("liorf/cbsBeliefInTopic", cbsBeliefInTopic, "liorf/cbs/belief_in");
         nh.param<std::string>("liorf/cbsBeliefOutTopic", cbsBeliefOutTopic, "liorf/cbs/belief_out");
         nh.param<bool>("liorf/cbsExternalExchangeInBodyFrame", cbsExternalExchangeInBodyFrame, true);
+        nh.param<bool>("liorf/cbsConjugateBodyFrameConversion",
+                       cbsConjugateBodyFrameConversion,
+                       true);
         nh.param<bool>("liorf/cbsL2KCovAuditEnable", cbsL2KCovAuditEnable, false);
         int cbsL2KCovAuditMaxSamplesInt = 20;
         nh.param<int>("liorf/cbsL2KCovAuditMaxSamples", cbsL2KCovAuditMaxSamplesInt, 20);
@@ -1896,6 +1963,9 @@ public:
             cbsAdjointLidarPoseBody = cbsLidarPoseBody.AdjointMap();
             cbsAdjointBodyPoseLidar = cbsBodyPoseLidar.AdjointMap();
             ROS_INFO_STREAM("LiORF CBS exchange semantic: world->body (imu). "
+                            << "conjugate_origin="
+                            << (cbsConjugateBodyFrameConversion ? "true" : "false")
+                            << ". "
                             << "Using lidar->body extrinsic from config. t_l_b=["
                             << extTrans.x() << ", " << extTrans.y() << ", " << extTrans.z() << "]");
         } else {
@@ -1918,6 +1988,18 @@ public:
         parameters.gbp_update_params.enable_soft_reset = cbsEnableSoftReset;
         parameters.gbp_update_params.d_reset = cbsDReset;
         parameters.use_raw_previous_belief_gate = cbsUseRawPreviousBeliefGate;
+        parameters.use_temporary_cbs_prior_factors =
+            cbsUseTemporaryCbsPriorFactors;
+        parameters.use_temporary_cbs_linear_priors =
+            cbsUseTemporaryCbsLinearPriors;
+        parameters.temporary_linear_already_applied_gate_enable =
+            cbsTemporaryLinearAlreadyAppliedGateEnable;
+        parameters.temporary_linear_already_applied_metric_threshold =
+            cbsTemporaryLinearAlreadyAppliedMetricThreshold;
+        parameters.temporary_linear_already_applied_dmu_threshold =
+            cbsTemporaryLinearAlreadyAppliedDmuThreshold;
+        parameters.temporary_linear_already_applied_cov_rel_threshold =
+            cbsTemporaryLinearAlreadyAppliedCovRelThreshold;
         if (std::isfinite(cbsK2LPriorFactorCovarianceScale) &&
             cbsK2LPriorFactorCovarianceScale > 0.0) {
             parameters.prior_factor_covariance_scale_by_source[static_cast<cbs::AgentId>('k')] =
@@ -1935,6 +2017,10 @@ public:
                         << (cbsEnableSoftReset ? "ON" : "OFF"));
         ROS_INFO_STREAM("LiORF BPSAM raw-previous receiver gate: "
                         << (cbsUseRawPreviousBeliefGate ? "ON" : "OFF"));
+        ROS_INFO_STREAM("LiORF BPSAM temporary CBS prior factors: "
+                        << (cbsUseTemporaryCbsPriorFactors ? "ON" : "OFF"));
+        ROS_INFO_STREAM("LiORF BPSAM temporary CBS linear priors: "
+                        << (cbsUseTemporaryCbsLinearPriors ? "ON" : "OFF"));
         ROS_INFO_STREAM("LiORF BPSAM d_reset: " << cbsDReset);
         ROS_INFO_STREAM("LiORF K2L final prior covariance scale: "
                         << cbsK2LPriorFactorCovarianceScale);
