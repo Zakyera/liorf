@@ -10,7 +10,6 @@ find_package(catkin REQUIRED COMPONENTS
   tf
   roscpp
   rospy
-  cv_bridge
   # pcl library
   pcl_conversions
   # msgs
@@ -24,7 +23,7 @@ find_package(catkin REQUIRED COMPONENTS
 
 find_package(OpenMP REQUIRED)
 find_package(PCL REQUIRED QUIET)
-find_package(OpenCV REQUIRED QUIET)
+find_package(opencv3_catkin REQUIRED QUIET)
 find_package(GTSAM REQUIRED QUIET)
 find_package(Eigen3 REQUIRED)
 # cbsConfig.cmake expects GTSAM_UNSTABLE; derive it from GTSAM_DIR when needed.
@@ -75,13 +74,12 @@ catkin_package(
   visualization_msgs
 )
 
-# include directories
 include_directories(
   lib
 	include
 	${catkin_INCLUDE_DIRS}
 	${PCL_INCLUDE_DIRS}
-  ${OpenCV_INCLUDE_DIRS}
+  ${opencv3_catkin_INCLUDE_DIRS}
 	${GTSAM_INCLUDE_DIR}
 )
 
@@ -90,7 +88,7 @@ link_directories(
   lib
 	include
 	${PCL_LIBRARY_DIRS}
-  ${OpenCV_LIBRARY_DIRS}
+  ${opencv3_catkin_LIBRARY_DIRS}
   ${GTSAM_LIBRARY_DIRS}
 )
 
@@ -103,17 +101,17 @@ file(GLOB common_lib "lib/*.cpp")
 # Range Image Projection
 add_executable(${PROJECT_NAME}_imageProjection src/imageProjection.cpp ${common_lib})
 add_dependencies(${PROJECT_NAME}_imageProjection ${catkin_EXPORTED_TARGETS} ${PROJECT_NAME}_generate_messages_cpp)
-target_link_libraries(${PROJECT_NAME}_imageProjection ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${OpenCV_LIBRARIES})
+target_link_libraries(${PROJECT_NAME}_imageProjection ${opencv3_catkin_LIBRARIES} ${catkin_LIBRARIES} ${PCL_LIBRARIES})
 
 # Mapping Optimization
 add_executable(${PROJECT_NAME}_mapOptmization src/mapOptmization.cpp ${common_lib} include/Scancontext.cpp)
 add_dependencies(${PROJECT_NAME}_mapOptmization ${catkin_EXPORTED_TARGETS} ${PROJECT_NAME}_generate_messages_cpp)
 target_compile_options(${PROJECT_NAME}_mapOptmization PRIVATE ${OpenMP_CXX_FLAGS})
-target_link_libraries(${PROJECT_NAME}_mapOptmization Boost::timer ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${OpenCV_LIBRARIES} ${OpenMP_CXX_FLAGS} ${GeographicLib_LIBRARIES} gtsam cbs aria_viz)
+target_link_libraries(${PROJECT_NAME}_mapOptmization Boost::timer ${opencv3_catkin_LIBRARIES} ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${OpenMP_CXX_FLAGS} ${GeographicLib_LIBRARIES} gtsam cbs aria_viz)
 
 # IMU Preintegration
 add_executable(${PROJECT_NAME}_imuPreintegration src/imuPreintegration.cpp ${common_lib})
-target_link_libraries(${PROJECT_NAME}_imuPreintegration Boost::timer ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${OpenCV_LIBRARIES} gtsam)
+target_link_libraries(${PROJECT_NAME}_imuPreintegration Boost::timer ${opencv3_catkin_LIBRARIES} ${catkin_LIBRARIES} ${PCL_LIBRARIES} gtsam)
 
 # BPSAM backend smoke test
 add_executable(${PROJECT_NAME}_bpsam_smoke src/bpsamSmoke.cpp)

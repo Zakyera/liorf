@@ -215,6 +215,7 @@ public:
     double beliefTimestampToleranceSec = 0.05;
     bool cbsBeliefRejectFirstMessage = true;
     bool cbsEnableSoftReset = true;
+    bool cbsUseRawPreviousBeliefGate = false;
     bool cbsBeliefBridgeEnable = true;
     std::string cbsBeliefInTopic = "liorf/cbs/belief_in";
     std::string cbsBeliefOutTopic = "liorf/cbs/belief_out";
@@ -259,6 +260,7 @@ public:
     std::string cbsL2KOutgoingCovModeLabel = "A_as_is_local_anchored";
     std::string cbsL2KOutgoingCovSourcePath = "LiORF::bpsam_getBeliefs_local_marginalization";
     std::string cbsL2KOutgoingCovAnchorMode = "local_anchored_perm_init_prior";
+    double cbsL2KOutgoingCovarianceScale = 1.0;
     std::unordered_set<size_t> cbsL2KCovAuditLoggedPoseIndices;
     std::atomic<size_t> cbsL2KCovAuditSampleCounter{0u};
     bool cbsExternalExchangeInBodyFrame = true;
@@ -1490,6 +1492,8 @@ public:
             << ",shape=" << numRejectedShape
             << ",exception=" << numRejectedException
             << ",soft_reset=" << (cbsEnableSoftReset ? "true" : "false")
+            << ",raw_previous_gate="
+            << (cbsUseRawPreviousBeliefGate ? "true" : "false")
             << ",root=" << (bpsam ? bpsam->rootFrontalKeyCount() : 0u)
             << ",max_root=" << cbsBeliefMaxRootSize
             << ",active_priors="
@@ -1581,7 +1585,8 @@ public:
             bpsam->marginalizationGraphFactorCount(),
             std::memory_order_relaxed);
         const auto cbsGetBeliefsStart = std::chrono::steady_clock::now();
-        auto outgoing = bpsam->getBeliefs(requestKeys, true);
+        auto outgoing =
+            bpsam->getBeliefs(requestKeys, static_cast<cbs::AgentId>('k'), false);
         atomicAddRelaxed(&cbsBeliefGenerationTimeMsPerRerunFrame,
                          elapsedMs(cbsGetBeliefsStart));
         const auto [selectedSourcePath, selectedAnchorMode] = covModeSemantics(cbsL2KOutgoingCovMode);
@@ -1627,6 +1632,14 @@ public:
                     } else {
                         outgoingCovStatus = "fallback_as_is_" + modeStatus;
                     }
+                }
+                if (std::isfinite(cbsL2KOutgoingCovarianceScale) &&
+                    cbsL2KOutgoingCovarianceScale > 0.0 &&
+                    std::abs(cbsL2KOutgoingCovarianceScale - 1.0) > 1e-12) {
+                    outgoingCovariance =
+                        sanitizeBeliefCovariance(cbsL2KOutgoingCovarianceScale *
+                                                 outgoingCovariance);
+                    outgoingCovStatus += "_scaled_" + std::to_string(cbsL2KOutgoingCovarianceScale);
                 }
                 for (size_t r = 0; r < 6; ++r) {
                     for (size_t c = 0; c < 6; ++c) {
@@ -1787,6 +1800,8 @@ public:
 
         bool cbsEnableBeliefDcs = false;
         double cbsBeliefSimilarityThreshold = 0.01;
+        double cbsDReset = 0.1;
+        double cbsK2LPriorFactorCovarianceScale = 1.0;
         int cbsBeliefWindow = 30;
         int cbsBeliefMaxRootSizeParam = 60;
         nh.param<bool>("liorf/cbsEnableBeliefDcs", cbsEnableBeliefDcs, false);
@@ -1796,6 +1811,11 @@ public:
         nh.param<double>("liorf/cbsBeliefTimestampToleranceSec", beliefTimestampToleranceSec, 0.05);
         nh.param<bool>("liorf/cbsBeliefRejectFirstMessage", cbsBeliefRejectFirstMessage, true);
         nh.param<bool>("liorf/cbsEnableSoftReset", cbsEnableSoftReset, true);
+        nh.param<bool>("liorf/cbsUseRawPreviousBeliefGate", cbsUseRawPreviousBeliefGate, false);
+        nh.param<double>("liorf/cbsDReset", cbsDReset, 0.1);
+        nh.param<double>("liorf/cbsK2LPriorFactorCovarianceScale",
+                         cbsK2LPriorFactorCovarianceScale,
+                         1.0);
         nh.param<bool>("liorf/cbsBeliefBridgeEnable", cbsBeliefBridgeEnable, true);
         nh.param<std::string>("liorf/cbsBeliefInTopic", cbsBeliefInTopic, "liorf/cbs/belief_in");
         nh.param<std::string>("liorf/cbsBeliefOutTopic", cbsBeliefOutTopic, "liorf/cbs/belief_out");
@@ -1813,6 +1833,16 @@ public:
         nh.param<std::string>("liorf/cbsL2KOutgoingCovarianceMode",
                               cbsL2KOutgoingCovModeToken,
                               "A_as_is_local_anchored");
+        nh.param<double>("liorf/cbsL2KOutgoingCovarianceScale",
+                         cbsL2KOutgoingCovarianceScale,
+                         1.0);
+        if (!std::isfinite(cbsL2KOutgoingCovarianceScale) ||
+            cbsL2KOutgoingCovarianceScale <= 0.0) {
+            ROS_WARN_STREAM("Invalid LiORF L2K outgoing covariance scale "
+                            << cbsL2KOutgoingCovarianceScale
+                            << "; falling back to 1.0");
+            cbsL2KOutgoingCovarianceScale = 1.0;
+        }
         cbsL2KOutgoingCovMode = parseCovModeToken(cbsL2KOutgoingCovModeToken);
         cbsL2KOutgoingCovModeLabel = covModeToLabel(cbsL2KOutgoingCovMode);
         const auto [covSourcePath, covAnchorMode] = covModeSemantics(cbsL2KOutgoingCovMode);
@@ -1886,6 +1916,13 @@ public:
         parameters.reject_first_message = cbsBeliefRejectFirstMessage;
         parameters.belief_similarity_threshold = cbsBeliefSimilarityThreshold;
         parameters.gbp_update_params.enable_soft_reset = cbsEnableSoftReset;
+        parameters.gbp_update_params.d_reset = cbsDReset;
+        parameters.use_raw_previous_belief_gate = cbsUseRawPreviousBeliefGate;
+        if (std::isfinite(cbsK2LPriorFactorCovarianceScale) &&
+            cbsK2LPriorFactorCovarianceScale > 0.0) {
+            parameters.prior_factor_covariance_scale_by_source[static_cast<cbs::AgentId>('k')] =
+                cbsK2LPriorFactorCovarianceScale;
+        }
         bpsam.reset(new cbs::BPSAM(parameters));
 
         ROS_INFO_STREAM("LiORF BPSAM backend agent id: '" << static_cast<char>(selfAgentId) << "'");
@@ -1896,6 +1933,11 @@ public:
                         << (cbsBeliefRejectFirstMessage ? "ON" : "OFF"));
         ROS_INFO_STREAM("LiORF BPSAM soft reset: "
                         << (cbsEnableSoftReset ? "ON" : "OFF"));
+        ROS_INFO_STREAM("LiORF BPSAM raw-previous receiver gate: "
+                        << (cbsUseRawPreviousBeliefGate ? "ON" : "OFF"));
+        ROS_INFO_STREAM("LiORF BPSAM d_reset: " << cbsDReset);
+        ROS_INFO_STREAM("LiORF K2L final prior covariance scale: "
+                        << cbsK2LPriorFactorCovarianceScale);
         ROS_INFO_STREAM("LiORF CBS belief window: " << beliefExchangeWindowSize
                         << " poses, max iSAM2 root size="
                         << cbsBeliefMaxRootSize);
@@ -1907,7 +1949,8 @@ public:
         ROS_INFO_STREAM("LiORF L2K outgoing covariance mode: "
                         << cbsL2KOutgoingCovModeLabel
                         << " source_path=" << cbsL2KOutgoingCovSourcePath
-                        << " anchor_mode=" << cbsL2KOutgoingCovAnchorMode);
+                        << " anchor_mode=" << cbsL2KOutgoingCovAnchorMode
+                        << " scale=" << cbsL2KOutgoingCovarianceScale);
 
         pubKeyPoses                 = nh.advertise<sensor_msgs::PointCloud2>("liorf/mapping/trajectory", 1);
         pubLaserCloudSurround       = nh.advertise<sensor_msgs::PointCloud2>("liorf/mapping/map_global", 1);
