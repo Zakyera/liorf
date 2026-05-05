@@ -224,11 +224,20 @@ public:
         double relaxFactor;
     };
 
+    struct RerunExternalOdomEdge
+    {
+        cbs::AgentId sourceAgent;
+        Key fromPoseKey;
+        Key toPoseKey;
+    };
+
     std::mutex mtxBeliefExchange;
+    std::mutex mtxRerunCbsVisualization;
     std::deque<StampedBelief> incomingStampedBeliefs;
     std::deque<StampedOdomBelief> incomingStampedOdomBeliefs;
     std::vector<StampedBelief> outgoingStampedBeliefs;
     std::vector<StampedOdomBelief> outgoingStampedOdomBeliefs;
+    std::vector<RerunExternalOdomEdge> rerunExternalOdomEdges;
     size_t beliefExchangeWindowSize = 30;
     size_t cbsBeliefMaxRootSize = 60;
     double beliefTimestampToleranceSec = 0.05;
@@ -1719,6 +1728,7 @@ public:
         size_t numRejectedInactiveWindow = 0u;
         size_t numRejectedShape = 0u;
         size_t numRejectedException = 0u;
+        std::vector<RerunExternalOdomEdge> acceptedRerunExternalOdomEdges;
 
         for (const auto& incoming : pendingBeliefs) {
             size_t fromLocalIndex = 0u;
@@ -1762,6 +1772,13 @@ public:
             numRejectedShape += addResult.rejected_shape;
             numRejectedException += addResult.rejected_exception;
             for (const auto& detail : addResult.details) {
+                if (detail.status == cbs::BPSAM::AddOdometryBeliefStatus::Accepted) {
+                    acceptedRerunExternalOdomEdges.push_back(
+                        RerunExternalOdomEdge{
+                            detail.source_agent,
+                            detail.from_pose_key,
+                            detail.to_pose_key});
+                }
                 ROS_INFO_STREAM(
                     "CBS_BPSAM_ODOM_ADD_ROW_K2L,"
                     << formatPoseKeyToken(incoming.sourceAgent, incoming.fromPoseIndex) << "->"
@@ -1773,6 +1790,11 @@ public:
                     << detail.conditional_A_frobenius << ","
                     << sanitizeCsvToken(detail.message));
             }
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(mtxRerunCbsVisualization);
+            rerunExternalOdomEdges = std::move(acceptedRerunExternalOdomEdges);
         }
 
         cbsBeliefsIncomingMatchedByTimestampTotal.fetch_add(numMatched, std::memory_order_relaxed);
@@ -2714,17 +2736,64 @@ public:
         if (rerunFactorGraphEnable && bpsam && isamCurrentEstimate.size() > 0u) {
             const auto& factorGraph = bpsam->getFactorsUnsafe();
             if (factorGraph.size() > 0u) {
+                const Eigen::Vector4f localFactorColor(255.f, 160.f, 0.f, 180.f);
+                const Eigen::Vector4f persistentCbsFactorColor(255.f, 60.f, 220.f, 230.f);
+                std::vector<Eigen::Vector4f> factorColors(factorGraph.size(), localFactorColor);
+                size_t persistentCbsFactorCount = 0u;
+                for (size_t i = 0; i < factorGraph.size(); ++i) {
+                    const auto factor = factorGraph.at(i);
+                    if (!factor) {
+                        continue;
+                    }
+                    if (cbs::isPoseBeliefFactor(selfAgentId, factor) ||
+                        cbs::isAnchorBeliefFactor(factor)) {
+                        factorColors[i] = persistentCbsFactorColor;
+                        ++persistentCbsFactorCount;
+                    }
+                }
                 rerunVisualizer->drawFactors(
                     "liorf/factor_graph",
                     factorGraph,
                     isamCurrentEstimate,
-                    Eigen::Vector4f(255.f, 160.f, 0.f, 180.f),
+                    factorColors,
                     0.75f,
                     false,
                     true);
                 rerunVisualizer->drawScalar("liorf/factor_graph/factors_total",
                                             factorGraph.size());
+                rerunVisualizer->drawScalar("liorf/factor_graph/persistent_cbs_factors",
+                                            persistentCbsFactorCount);
             }
+
+            std::vector<RerunExternalOdomEdge> externalOdomEdges;
+            {
+                std::lock_guard<std::mutex> lock(mtxRerunCbsVisualization);
+                externalOdomEdges = rerunExternalOdomEdges;
+            }
+
+            std::vector<std::pair<Point3, Point3>> externalOdomLines;
+            externalOdomLines.reserve(externalOdomEdges.size());
+            std::vector<Eigen::Vector4f> externalOdomColors;
+            externalOdomColors.reserve(externalOdomEdges.size());
+            for (const auto& edge : externalOdomEdges) {
+                if (!isamCurrentEstimate.exists(edge.fromPoseKey) ||
+                    !isamCurrentEstimate.exists(edge.toPoseKey)) {
+                    continue;
+                }
+                const Pose3 fromPose = isamCurrentEstimate.at<Pose3>(edge.fromPoseKey);
+                const Pose3 toPose = isamCurrentEstimate.at<Pose3>(edge.toPoseKey);
+                externalOdomLines.emplace_back(fromPose.translation(), toPose.translation());
+                externalOdomColors.emplace_back(Eigen::Vector4f(0.f, 255.f, 255.f, 255.f));
+            }
+            if (!externalOdomLines.empty()) {
+                rerunVisualizer->drawLines(
+                    "liorf/cbs/external_odom_factors",
+                    externalOdomLines,
+                    externalOdomColors,
+                    2.5f);
+            }
+            rerunVisualizer->drawScalar("liorf/cbs/external_odom_factors/visible",
+                                        externalOdomLines.size());
         }
 
         if (laserCloudSurfFromMapDS && !laserCloudSurfFromMapDS->empty()) {
