@@ -1,0 +1,10 @@
+std_msgs/Header header
+uint8 source_agent
+uint32 from_pose_index
+uint32 to_pose_index
+float64 from_stamp_sec
+float64 to_stamp_sec
+float64[6] relative_mu
+float64[36] covariance
+float64[36] conditional_A
+float64 relax_factor

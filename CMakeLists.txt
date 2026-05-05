@@ -44,6 +44,8 @@ add_message_files(
   cloud_info.msg
   pose_belief.msg
   pose_belief_array.msg
+  pose_odom_belief.msg
+  pose_odom_belief_array.msg
 )
 
 add_service_files(
