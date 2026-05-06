@@ -42,8 +42,6 @@ add_message_files(
   DIRECTORY msg
   FILES
   cloud_info.msg
-  pose_belief.msg
-  pose_belief_array.msg
   pose_odom_belief.msg
   pose_odom_belief_array.msg
 )

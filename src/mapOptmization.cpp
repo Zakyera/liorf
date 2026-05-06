@@ -1,7 +1,5 @@
 #include "utility.h"
 #include "liorf/cloud_info.h"
-#include "liorf/pose_belief.h"
-#include "liorf/pose_belief_array.h"
 #include "liorf/pose_odom_belief.h"
 #include "liorf/pose_odom_belief_array.h"
 #include "liorf/save_map.h"
@@ -195,20 +193,6 @@ public:
     std::unordered_map<Key, size_t> localPoseKeyToIndex;
     std::vector<double> localPoseTimestampsSec;
 
-    struct StampedBelief
-    {
-        cbs::AgentId sourceAgent;
-        size_t poseIndex;
-        double stampSec;
-        uint64_t senderTimestampNs;
-        std::string senderFrameId;
-        std::array<double, 6> mu;
-        std::array<double, 36> covariance;
-        double sentTrace;
-        double receivedTrace;
-        double relaxFactor;
-    };
-
     struct StampedOdomBelief
     {
         cbs::AgentId sourceAgent;
@@ -220,7 +204,6 @@ public:
         std::string senderFrameId;
         std::array<double, 6> relativeMu;
         std::array<double, 36> covariance;
-        std::array<double, 36> conditionalA;
         double relaxFactor;
     };
 
@@ -233,9 +216,7 @@ public:
 
     std::mutex mtxBeliefExchange;
     std::mutex mtxRerunCbsVisualization;
-    std::deque<StampedBelief> incomingStampedBeliefs;
     std::deque<StampedOdomBelief> incomingStampedOdomBeliefs;
-    std::vector<StampedBelief> outgoingStampedBeliefs;
     std::vector<StampedOdomBelief> outgoingStampedOdomBeliefs;
     std::vector<RerunExternalOdomEdge> rerunExternalOdomEdges;
     size_t beliefExchangeWindowSize = 30;
@@ -244,17 +225,12 @@ public:
     bool cbsBeliefRejectFirstMessage = true;
     bool cbsEnableSoftReset = true;
     bool cbsUseRawPreviousBeliefGate = false;
-    bool cbsUseTemporaryCbsPriorFactors = false;
-    bool cbsUseTemporaryCbsLinearPriors = true;
-    std::string cbsBeliefFactorMode = "prior";
-    bool cbsUseSenderConditionalOdomFactors = true;
+    bool cbsUseTemporaryCbsLinearFactors = true;
     bool cbsTemporaryLinearAlreadyAppliedGateEnable = true;
     double cbsTemporaryLinearAlreadyAppliedMetricThreshold = 0.01;
     double cbsTemporaryLinearAlreadyAppliedDmuThreshold = 1e-3;
     double cbsTemporaryLinearAlreadyAppliedCovRelThreshold = 1e-3;
     bool cbsBeliefBridgeEnable = true;
-    std::string cbsBeliefInTopic = "liorf/cbs/belief_in";
-    std::string cbsBeliefOutTopic = "liorf/cbs/belief_out";
     std::string cbsOdomBeliefInTopic = "liorf/cbs/odom_belief_in";
     std::string cbsOdomBeliefOutTopic = "liorf/cbs/odom_belief_out";
     std::atomic<size_t> cbsBeliefsIncomingReceivedTotal{0u};
@@ -774,8 +750,7 @@ public:
                 continue;
             }
             if (factor->keys().size() == 2 &&
-                (cbs::isPoseBeliefFactor(selfAgentId, factor) ||
-                 cbs::isAnchorBeliefFactor(factor))) {
+                cbs::isAnchorBeliefFactor(factor)) {
                 continue;
             }
             bool hasValues = true;
@@ -1011,54 +986,6 @@ public:
         }
     }
 
-    void convertIncomingExchangeBeliefToLidarFrame(StampedBelief* belief) const
-    {
-        if (!belief || !cbsExternalExchangeInBodyFrame) {
-            return;
-        }
-
-        const gtsam::Pose3 worldPoseBody =
-            gtsam::Pose3::Expmap(beliefArrayToVector6(belief->mu));
-        const gtsam::Pose3 worldPoseLidar =
-            cbsConjugateBodyFrameConversion
-                ? cbsLidarPoseBody.compose(worldPoseBody).compose(cbsBodyPoseLidar)
-                : worldPoseBody.compose(cbsBodyPoseLidar);
-        const gtsam::Matrix6 covarianceBody = sanitizeBeliefCovariance(beliefArrayToMatrix6(belief->covariance));
-        const gtsam::Matrix6& exchangeToLidarAdjoint =
-            cbsConjugateBodyFrameConversion
-                ? cbsAdjointLidarPoseBody
-                : cbsAdjointBodyPoseLidar;
-        const gtsam::Matrix6 covarianceLidar =
-            sanitizeBeliefCovariance(exchangeToLidarAdjoint * covarianceBody *
-                                     exchangeToLidarAdjoint.transpose());
-        beliefVector6ToArray(gtsam::Pose3::Logmap(worldPoseLidar), &belief->mu);
-        beliefMatrix6ToArray(covarianceLidar, &belief->covariance);
-    }
-
-    void convertOutgoingLidarBeliefToExchangeFrame(StampedBelief* belief) const
-    {
-        if (!belief || !cbsExternalExchangeInBodyFrame) {
-            return;
-        }
-
-        const gtsam::Pose3 worldPoseLidar =
-            gtsam::Pose3::Expmap(beliefArrayToVector6(belief->mu));
-        const gtsam::Pose3 worldPoseBody =
-            cbsConjugateBodyFrameConversion
-                ? cbsBodyPoseLidar.compose(worldPoseLidar).compose(cbsLidarPoseBody)
-                : worldPoseLidar.compose(cbsLidarPoseBody);
-        const gtsam::Matrix6 covarianceLidar = sanitizeBeliefCovariance(beliefArrayToMatrix6(belief->covariance));
-        const gtsam::Matrix6& lidarToExchangeAdjoint =
-            cbsConjugateBodyFrameConversion
-                ? cbsAdjointBodyPoseLidar
-                : cbsAdjointLidarPoseBody;
-        const gtsam::Matrix6 covarianceBody =
-            sanitizeBeliefCovariance(lidarToExchangeAdjoint * covarianceLidar *
-                                     lidarToExchangeAdjoint.transpose());
-        beliefVector6ToArray(gtsam::Pose3::Logmap(worldPoseBody), &belief->mu);
-        beliefMatrix6ToArray(covarianceBody, &belief->covariance);
-    }
-
     void convertIncomingExchangeOdomBeliefToLidarFrame(StampedOdomBelief* belief) const
     {
         if (!belief || !cbsExternalExchangeInBodyFrame) {
@@ -1073,23 +1000,15 @@ public:
                 : relativeBody.compose(cbsBodyPoseLidar);
         const gtsam::Matrix6 covarianceBody =
             sanitizeBeliefCovariance(beliefArrayToMatrix6(belief->covariance));
-        const gtsam::Matrix6 conditionalABody = beliefArrayToMatrix6(belief->conditionalA);
         const gtsam::Matrix6& exchangeToLidarAdjoint =
             cbsConjugateBodyFrameConversion
                 ? cbsAdjointLidarPoseBody
                 : cbsAdjointBodyPoseLidar;
-        const gtsam::Matrix6& lidarToExchangeAdjoint =
-            cbsConjugateBodyFrameConversion
-                ? cbsAdjointBodyPoseLidar
-                : cbsAdjointLidarPoseBody;
         const gtsam::Matrix6 covarianceLidar =
             sanitizeBeliefCovariance(exchangeToLidarAdjoint * covarianceBody *
                                      exchangeToLidarAdjoint.transpose());
-        const gtsam::Matrix6 conditionalALidar =
-            exchangeToLidarAdjoint * conditionalABody * lidarToExchangeAdjoint;
         beliefVector6ToArray(gtsam::Pose3::Logmap(relativeLidar), &belief->relativeMu);
         beliefMatrix6ToArray(covarianceLidar, &belief->covariance);
-        beliefMatrix6ToArray(conditionalALidar, &belief->conditionalA);
     }
 
     void convertOutgoingLidarOdomBeliefToExchangeFrame(StampedOdomBelief* belief) const
@@ -1106,29 +1025,15 @@ public:
                 : relativeLidar.compose(cbsLidarPoseBody);
         const gtsam::Matrix6 covarianceLidar =
             sanitizeBeliefCovariance(beliefArrayToMatrix6(belief->covariance));
-        const gtsam::Matrix6 conditionalALidar = beliefArrayToMatrix6(belief->conditionalA);
         const gtsam::Matrix6& lidarToExchangeAdjoint =
             cbsConjugateBodyFrameConversion
                 ? cbsAdjointBodyPoseLidar
                 : cbsAdjointLidarPoseBody;
-        const gtsam::Matrix6& exchangeToLidarAdjoint =
-            cbsConjugateBodyFrameConversion
-                ? cbsAdjointLidarPoseBody
-                : cbsAdjointBodyPoseLidar;
         const gtsam::Matrix6 covarianceBody =
             sanitizeBeliefCovariance(lidarToExchangeAdjoint * covarianceLidar *
                                      lidarToExchangeAdjoint.transpose());
-        const gtsam::Matrix6 conditionalABody =
-            lidarToExchangeAdjoint * conditionalALidar * exchangeToLidarAdjoint;
         beliefVector6ToArray(gtsam::Pose3::Logmap(relativeBody), &belief->relativeMu);
         beliefMatrix6ToArray(covarianceBody, &belief->covariance);
-        beliefMatrix6ToArray(conditionalABody, &belief->conditionalA);
-    }
-
-    void enqueueIncomingBelief(const StampedBelief& belief)
-    {
-        std::lock_guard<std::mutex> lock(mtxBeliefExchange);
-        incomingStampedBeliefs.push_back(belief);
     }
 
     void enqueueIncomingOdomBelief(const StampedOdomBelief& belief)
@@ -1160,7 +1065,6 @@ public:
             }
             for (size_t i = 0; i < belief.covariance.size(); ++i) {
                 belief.covariance[i] = beliefMsg.covariance[i];
-                belief.conditionalA[i] = beliefMsg.conditional_A[i];
             }
 
             convertIncomingExchangeOdomBeliefToLidarFrame(&belief);
@@ -1168,543 +1072,6 @@ public:
             cbsBeliefsIncomingReceivedTotal.fetch_add(1u, std::memory_order_relaxed);
             cbsBeliefsIncomingReceivedPerRerunFrame.fetch_add(1u, std::memory_order_relaxed);
         }
-    }
-
-    void poseBeliefInHandler(const liorf::pose_belief_arrayConstPtr& msg)
-    {
-        for (const auto& beliefMsg : msg->beliefs) {
-            const cbs::AgentId sourceAgent = static_cast<cbs::AgentId>(beliefMsg.source_agent);
-            if (sourceAgent == selfAgentId) {
-                continue;
-            }
-
-            StampedBelief belief;
-            belief.sourceAgent = sourceAgent;
-            belief.poseIndex = static_cast<size_t>(beliefMsg.pose_index);
-            belief.stampSec = beliefMsg.stamp_sec > 0.0 ? beliefMsg.stamp_sec : beliefMsg.header.stamp.toSec();
-            belief.senderTimestampNs = beliefMsg.header.stamp.toNSec();
-            belief.senderFrameId = beliefMsg.header.frame_id;
-            belief.relaxFactor = beliefMsg.relax_factor;
-
-            for (size_t i = 0; i < belief.mu.size(); ++i) {
-                belief.mu[i] = beliefMsg.mu[i];
-            }
-            for (size_t i = 0; i < belief.covariance.size(); ++i) {
-                belief.covariance[i] = beliefMsg.covariance[i];
-            }
-            belief.sentTrace = beliefTraceFromArray(belief.covariance);
-
-            const gtsam::Pose3 senderPoseRaw = gtsam::Pose3::Expmap(beliefArrayToVector6(belief.mu));
-            const gtsam::Matrix6 senderCovRaw = sanitizeBeliefCovariance(beliefArrayToMatrix6(belief.covariance));
-
-            convertIncomingExchangeBeliefToLidarFrame(&belief);
-            belief.receivedTrace = beliefTraceFromArray(belief.covariance);
-
-            const gtsam::Pose3 convertedPose = gtsam::Pose3::Expmap(beliefArrayToVector6(belief.mu));
-            const gtsam::Matrix6 convertedCov =
-                sanitizeBeliefCovariance(beliefArrayToMatrix6(belief.covariance));
-
-            gtsam::Pose3 reconstructedPose = senderPoseRaw;
-            gtsam::Matrix6 reconstructedCov = senderCovRaw;
-            std::string transformLabel = "identity_exchange_equals_lidar";
-            std::string receiverExpectedFrame = "world_to_lidar_pose";
-            if (cbsExternalExchangeInBodyFrame) {
-                reconstructedPose =
-                    cbsConjugateBodyFrameConversion
-                        ? cbsLidarPoseBody.compose(senderPoseRaw).compose(cbsBodyPoseLidar)
-                        : senderPoseRaw.compose(cbsBodyPoseLidar);
-                const gtsam::Matrix6& exchangeToLidarAdjoint =
-                    cbsConjugateBodyFrameConversion
-                        ? cbsAdjointLidarPoseBody
-                        : cbsAdjointBodyPoseLidar;
-                reconstructedCov =
-                    sanitizeBeliefCovariance(exchangeToLidarAdjoint * senderCovRaw *
-                                             exchangeToLidarAdjoint.transpose());
-                transformLabel = cbsConjugateBodyFrameConversion
-                                     ? "body_to_lidar_conjugate_adjoint"
-                                     : "body_to_lidar_compose_adjoint";
-                receiverExpectedFrame = "world_to_body_pose";
-            }
-            const double meanErrorNorm = poseErrorNorm(convertedPose, reconstructedPose);
-            const double covErrorFro = (convertedCov - reconstructedCov).norm();
-            const double covSymmetryError = (convertedCov - convertedCov.transpose()).norm();
-            const double minEigenvalue = minEigenvalueSymmetric(convertedCov);
-
-            gtsam::Pose3 roundtripPose = convertedPose;
-            gtsam::Matrix6 roundtripCov = convertedCov;
-            if (cbsExternalExchangeInBodyFrame) {
-                roundtripPose =
-                    cbsConjugateBodyFrameConversion
-                        ? cbsBodyPoseLidar.compose(convertedPose).compose(cbsLidarPoseBody)
-                        : convertedPose.compose(cbsLidarPoseBody);
-                const gtsam::Matrix6& lidarToExchangeAdjoint =
-                    cbsConjugateBodyFrameConversion
-                        ? cbsAdjointBodyPoseLidar
-                        : cbsAdjointLidarPoseBody;
-                roundtripCov =
-                    sanitizeBeliefCovariance(lidarToExchangeAdjoint * convertedCov *
-                                             lidarToExchangeAdjoint.transpose());
-            }
-            const double meanRoundtripError = poseErrorNorm(roundtripPose, senderPoseRaw);
-            const double covRoundtripError = (roundtripCov - senderCovRaw).norm();
-
-            const std::string keyToken = formatPoseKeyToken(sourceAgent, belief.poseIndex);
-            ROS_INFO_STREAM(
-                "CBS_TRANSPORT_ROW_K2L,"
-                << keyToken << ","
-                << belief.senderTimestampNs << ","
-                << sanitizeCsvToken(belief.senderFrameId) << ","
-                << sanitizeCsvToken(receiverExpectedFrame) << ","
-                << sanitizeCsvToken(transformLabel) << ","
-                << vector6ToToken(gtsam::Pose3::Logmap(senderPoseRaw)) << ","
-                << vector6ToToken(gtsam::Pose3::Logmap(convertedPose)) << ","
-                << vector6ToToken(gtsam::Pose3::Logmap(reconstructedPose)) << ","
-                << meanErrorNorm << ","
-                << matrix6ToToken(senderCovRaw) << ","
-                << matrix6ToToken(convertedCov) << ","
-                << matrix6ToToken(reconstructedCov) << ","
-                << covErrorFro << ","
-                << covSymmetryError << ","
-                << minEigenvalue << ",ok");
-            ROS_INFO_STREAM(
-                "CBS_ROUNDTRIP_ROW_K2L,"
-                << keyToken << ","
-                << belief.senderTimestampNs << ","
-                << meanRoundtripError << ","
-                << covRoundtripError << ",ok");
-
-            enqueueIncomingBelief(belief);
-            cbsBeliefsIncomingReceivedTotal.fetch_add(1u, std::memory_order_relaxed);
-            cbsBeliefsIncomingReceivedPerRerunFrame.fetch_add(1u, std::memory_order_relaxed);
-        }
-    }
-
-    void consumeIncomingBeliefsIntoBpsam()
-    {
-        std::deque<StampedBelief> pendingBeliefs;
-        {
-            std::lock_guard<std::mutex> lock(mtxBeliefExchange);
-            if (incomingStampedBeliefs.empty()) {
-                return;
-            }
-            pendingBeliefs.swap(incomingStampedBeliefs);
-        }
-
-        const size_t pendingCount = pendingBeliefs.size();
-        cbsBeliefsIncomingDequeuedTotal.fetch_add(pendingCount, std::memory_order_relaxed);
-
-        size_t numMatchedByIndex = 0;
-        size_t numMatchedByTimestamp = 0;
-        size_t numDroppedNoLocalTimestamp = 0;
-        size_t numDroppedInvalidStamp = 0;
-        size_t numDroppedTimestampMismatch = 0;
-        size_t numCandidateForBpsam = 0;
-        size_t numRejectedByBpsam = 0;
-        size_t numAddedToBpsam = 0;
-        size_t numRejectedInactiveWindow = 0;
-        size_t numRejectedRootSize = 0;
-        size_t numRejectedFirstMessage = 0;
-        size_t numRejectedUpdateStatus = 0;
-        size_t numRejectedShape = 0;
-        size_t numRejectedException = 0;
-
-        auto fetchAgentLocalBelief = [&](const cbs::AgentId sourceAgent,
-                                         const Key localKey,
-                                         gbp::Gaussian* beliefOut) -> bool {
-            if (!beliefOut) {
-                return false;
-            }
-            try {
-                const auto beliefGraph = bpsam->beliefGraph();
-                const auto agentIt = beliefGraph.find(sourceAgent);
-                if (agentIt == beliefGraph.end()) {
-                    return false;
-                }
-                if (agentIt->second.contains(localKey) == 0) {
-                    return false;
-                }
-                const auto beliefVar = agentIt->second.getVar(localKey);
-                if (!beliefVar) {
-                    return false;
-                }
-                *beliefOut = *beliefVar;
-                return true;
-            } catch (...) {
-                return false;
-            }
-        };
-
-        auto logMergeRow = [&](const StampedBelief& incoming,
-                               const std::string& senderKeyToken,
-                               const std::string& receiverPoseKeyToken,
-                               double receiverLocalBeforeTrace,
-                               double receiverMergedTrace,
-                               double receiverPosteriorPreTrace,
-                               double receiverPosteriorPostTrace,
-                               double hellingerLocalIncoming,
-                               double hellingerLocalMerged,
-                               double mahalLocalIncoming,
-                               const std::string& status,
-                               const std::string& receiverLocalSource,
-                               double receiverLocalRawTrace,
-                               double receiverLocalAnchoredTrace,
-                               double dmuLocalIncoming,
-                               double dmuLocalMerged,
-                               double step,
-                               double dxycurr,
-                               double dxyTarget) {
-            const size_t sampleIdx = cbsMergeK2LSampleCounter.fetch_add(1u, std::memory_order_relaxed);
-            ROS_INFO_STREAM(
-                "CBS_MERGE_ROW_K2L,"
-                << sampleIdx << ","
-                << sanitizeCsvToken(incoming.senderFrameId) << ","
-                << incoming.senderTimestampNs << ","
-                << senderKeyToken << ","
-                << receiverPoseKeyToken << ","
-                << incoming.sentTrace << ","
-                << incoming.receivedTrace << ","
-                << receiverLocalBeforeTrace << ","
-                << receiverMergedTrace << ","
-                << receiverPosteriorPreTrace << ","
-                << receiverPosteriorPostTrace << ","
-                << hellingerLocalIncoming << ","
-                << hellingerLocalMerged << ","
-                << mahalLocalIncoming << ","
-                << sanitizeCsvToken(status) << ","
-                << sanitizeCsvToken(receiverLocalSource) << ","
-                << receiverLocalRawTrace << ","
-                << receiverLocalAnchoredTrace << ","
-                << dmuLocalIncoming << ","
-                << dmuLocalMerged << ","
-                << step << ","
-                << dxycurr << ","
-                << dxyTarget);
-        };
-
-        auto statusForBpsamDetail = [](const cbs::BPSAM::AddBeliefStatus status) {
-            switch (status) {
-                case cbs::BPSAM::AddBeliefStatus::Accepted:
-                    return std::string("bpsam_added");
-                case cbs::BPSAM::AddBeliefStatus::AcceptedButSkippedAlreadyApplied:
-                    return std::string("bpsam_accepted_but_skipped_already_applied");
-                case cbs::BPSAM::AddBeliefStatus::RejectedFirstMessage:
-                    return std::string("bpsam_rejected_first_message");
-                case cbs::BPSAM::AddBeliefStatus::RejectedUpdateStatus:
-                    return std::string("bpsam_rejected_update_status");
-                case cbs::BPSAM::AddBeliefStatus::RejectedShape:
-                    return std::string("bpsam_rejected_shape");
-                case cbs::BPSAM::AddBeliefStatus::RejectedInactiveWindow:
-                    return std::string("bpsam_rejected_inactive_window");
-                case cbs::BPSAM::AddBeliefStatus::Exception:
-                    return std::string("bpsam_rejected_exception");
-            }
-            return std::string("bpsam_rejected");
-        };
-
-        auto logBpsamAddRow =
-            [&](const cbs::BPSAM::AddBeliefDetail& detail,
-                const std::string& senderKeyToken,
-                const std::string& receiverPoseKeyToken) {
-                ROS_INFO_STREAM(
-                    "CBS_BPSAM_ADD_ROW_K2L,"
-                    << senderKeyToken << ","
-                    << receiverPoseKeyToken << ","
-                    << cbs::BPSAM::addBeliefStatusName(detail.status) << ","
-                    << (detail.enable_soft_reset ? "true" : "false") << ","
-                    << cbs::BPSAM::metricTypeName(detail.metric_type) << ","
-                    << detail.d_reset << ","
-                    << detail.contract_alpha << ","
-                    << (detail.existing_gbp_var ? "true" : "false") << ","
-                    << (detail.is_first_message ? "true" : "false") << ","
-                    << detail.dxycurr << ","
-                    << detail.dxy << ","
-                    << detail.contraction_step_size << ","
-                    << sanitizeCsvToken(detail.message));
-            };
-
-        for (const auto& incoming : pendingBeliefs) {
-            size_t localIndex = 0;
-            bool matched = false;
-            BeliefMatchFailureReason matchReason = BeliefMatchFailureReason::kNone;
-            if (std::isfinite(incoming.stampSec) && incoming.stampSec > 0.0) {
-                matched = findClosestLocalIndexByTimestamp(incoming.stampSec, &localIndex, &matchReason);
-                if (matched) {
-                    numMatchedByTimestamp++;
-                } else if (matchReason == BeliefMatchFailureReason::kNoLocalTimestamp) {
-                    numDroppedNoLocalTimestamp++;
-                } else if (matchReason == BeliefMatchFailureReason::kInvalidStamp) {
-                    numDroppedInvalidStamp++;
-                } else {
-                    numDroppedTimestampMismatch++;
-                }
-            } else {
-                numDroppedInvalidStamp++;
-                matchReason = BeliefMatchFailureReason::kInvalidStamp;
-            }
-
-            const std::string senderKeyToken = formatPoseKeyToken(incoming.sourceAgent, incoming.poseIndex);
-            if (!matched) {
-                const std::string status =
-                    (matchReason == BeliefMatchFailureReason::kNoLocalTimestamp)
-                        ? "dropped_no_local_timestamp"
-                        : (matchReason == BeliefMatchFailureReason::kInvalidStamp)
-                              ? "dropped_invalid_stamp"
-                              : "dropped_timestamp_mismatch";
-                const double nan = std::numeric_limits<double>::quiet_NaN();
-                logMergeRow(incoming,
-                            senderKeyToken,
-                            "na",
-                            nan,
-                            nan,
-                            nan,
-                            nan,
-                            nan,
-                            nan,
-                            nan,
-                            status,
-                            "na",
-                            nan,
-                            nan,
-                            nan,
-                            nan,
-                            nan,
-                            nan,
-                            nan);
-                continue;
-            }
-
-            const Key localKey = ensurePoseKeyForLocalIndex(localIndex);
-            const gtsam::LabeledSymbol localSymbol(localKey);
-            const std::string receiverPoseKeyToken =
-                formatPoseKeyToken(static_cast<cbs::AgentId>(localSymbol.chr()), localSymbol.index());
-
-            if (!isLocalIndexInBeliefWindow(localIndex)) {
-                ++numRejectedByBpsam;
-                ++numRejectedInactiveWindow;
-                const double nan = std::numeric_limits<double>::quiet_NaN();
-                logMergeRow(incoming,
-                            senderKeyToken,
-                            receiverPoseKeyToken,
-                            nan,
-                            nan,
-                            nan,
-                            nan,
-                            nan,
-                            nan,
-                            nan,
-                            "bpsam_rejected_inactive_window",
-                            "na",
-                            nan,
-                            nan,
-                            nan,
-                            nan,
-                            nan,
-                            nan,
-                            nan);
-                continue;
-            }
-
-            if (cbsBeliefMaxRootSize > 0u && bpsam &&
-                bpsam->rootFrontalKeyCount() >= cbsBeliefMaxRootSize) {
-                ++numRejectedByBpsam;
-                ++numRejectedRootSize;
-                const double nan = std::numeric_limits<double>::quiet_NaN();
-                logMergeRow(incoming,
-                            senderKeyToken,
-                            receiverPoseKeyToken,
-                            nan,
-                            nan,
-                            nan,
-                            nan,
-                            nan,
-                            nan,
-                            nan,
-                            "bpsam_rejected_root_size",
-                            "na",
-                            nan,
-                            nan,
-                            nan,
-                            nan,
-                            nan,
-                            nan,
-                            nan);
-                continue;
-            }
-
-            gtsam::Vector6 mu = gtsam::Vector6::Zero();
-            gtsam::Matrix6 covariance = gtsam::Matrix6::Zero();
-            for (size_t i = 0; i < 6; ++i) {
-                mu(i) = incoming.mu[i];
-            }
-            for (size_t r = 0; r < 6; ++r) {
-                for (size_t c = 0; c < 6; ++c) {
-                    covariance(r, c) = incoming.covariance[r * 6 + c];
-                }
-            }
-            gbp::Gaussian gaussian(localKey, mu, covariance, 1);
-            gaussian.relax_factor() = incoming.relaxFactor;
-            numCandidateForBpsam++;
-
-            gbp::Gaussian localBefore(localKey, gtsam::Vector6::Zero(), gtsam::Matrix6::Identity(), 1);
-            const bool hasLocalBefore = fetchAgentLocalBelief(incoming.sourceAgent, localKey, &localBefore);
-            const double receiverLocalBeforeTrace =
-                hasLocalBefore ? beliefTraceFromMatrix(localBefore.Sigma()) : std::numeric_limits<double>::quiet_NaN();
-            const double hellingerLocalIncoming =
-                hasLocalBefore ? safeHellingerDistance(localBefore.mu(), localBefore.Sigma(), mu, covariance)
-                               : std::numeric_limits<double>::quiet_NaN();
-            const double mahalLocalIncoming =
-                hasLocalBefore ? safeMahalanobisDistance(localBefore.mu(), localBefore.Sigma(), mu)
-                               : std::numeric_limits<double>::quiet_NaN();
-            const double dmuLocalIncoming =
-                hasLocalBefore ? safeDeltaNorm(localBefore.mu(), mu)
-                               : std::numeric_limits<double>::quiet_NaN();
-
-            std::map<Key, std::vector<std::pair<cbs::AgentId, gbp::Gaussian>>> singleBelief;
-            singleBelief[localKey].emplace_back(incoming.sourceAgent, gaussian);
-            const auto addResult = bpsam->addBeliefsDetailed(std::move(singleBelief));
-            const bool added = addResult.accepted > 0u;
-            numAddedToBpsam += addResult.accepted;
-            numRejectedByBpsam += addResult.rejected();
-            numRejectedFirstMessage += addResult.rejected_first_message;
-            numRejectedUpdateStatus += addResult.rejected_update_status;
-            numRejectedShape += addResult.rejected_shape;
-            numRejectedException += addResult.rejected_exception;
-            const cbs::BPSAM::AddBeliefDetail* addDetail =
-                addResult.details.empty() ? nullptr : &addResult.details.front();
-            if (addDetail) {
-                logBpsamAddRow(*addDetail, senderKeyToken, receiverPoseKeyToken);
-            }
-
-            gbp::Gaussian localAfter(localKey, gtsam::Vector6::Zero(), gtsam::Matrix6::Identity(), 1);
-            const bool hasLocalAfter = fetchAgentLocalBelief(incoming.sourceAgent, localKey, &localAfter);
-            const double receiverMergedTrace =
-                hasLocalAfter ? beliefTraceFromMatrix(localAfter.Sigma()) : std::numeric_limits<double>::quiet_NaN();
-            const double hellingerLocalMerged =
-                (hasLocalBefore && hasLocalAfter)
-                    ? safeHellingerDistance(localBefore.mu(), localBefore.Sigma(),
-                                            localAfter.mu(), localAfter.Sigma())
-                    : std::numeric_limits<double>::quiet_NaN();
-            const double dmuLocalMerged =
-                (hasLocalBefore && hasLocalAfter)
-                    ? safeDeltaNorm(localBefore.mu(), localAfter.mu())
-                    : std::numeric_limits<double>::quiet_NaN();
-            const std::string status =
-                addDetail ? statusForBpsamDetail(addDetail->status)
-                          : (added ? "bpsam_added" : "bpsam_rejected");
-
-            const double receiverPosteriorPreTrace = receiverLocalBeforeTrace;
-            const double receiverPosteriorPostTrace = receiverMergedTrace;
-            const double receiverLocalRawTrace = receiverLocalBeforeTrace;
-            const double receiverLocalAnchoredTrace = receiverMergedTrace;
-            const double step =
-                hasLocalAfter ? localAfter.contractionStepSize() : std::numeric_limits<double>::quiet_NaN();
-            const double dxycurr =
-                hasLocalAfter ? localAfter.dxycurr() : std::numeric_limits<double>::quiet_NaN();
-            const double dxyTarget =
-                hasLocalAfter ? localAfter.dxy() : std::numeric_limits<double>::quiet_NaN();
-
-            logMergeRow(incoming,
-                        senderKeyToken,
-                        receiverPoseKeyToken,
-                        receiverLocalBeforeTrace,
-                        receiverMergedTrace,
-                        receiverPosteriorPreTrace,
-                        receiverPosteriorPostTrace,
-                        hellingerLocalIncoming,
-                        hellingerLocalMerged,
-                        mahalLocalIncoming,
-                        status,
-                        "gbp_agent_local_prior",
-                        receiverLocalRawTrace,
-                        receiverLocalAnchoredTrace,
-                        dmuLocalIncoming,
-                        dmuLocalMerged,
-                        step,
-                        dxycurr,
-                        dxyTarget);
-        }
-
-        cbsBeliefsIncomingMatchedByIndexTotal.fetch_add(numMatchedByIndex, std::memory_order_relaxed);
-        cbsBeliefsIncomingMatchedByTimestampTotal.fetch_add(numMatchedByTimestamp, std::memory_order_relaxed);
-        cbsBeliefsIncomingDroppedNoLocalTimestampTotal.fetch_add(numDroppedNoLocalTimestamp, std::memory_order_relaxed);
-        cbsBeliefsIncomingDroppedInvalidStampTotal.fetch_add(numDroppedInvalidStamp, std::memory_order_relaxed);
-        cbsBeliefsIncomingDroppedTimestampMismatchTotal.fetch_add(numDroppedTimestampMismatch, std::memory_order_relaxed);
-        cbsBeliefsIncomingAddedToBpsamTotal.fetch_add(numAddedToBpsam, std::memory_order_relaxed);
-        cbsBeliefsIncomingAddedToBpsamPerRerunFrame.fetch_add(numAddedToBpsam, std::memory_order_relaxed);
-        cbsBeliefsIncomingRejectedByBpsamTotal.fetch_add(numRejectedByBpsam, std::memory_order_relaxed);
-        cbsBeliefsIncomingRejectedFirstMessageTotal.fetch_add(numRejectedFirstMessage, std::memory_order_relaxed);
-        cbsBeliefsIncomingRejectedUpdateStatusTotal.fetch_add(numRejectedUpdateStatus, std::memory_order_relaxed);
-        cbsBeliefsIncomingRejectedShapeTotal.fetch_add(numRejectedShape, std::memory_order_relaxed);
-        cbsBeliefsIncomingRejectedExceptionTotal.fetch_add(numRejectedException, std::memory_order_relaxed);
-        cbsBeliefsIncomingRejectedFirstMessagePerRerunFrame.fetch_add(numRejectedFirstMessage, std::memory_order_relaxed);
-        cbsBeliefsIncomingRejectedUpdateStatusPerRerunFrame.fetch_add(numRejectedUpdateStatus, std::memory_order_relaxed);
-        cbsBeliefsIncomingRejectedShapePerRerunFrame.fetch_add(numRejectedShape, std::memory_order_relaxed);
-        cbsBeliefsIncomingRejectedExceptionPerRerunFrame.fetch_add(numRejectedException, std::memory_order_relaxed);
-
-        const size_t numDroppedTotal =
-            numDroppedNoLocalTimestamp + numDroppedInvalidStamp + numDroppedTimestampMismatch;
-        if (numDroppedTotal > 0) {
-            ROS_WARN_STREAM_THROTTLE(
-                1.0,
-                "Dropped " << numDroppedTotal
-                           << " incoming beliefs (no_local_ts=" << numDroppedNoLocalTimestamp
-                           << ", invalid_stamp=" << numDroppedInvalidStamp
-                           << ", timestamp_mismatch=" << numDroppedTimestampMismatch << ").");
-        }
-
-        ROS_INFO_STREAM_THROTTLE(
-            1.0,
-            "LiORF CBS incoming flow: dequeued=" << pendingCount
-            << " matched(index=" << numMatchedByIndex
-            << ",timestamp=" << numMatchedByTimestamp << ")"
-            << " dropped(no_local_ts=" << numDroppedNoLocalTimestamp
-            << ",invalid_stamp=" << numDroppedInvalidStamp
-            << ",timestamp_mismatch=" << numDroppedTimestampMismatch << ")"
-            << " bpsam(candidate=" << numCandidateForBpsam
-            << ",added=" << numAddedToBpsam
-            << ",rejected=" << numRejectedByBpsam
-            << ",inactive_window=" << numRejectedInactiveWindow
-            << ",root_size=" << numRejectedRootSize
-            << ",first_message=" << numRejectedFirstMessage
-            << ",update_status=" << numRejectedUpdateStatus
-            << ",shape=" << numRejectedShape
-            << ",exception=" << numRejectedException
-            << ",soft_reset=" << (cbsEnableSoftReset ? "true" : "false")
-            << ",raw_previous_gate="
-            << (cbsUseRawPreviousBeliefGate ? "true" : "false")
-            << ",temporary_linear_priors="
-            << (cbsUseTemporaryCbsLinearPriors ? "true" : "false")
-            << ",root=" << (bpsam ? bpsam->rootFrontalKeyCount() : 0u)
-            << ",max_root=" << cbsBeliefMaxRootSize
-            << ",active_priors="
-            << (bpsam ? bpsam->trackedCbsPriorSlotCount() : 0u) << ")"
-            << " totals(received="
-            << cbsBeliefsIncomingReceivedTotal.load(std::memory_order_relaxed)
-            << ",dequeued="
-            << cbsBeliefsIncomingDequeuedTotal.load(std::memory_order_relaxed)
-            << ",matched_index="
-            << cbsBeliefsIncomingMatchedByIndexTotal.load(std::memory_order_relaxed)
-            << ",matched_timestamp="
-            << cbsBeliefsIncomingMatchedByTimestampTotal.load(std::memory_order_relaxed)
-            << ",dropped_no_local_ts="
-            << cbsBeliefsIncomingDroppedNoLocalTimestampTotal.load(std::memory_order_relaxed)
-            << ",dropped_invalid_stamp="
-            << cbsBeliefsIncomingDroppedInvalidStampTotal.load(std::memory_order_relaxed)
-            << ",dropped_timestamp_mismatch="
-            << cbsBeliefsIncomingDroppedTimestampMismatchTotal.load(std::memory_order_relaxed)
-            << ",bpsam_added="
-            << cbsBeliefsIncomingAddedToBpsamTotal.load(std::memory_order_relaxed)
-            << ",bpsam_rejected="
-            << cbsBeliefsIncomingRejectedByBpsamTotal.load(std::memory_order_relaxed)
-            << ",rejected_first_message="
-            << cbsBeliefsIncomingRejectedFirstMessageTotal.load(std::memory_order_relaxed)
-            << ",rejected_update_status="
-            << cbsBeliefsIncomingRejectedUpdateStatusTotal.load(std::memory_order_relaxed)
-            << ",rejected_shape="
-            << cbsBeliefsIncomingRejectedShapeTotal.load(std::memory_order_relaxed)
-            << ",rejected_exception="
-            << cbsBeliefsIncomingRejectedExceptionTotal.load(std::memory_order_relaxed)
-            << ")");
     }
 
     void consumeIncomingOdomBeliefsIntoBpsam()
@@ -1760,7 +1127,6 @@ public:
                 gtsam::Pose3::Expmap(beliefArrayToVector6(incoming.relativeMu));
             odomBelief.covariance =
                 sanitizeBeliefCovariance(beliefArrayToMatrix6(incoming.covariance));
-            odomBelief.conditional_A = beliefArrayToMatrix6(incoming.conditionalA);
             odomBelief.relax_factor = incoming.relaxFactor;
 
             std::vector<cbs::BPSAM::CbsOdometryBelief> singleBelief;
@@ -1787,7 +1153,6 @@ public:
                     << formatPoseKeyToken(selfAgentId, toLocalIndex) << ","
                     << static_cast<int>(detail.status) << ","
                     << detail.covariance_trace << ","
-                    << detail.conditional_A_frobenius << ","
                     << sanitizeCsvToken(detail.message));
             }
         }
@@ -1817,51 +1182,6 @@ public:
             << ",inactive_window=" << numRejectedInactiveWindow
             << ",shape=" << numRejectedShape
             << ",exception=" << numRejectedException << ")");
-    }
-
-    void publishOutgoingBeliefs()
-    {
-        if (!cbsBeliefBridgeEnable) {
-            return;
-        }
-
-        std::vector<StampedBelief> beliefsToPublish;
-        {
-            std::lock_guard<std::mutex> lock(mtxBeliefExchange);
-            beliefsToPublish = outgoingStampedBeliefs;
-        }
-
-        liorf::pose_belief_array msg;
-        msg.header.stamp = timeLaserInfoStamp;
-        msg.header.frame_id = odometryFrame;
-        msg.beliefs.reserve(beliefsToPublish.size());
-        for (const auto& belief : beliefsToPublish) {
-            liorf::pose_belief beliefMsg;
-            beliefMsg.header = msg.header;
-            beliefMsg.source_agent = static_cast<uint8_t>(belief.sourceAgent);
-            beliefMsg.pose_index = static_cast<uint32_t>(belief.poseIndex);
-            beliefMsg.stamp_sec = belief.stampSec;
-            beliefMsg.relax_factor = belief.relaxFactor;
-            for (size_t i = 0; i < belief.mu.size(); ++i) {
-                beliefMsg.mu[i] = belief.mu[i];
-            }
-            for (size_t i = 0; i < belief.covariance.size(); ++i) {
-                beliefMsg.covariance[i] = belief.covariance[i];
-            }
-            msg.beliefs.push_back(beliefMsg);
-        }
-
-        pubPoseBeliefsOut.publish(msg);
-        cbsBeliefsOutgoingPublishedTotal.fetch_add(msg.beliefs.size(), std::memory_order_relaxed);
-        cbsBeliefsOutgoingPublishedPerRerunFrame.fetch_add(msg.beliefs.size(), std::memory_order_relaxed);
-        ROS_INFO_STREAM_THROTTLE(
-            1.0,
-            "LiORF CBS outgoing flow: published=" << msg.beliefs.size()
-            << " totals(prepared="
-            << cbsBeliefsOutgoingPreparedTotal.load(std::memory_order_relaxed)
-            << ",published="
-            << cbsBeliefsOutgoingPublishedTotal.load(std::memory_order_relaxed)
-            << ")");
     }
 
     void publishOutgoingOdomBeliefs()
@@ -1894,7 +1214,6 @@ public:
             }
             for (size_t i = 0; i < belief.covariance.size(); ++i) {
                 beliefMsg.covariance[i] = belief.covariance[i];
-                beliefMsg.conditional_A[i] = belief.conditionalA[i];
             }
             msg.beliefs.push_back(beliefMsg);
         }
@@ -1928,174 +1247,54 @@ public:
             bpsam->marginalizationGraphFactorCount(),
             std::memory_order_relaxed);
         const auto cbsGetBeliefsStart = std::chrono::steady_clock::now();
-        if (cbs::BPSAM::beliefFactorModeFromString(cbsBeliefFactorMode) ==
-            cbs::BPSAM::CbsBeliefFactorMode::OdometryBetween) {
-            auto outgoing =
-                bpsam->getOdometryBeliefs(requestKeys, static_cast<cbs::AgentId>('k'));
-            atomicAddRelaxed(&cbsBeliefGenerationTimeMsPerRerunFrame,
-                             elapsedMs(cbsGetBeliefsStart));
-
-            std::vector<StampedOdomBelief> outgoingStamped;
-            outgoingStamped.reserve(outgoing.size());
-            for (const auto& odom : outgoing) {
-                auto fromIt = localPoseKeyToIndex.find(odom.from_pose_key);
-                auto toIt = localPoseKeyToIndex.find(odom.to_pose_key);
-                if (fromIt == localPoseKeyToIndex.end() ||
-                    toIt == localPoseKeyToIndex.end()) {
-                    continue;
-                }
-                const size_t fromIndex = fromIt->second;
-                const size_t toIndex = toIt->second;
-                if (fromIndex >= localPoseTimestampsSec.size() ||
-                    toIndex >= localPoseTimestampsSec.size() ||
-                    localPoseTimestampsSec[fromIndex] < 0.0 ||
-                    localPoseTimestampsSec[toIndex] < 0.0) {
-                    continue;
-                }
-
-                StampedOdomBelief stampedBelief;
-                stampedBelief.sourceAgent = selfAgentId;
-                stampedBelief.fromPoseIndex = fromIndex;
-                stampedBelief.toPoseIndex = toIndex;
-                stampedBelief.fromStampSec = localPoseTimestampsSec[fromIndex];
-                stampedBelief.toStampSec = localPoseTimestampsSec[toIndex];
-                stampedBelief.senderTimestampNs =
-                    static_cast<uint64_t>(std::llround(stampedBelief.toStampSec * 1e9));
-                stampedBelief.senderFrameId = odometryFrame;
-                stampedBelief.relaxFactor = odom.relax_factor;
-                beliefVector6ToArray(gtsam::Pose3::Logmap(odom.measured_from_to),
-                                     &stampedBelief.relativeMu);
-                beliefMatrix6ToArray(sanitizeBeliefCovariance(odom.covariance),
-                                     &stampedBelief.covariance);
-                gtsam::Matrix6 conditionalA = gtsam::Matrix6::Identity();
-                if (odom.conditional_A.rows() == 6 && odom.conditional_A.cols() == 6) {
-                    conditionalA = odom.conditional_A;
-                }
-                beliefMatrix6ToArray(conditionalA, &stampedBelief.conditionalA);
-                convertOutgoingLidarOdomBeliefToExchangeFrame(&stampedBelief);
-                outgoingStamped.push_back(stampedBelief);
-            }
-
-            {
-                std::lock_guard<std::mutex> lock(mtxBeliefExchange);
-                outgoingStampedOdomBeliefs = std::move(outgoingStamped);
-                outgoingStampedBeliefs.clear();
-            }
-            cbsBeliefsOutgoingPreparedTotal.fetch_add(
-                outgoingStampedOdomBeliefs.size(), std::memory_order_relaxed);
-            publishOutgoingOdomBeliefs();
-            return;
-        }
-
         auto outgoing =
-            bpsam->getBeliefs(requestKeys, static_cast<cbs::AgentId>('k'), false);
+            bpsam->getOdometryBeliefs(requestKeys, static_cast<cbs::AgentId>('k'));
         atomicAddRelaxed(&cbsBeliefGenerationTimeMsPerRerunFrame,
                          elapsedMs(cbsGetBeliefsStart));
-        const auto [selectedSourcePath, selectedAnchorMode] = covModeSemantics(cbsL2KOutgoingCovMode);
 
-        std::vector<StampedBelief> outgoingStamped;
+        std::vector<StampedOdomBelief> outgoingStamped;
         outgoingStamped.reserve(outgoing.size());
-        for (const auto& [key, beliefsByAgent] : outgoing) {
-            auto keyIt = localPoseKeyToIndex.find(key);
-            if (keyIt == localPoseKeyToIndex.end()) {
+        for (const auto& odom : outgoing) {
+            auto fromIt = localPoseKeyToIndex.find(odom.from_pose_key);
+            auto toIt = localPoseKeyToIndex.find(odom.to_pose_key);
+            if (fromIt == localPoseKeyToIndex.end() ||
+                toIt == localPoseKeyToIndex.end()) {
+                continue;
+            }
+            const size_t fromIndex = fromIt->second;
+            const size_t toIndex = toIt->second;
+            if (fromIndex >= localPoseTimestampsSec.size() ||
+                toIndex >= localPoseTimestampsSec.size() ||
+                localPoseTimestampsSec[fromIndex] < 0.0 ||
+                localPoseTimestampsSec[toIndex] < 0.0) {
                 continue;
             }
 
-            const size_t localIndex = keyIt->second;
-            if (localIndex >= localPoseTimestampsSec.size() || localPoseTimestampsSec[localIndex] < 0.0) {
-                continue;
-            }
-
-            for (const auto& [agentId, belief] : beliefsByAgent) {
-                if (agentId != selfAgentId) {
-                    continue;
-                }
-                StampedBelief stampedBelief;
-                stampedBelief.sourceAgent = selfAgentId;
-                stampedBelief.poseIndex = localIndex;
-                stampedBelief.stampSec = localPoseTimestampsSec[localIndex];
-                stampedBelief.relaxFactor = belief.relax_factor();
-                for (size_t i = 0; i < stampedBelief.mu.size(); ++i) {
-                    stampedBelief.mu[i] = belief.mu()(i);
-                }
-
-                gtsam::Matrix6 outgoingCovariance = sanitizeBeliefCovariance(belief.Sigma());
-                std::string outgoingCovStatus = "ok_as_is_local_anchored";
-                if (cbsL2KOutgoingCovMode != L2KOutgoingCovMode::kAsIsLocalAnchored) {
-                    gtsam::Matrix6 modeCovariance;
-                    std::string modeStatus;
-                    if (computeL2KOutgoingCovarianceForMode(key,
-                                                            belief,
-                                                            cbsL2KOutgoingCovMode,
-                                                            &modeCovariance,
-                                                            &modeStatus)) {
-                        outgoingCovariance = modeCovariance;
-                        outgoingCovStatus = modeStatus;
-                    } else {
-                        outgoingCovStatus = "fallback_as_is_" + modeStatus;
-                    }
-                }
-                if (std::isfinite(cbsL2KOutgoingCovarianceScale) &&
-                    cbsL2KOutgoingCovarianceScale > 0.0 &&
-                    std::abs(cbsL2KOutgoingCovarianceScale - 1.0) > 1e-12) {
-                    outgoingCovariance =
-                        sanitizeBeliefCovariance(cbsL2KOutgoingCovarianceScale *
-                                                 outgoingCovariance);
-                    outgoingCovStatus += "_scaled_" + std::to_string(cbsL2KOutgoingCovarianceScale);
-                }
-                for (size_t r = 0; r < 6; ++r) {
-                    for (size_t c = 0; c < 6; ++c) {
-                        stampedBelief.covariance[r * 6 + c] = outgoingCovariance(r, c);
-                    }
-                }
-                if (cbsL2KCovAuditEnable &&
-                    cbsL2KCovAuditLoggedPoseIndices.size() < cbsL2KCovAuditMaxSamples &&
-                    cbsL2KCovAuditLoggedPoseIndices.find(localIndex) == cbsL2KCovAuditLoggedPoseIndices.end()) {
-                    const L2KOutgoingCovAuditResult auditResult =
-                        computeL2KOutgoingCovAudit(key, belief);
-                    const uint64_t stampNs = static_cast<uint64_t>(std::llround(stampedBelief.stampSec * 1e9));
-                    const size_t sampleIdx =
-                        cbsL2KCovAuditSampleCounter.fetch_add(1u, std::memory_order_relaxed);
-                    ROS_INFO_STREAM(
-                        "CBS_L2K_OUT_COV_AUDIT,"
-                        << sampleIdx << ","
-                        << formatPoseKeyToken(selfAgentId, localIndex) << ","
-                        << stampNs << ","
-                        << auditResult.traceAsIs << ","
-                        << auditResult.traceInitPriorReplaced << ","
-                        << auditResult.traceQueryAnchorOnly << ","
-                        << sanitizeCsvToken(auditResult.modeBStatus) << ","
-                        << sanitizeCsvToken(auditResult.modeCStatus) << ","
-                        << cbsL2KCovAuditReplacementTransVariance << ","
-                        << cbsL2KCovAuditQueryAnchorVariance);
-                    double covLogdet = std::numeric_limits<double>::quiet_NaN();
-                    double covLambdaMin = std::numeric_limits<double>::quiet_NaN();
-                    computeCovarianceLogdetAndLambdaMin(outgoingCovariance, &covLogdet, &covLambdaMin);
-                    ROS_INFO_STREAM(
-                        "CBS_L2K_OUT_COV_APPLIED,"
-                        << sampleIdx << ","
-                        << formatPoseKeyToken(selfAgentId, localIndex) << ","
-                        << stampNs << ","
-                        << sanitizeCsvToken(cbsL2KOutgoingCovModeLabel) << ","
-                        << sanitizeCsvToken(selectedSourcePath) << ","
-                        << sanitizeCsvToken(selectedAnchorMode) << ","
-                        << sanitizeCsvToken(outgoingCovStatus) << ","
-                        << outgoingCovariance.trace() << ","
-                        << covLogdet << ","
-                        << covLambdaMin);
-                    cbsL2KCovAuditLoggedPoseIndices.insert(localIndex);
-                }
-                convertOutgoingLidarBeliefToExchangeFrame(&stampedBelief);
-                outgoingStamped.push_back(stampedBelief);
-            }
+            StampedOdomBelief stampedBelief;
+            stampedBelief.sourceAgent = selfAgentId;
+            stampedBelief.fromPoseIndex = fromIndex;
+            stampedBelief.toPoseIndex = toIndex;
+            stampedBelief.fromStampSec = localPoseTimestampsSec[fromIndex];
+            stampedBelief.toStampSec = localPoseTimestampsSec[toIndex];
+            stampedBelief.senderTimestampNs =
+                static_cast<uint64_t>(std::llround(stampedBelief.toStampSec * 1e9));
+            stampedBelief.senderFrameId = odometryFrame;
+            stampedBelief.relaxFactor = odom.relax_factor;
+            beliefVector6ToArray(gtsam::Pose3::Logmap(odom.measured_from_to),
+                                 &stampedBelief.relativeMu);
+            beliefMatrix6ToArray(sanitizeBeliefCovariance(odom.covariance),
+                                 &stampedBelief.covariance);
+            convertOutgoingLidarOdomBeliefToExchangeFrame(&stampedBelief);
+            outgoingStamped.push_back(stampedBelief);
         }
 
         {
             std::lock_guard<std::mutex> lock(mtxBeliefExchange);
-            outgoingStampedBeliefs = std::move(outgoingStamped);
+            outgoingStampedOdomBeliefs = std::move(outgoingStamped);
         }
-        cbsBeliefsOutgoingPreparedTotal.fetch_add(outgoingStampedBeliefs.size(), std::memory_order_relaxed);
-        publishOutgoingBeliefs();
+        cbsBeliefsOutgoingPreparedTotal.fetch_add(
+            outgoingStampedOdomBeliefs.size(), std::memory_order_relaxed);
+        publishOutgoingOdomBeliefs();
     }
 
     ros::Publisher pubLaserCloudSurround;
@@ -2113,13 +1312,11 @@ public:
 
     ros::Publisher pubSLAMInfo;
     ros::Publisher pubGpsOdom;
-    ros::Publisher pubPoseBeliefsOut;
     ros::Publisher pubPoseOdomBeliefsOut;
 
     ros::Subscriber subCloud;
     ros::Subscriber subGPS;
     ros::Subscriber subLoop;
-    ros::Subscriber subPoseBeliefsIn;
     ros::Subscriber subPoseOdomBeliefsIn;
 
     ros::ServiceServer srvSaveMap;
@@ -2205,7 +1402,7 @@ public:
         bool cbsEnableBeliefDcs = false;
         double cbsBeliefSimilarityThreshold = 0.01;
         double cbsDReset = 0.1;
-        double cbsK2LPriorFactorCovarianceScale = 1.0;
+        double cbsK2LOdomFactorCovarianceScale = 1.0;
         int cbsBeliefWindow = 30;
         int cbsBeliefMaxRootSizeParam = 60;
         nh.param<bool>("liorf/cbsEnableBeliefDcs", cbsEnableBeliefDcs, false);
@@ -2216,17 +1413,8 @@ public:
         nh.param<bool>("liorf/cbsBeliefRejectFirstMessage", cbsBeliefRejectFirstMessage, true);
         nh.param<bool>("liorf/cbsEnableSoftReset", cbsEnableSoftReset, true);
         nh.param<bool>("liorf/cbsUseRawPreviousBeliefGate", cbsUseRawPreviousBeliefGate, false);
-        nh.param<bool>("liorf/cbsUseTemporaryCbsPriorFactors",
-                       cbsUseTemporaryCbsPriorFactors,
-                       false);
-        nh.param<bool>("liorf/cbsUseTemporaryCbsLinearPriors",
-                       cbsUseTemporaryCbsLinearPriors,
-                       true);
-        nh.param<std::string>("liorf/cbsBeliefFactorMode",
-                              cbsBeliefFactorMode,
-                              "prior");
-        nh.param<bool>("liorf/cbsUseSenderConditionalOdomFactors",
-                       cbsUseSenderConditionalOdomFactors,
+        nh.param<bool>("liorf/cbsUseTemporaryCbsLinearFactors",
+                       cbsUseTemporaryCbsLinearFactors,
                        true);
         nh.param<bool>("liorf/cbsTemporaryLinearAlreadyAppliedGateEnable",
                        cbsTemporaryLinearAlreadyAppliedGateEnable,
@@ -2241,12 +1429,10 @@ public:
                          cbsTemporaryLinearAlreadyAppliedCovRelThreshold,
                          1e-3);
         nh.param<double>("liorf/cbsDReset", cbsDReset, 0.1);
-        nh.param<double>("liorf/cbsK2LPriorFactorCovarianceScale",
-                         cbsK2LPriorFactorCovarianceScale,
+        nh.param<double>("liorf/cbsK2LOdomFactorCovarianceScale",
+                         cbsK2LOdomFactorCovarianceScale,
                          1.0);
         nh.param<bool>("liorf/cbsBeliefBridgeEnable", cbsBeliefBridgeEnable, true);
-        nh.param<std::string>("liorf/cbsBeliefInTopic", cbsBeliefInTopic, "liorf/cbs/belief_in");
-        nh.param<std::string>("liorf/cbsBeliefOutTopic", cbsBeliefOutTopic, "liorf/cbs/belief_out");
         nh.param<std::string>("liorf/cbsOdomBeliefInTopic",
                               cbsOdomBeliefInTopic,
                               "liorf/cbs/odom_belief_in");
@@ -2358,22 +1544,8 @@ public:
         parameters.gbp_update_params.enable_soft_reset = cbsEnableSoftReset;
         parameters.gbp_update_params.d_reset = cbsDReset;
         parameters.use_raw_previous_belief_gate = cbsUseRawPreviousBeliefGate;
-        parameters.use_temporary_cbs_prior_factors =
-            cbsUseTemporaryCbsPriorFactors;
-        parameters.use_temporary_cbs_linear_priors =
-            cbsUseTemporaryCbsLinearPriors;
-        try {
-            parameters.belief_factor_mode =
-                cbs::BPSAM::beliefFactorModeFromString(cbsBeliefFactorMode);
-        } catch (const std::exception& e) {
-            ROS_WARN_STREAM("Invalid LiORF CBS belief factor mode '"
-                            << cbsBeliefFactorMode << "': " << e.what()
-                            << ". Falling back to prior.");
-            parameters.belief_factor_mode =
-                cbs::BPSAM::CbsBeliefFactorMode::Prior;
-        }
-        parameters.use_sender_conditional_odom_factors =
-            cbsUseSenderConditionalOdomFactors;
+        parameters.use_temporary_cbs_linear_factors =
+            cbsUseTemporaryCbsLinearFactors;
         parameters.temporary_linear_already_applied_gate_enable =
             cbsTemporaryLinearAlreadyAppliedGateEnable;
         parameters.temporary_linear_already_applied_metric_threshold =
@@ -2382,10 +1554,10 @@ public:
             cbsTemporaryLinearAlreadyAppliedDmuThreshold;
         parameters.temporary_linear_already_applied_cov_rel_threshold =
             cbsTemporaryLinearAlreadyAppliedCovRelThreshold;
-        if (std::isfinite(cbsK2LPriorFactorCovarianceScale) &&
-            cbsK2LPriorFactorCovarianceScale > 0.0) {
-            parameters.prior_factor_covariance_scale_by_source[static_cast<cbs::AgentId>('k')] =
-                cbsK2LPriorFactorCovarianceScale;
+        if (std::isfinite(cbsK2LOdomFactorCovarianceScale) &&
+            cbsK2LOdomFactorCovarianceScale > 0.0) {
+            parameters.external_factor_covariance_scale_by_source[static_cast<cbs::AgentId>('k')] =
+                cbsK2LOdomFactorCovarianceScale;
         }
         bpsam.reset(new cbs::BPSAM(parameters));
 
@@ -2399,18 +1571,11 @@ public:
                         << (cbsEnableSoftReset ? "ON" : "OFF"));
         ROS_INFO_STREAM("LiORF BPSAM raw-previous receiver gate: "
                         << (cbsUseRawPreviousBeliefGate ? "ON" : "OFF"));
-        ROS_INFO_STREAM("LiORF BPSAM temporary CBS prior factors: "
-                        << (cbsUseTemporaryCbsPriorFactors ? "ON" : "OFF"));
-        ROS_INFO_STREAM("LiORF BPSAM temporary CBS linear priors: "
-                        << (cbsUseTemporaryCbsLinearPriors ? "ON" : "OFF"));
-        ROS_INFO_STREAM("LiORF BPSAM CBS belief factor mode: "
-                        << cbs::BPSAM::beliefFactorModeName(
-                               parameters.belief_factor_mode));
-        ROS_INFO_STREAM("LiORF BPSAM sender conditional odometry factors: "
-                        << (cbsUseSenderConditionalOdomFactors ? "ON" : "OFF"));
+        ROS_INFO_STREAM("LiORF BPSAM temporary CBS linear odometry factors: "
+                        << (cbsUseTemporaryCbsLinearFactors ? "ON" : "OFF"));
         ROS_INFO_STREAM("LiORF BPSAM d_reset: " << cbsDReset);
-        ROS_INFO_STREAM("LiORF K2L final prior covariance scale: "
-                        << cbsK2LPriorFactorCovarianceScale);
+        ROS_INFO_STREAM("LiORF K2L final odometry covariance scale: "
+                        << cbsK2LOdomFactorCovarianceScale);
         ROS_INFO_STREAM("LiORF CBS belief window: " << beliefExchangeWindowSize
                         << " poses, max iSAM2 root size="
                         << cbsBeliefMaxRootSize);
@@ -2437,8 +1602,6 @@ public:
         }
         subLoop  = nh.subscribe<std_msgs::Float64MultiArray>("lio_loop/loop_closure_detection", 1, &mapOptimization::loopInfoHandler, this, ros::TransportHints().tcpNoDelay());
         if (cbsBeliefBridgeEnable) {
-            subPoseBeliefsIn = nh.subscribe<liorf::pose_belief_array>(cbsBeliefInTopic, 50, &mapOptimization::poseBeliefInHandler, this, ros::TransportHints().tcpNoDelay());
-            pubPoseBeliefsOut = nh.advertise<liorf::pose_belief_array>(cbsBeliefOutTopic, 50);
             subPoseOdomBeliefsIn = nh.subscribe<liorf::pose_odom_belief_array>(cbsOdomBeliefInTopic, 50, &mapOptimization::poseOdomBeliefInHandler, this, ros::TransportHints().tcpNoDelay());
             pubPoseOdomBeliefsOut = nh.advertise<liorf::pose_odom_belief_array>(cbsOdomBeliefOutTopic, 50);
         }
@@ -2473,8 +1636,6 @@ public:
         localPoseKeys.clear();
         localPoseKeyToIndex.clear();
         localPoseTimestampsSec.clear();
-        incomingStampedBeliefs.clear();
-        outgoingStampedBeliefs.clear();
         cbsBeliefsIncomingReceivedTotal.store(0u, std::memory_order_relaxed);
         cbsBeliefsIncomingDequeuedTotal.store(0u, std::memory_order_relaxed);
         cbsBeliefsIncomingMatchedByIndexTotal.store(0u, std::memory_order_relaxed);
@@ -2745,8 +1906,7 @@ public:
                     if (!factor) {
                         continue;
                     }
-                    if (cbs::isPoseBeliefFactor(selfAgentId, factor) ||
-                        cbs::isAnchorBeliefFactor(factor)) {
+                    if (cbs::isAnchorBeliefFactor(factor)) {
                         factorColors[i] = persistentCbsFactorColor;
                         ++persistentCbsFactorCount;
                     }
@@ -4006,18 +3166,17 @@ public:
         // loop factor
         addLoopFactor();
 
-        // external belief factors (from camera-VIO backend) are pre-matched by timestamp.
-        consumeIncomingBeliefsIntoBpsam();
+        // external odometry belief factors (from camera-VIO backend) are pre-matched by timestamp.
         consumeIncomingOdomBeliefsIntoBpsam();
 
-        const KeySet activeCbsPriorKeys = activeBeliefWindowKeys();
-        const FactorIndices staleCbsPriorSlots =
-            bpsam->cbsPriorFactorSlotsOutsideKeys(activeCbsPriorKeys);
-        if (!staleCbsPriorSlots.empty()) {
+        const KeySet activeCbsFactorKeys = activeBeliefWindowKeys();
+        const FactorIndices staleCbsFactorSlots =
+            bpsam->cbsFactorSlotsOutsideKeys(activeCbsFactorKeys);
+        if (!staleCbsFactorSlots.empty()) {
             ROS_INFO_STREAM_THROTTLE(
                 1.0,
-                "LiORF CBS pruning " << staleCbsPriorSlots.size()
-                                     << " stale prior factors outside the "
+                "LiORF CBS pruning " << staleCbsFactorSlots.size()
+                                     << " stale external odometry factors outside the "
                                      << beliefExchangeWindowSize
                                      << "-pose active window.");
         }
@@ -4028,7 +3187,7 @@ public:
         // update BPSAM backend
         const auto bpsamOptimizationStart = std::chrono::steady_clock::now();
         cbs::BPSAM::UpdateParams bpsamUpdateParams;
-        bpsamUpdateParams.removeFactorIndices = staleCbsPriorSlots;
+        bpsamUpdateParams.removeFactorIndices = staleCbsFactorSlots;
         bpsam->update(gtSAMgraph, initialEstimate, bpsamUpdateParams);
         bpsam->update();
 
@@ -4045,13 +3204,13 @@ public:
         cbsBpsamRootSizePerRerunFrame.store(
             bpsam->rootFrontalKeyCount(), std::memory_order_relaxed);
         cbsBpsamActivePriorSlotsPerRerunFrame.store(
-            bpsam->trackedCbsPriorSlotCount(), std::memory_order_relaxed);
+            bpsam->trackedCbsFactorSlotCount(), std::memory_order_relaxed);
         ROS_INFO_STREAM_THROTTLE(
             1.0,
             "LiORF BPSAM root: size=" << bpsam->rootFrontalKeyCount()
                                       << " cliques=" << bpsam->rootCliqueCount()
                                       << " active_cbs_priors="
-                                      << bpsam->trackedCbsPriorSlotCount()
+                                      << bpsam->trackedCbsFactorSlotCount()
                                       << " max_root=" << cbsBeliefMaxRootSize);
 
         gtSAMgraph.resize(0);

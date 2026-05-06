@@ -75,5 +75,3 @@ liorf:
   cbsBeliefExchangeWindowSize: 30
   cbsBeliefMaxRootSize: 60
   cbsBeliefTimestampToleranceSec: 0.12
-  cbsBeliefInTopic: "/kimera/cbs/belief_out"
-  cbsBeliefOutTopic: "/kimera/cbs/belief_in"
