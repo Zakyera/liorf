@@ -640,15 +640,9 @@ public:
         return (muB - muA).norm();
     }
 
-    static gtsam::Matrix6 sanitizeBeliefCovariance(const gtsam::Matrix6& covariance)
+    static gtsam::Matrix6 beliefCovarianceRaw(const gtsam::Matrix6& covariance)
     {
-        gtsam::Matrix6 sym = 0.5 * (covariance + covariance.transpose());
-        for (size_t i = 0; i < 6; ++i) {
-            if (!std::isfinite(sym(i, i)) || sym(i, i) <= 1e-9) {
-                sym(i, i) = 1e-3;
-            }
-        }
-        return sym;
+        return covariance;
     }
 
     static Eigen::Matrix3d sanitizeTranslationCovariance(const Eigen::MatrixXd& poseCovariance)
@@ -696,7 +690,7 @@ public:
             if (poseCov.rows() != 6 || poseCov.cols() != 6 || !poseCov.allFinite()) {
                 return false;
             }
-            *covarianceOut = sanitizeBeliefCovariance(poseCov);
+            *covarianceOut = beliefCovarianceRaw(poseCov);
             return true;
         } catch (...) {
             return false;
@@ -867,7 +861,7 @@ public:
         }
 
         if (mode == L2KOutgoingCovMode::kAsIsLocalAnchored) {
-            *covarianceOut = sanitizeBeliefCovariance(asIsBelief.Sigma());
+            *covarianceOut = beliefCovarianceRaw(asIsBelief.Sigma());
             if (statusOut) {
                 *statusOut = "ok_as_is_local_anchored";
             }
@@ -934,7 +928,7 @@ public:
                                                          const gbp::Gaussian& asIsBelief) const
     {
         L2KOutgoingCovAuditResult result;
-        gtsam::Matrix6 covA = sanitizeBeliefCovariance(asIsBelief.Sigma());
+        gtsam::Matrix6 covA = beliefCovarianceRaw(asIsBelief.Sigma());
         result.traceAsIs = beliefTraceFromMatrix(covA);
 
         gtsam::Matrix6 covB;
@@ -999,14 +993,14 @@ public:
                 ? cbsLidarPoseBody.compose(relativeBody).compose(cbsBodyPoseLidar)
                 : relativeBody.compose(cbsBodyPoseLidar);
         const gtsam::Matrix6 covarianceBody =
-            sanitizeBeliefCovariance(beliefArrayToMatrix6(belief->covariance));
+            beliefCovarianceRaw(beliefArrayToMatrix6(belief->covariance));
         const gtsam::Matrix6& exchangeToLidarAdjoint =
             cbsConjugateBodyFrameConversion
                 ? cbsAdjointLidarPoseBody
                 : cbsAdjointBodyPoseLidar;
         const gtsam::Matrix6 covarianceLidar =
-            sanitizeBeliefCovariance(exchangeToLidarAdjoint * covarianceBody *
-                                     exchangeToLidarAdjoint.transpose());
+            beliefCovarianceRaw(exchangeToLidarAdjoint * covarianceBody *
+                                exchangeToLidarAdjoint.transpose());
         beliefVector6ToArray(gtsam::Pose3::Logmap(relativeLidar), &belief->relativeMu);
         beliefMatrix6ToArray(covarianceLidar, &belief->covariance);
     }
@@ -1024,14 +1018,14 @@ public:
                 ? cbsBodyPoseLidar.compose(relativeLidar).compose(cbsLidarPoseBody)
                 : relativeLidar.compose(cbsLidarPoseBody);
         const gtsam::Matrix6 covarianceLidar =
-            sanitizeBeliefCovariance(beliefArrayToMatrix6(belief->covariance));
+            beliefCovarianceRaw(beliefArrayToMatrix6(belief->covariance));
         const gtsam::Matrix6& lidarToExchangeAdjoint =
             cbsConjugateBodyFrameConversion
                 ? cbsAdjointBodyPoseLidar
                 : cbsAdjointLidarPoseBody;
         const gtsam::Matrix6 covarianceBody =
-            sanitizeBeliefCovariance(lidarToExchangeAdjoint * covarianceLidar *
-                                     lidarToExchangeAdjoint.transpose());
+            beliefCovarianceRaw(lidarToExchangeAdjoint * covarianceLidar *
+                                lidarToExchangeAdjoint.transpose());
         beliefVector6ToArray(gtsam::Pose3::Logmap(relativeBody), &belief->relativeMu);
         beliefMatrix6ToArray(covarianceBody, &belief->covariance);
     }
@@ -1126,7 +1120,7 @@ public:
             odomBelief.measured_from_to =
                 gtsam::Pose3::Expmap(beliefArrayToVector6(incoming.relativeMu));
             odomBelief.covariance =
-                sanitizeBeliefCovariance(beliefArrayToMatrix6(incoming.covariance));
+                beliefCovarianceRaw(beliefArrayToMatrix6(incoming.covariance));
             odomBelief.relax_factor = incoming.relaxFactor;
 
             std::vector<cbs::BPSAM::CbsOdometryBelief> singleBelief;
@@ -1282,7 +1276,7 @@ public:
             stampedBelief.relaxFactor = odom.relax_factor;
             beliefVector6ToArray(gtsam::Pose3::Logmap(odom.measured_from_to),
                                  &stampedBelief.relativeMu);
-            beliefMatrix6ToArray(sanitizeBeliefCovariance(odom.covariance),
+            beliefMatrix6ToArray(beliefCovarianceRaw(odom.covariance),
                                  &stampedBelief.covariance);
             convertOutgoingLidarOdomBeliefToExchangeFrame(&stampedBelief);
             outgoingStamped.push_back(stampedBelief);
