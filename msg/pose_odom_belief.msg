@@ -6,5 +6,4 @@ float64 from_stamp_sec
 float64 to_stamp_sec
 float64[6] relative_mu
 float64[36] covariance
-float64[36] conditional_A
 float64 relax_factor

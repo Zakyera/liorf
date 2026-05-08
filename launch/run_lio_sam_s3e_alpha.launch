@@ -5,20 +5,19 @@
   <arg name="cbs_belief_reject_first_message" default="true"/>
   <arg name="cbs_enable_soft_reset" default="true"/>
   <arg name="cbs_use_raw_previous_belief_gate" default="false"/>
-  <arg name="cbs_use_temporary_cbs_prior_factors" default="false"/>
-  <arg name="cbs_use_temporary_cbs_linear_priors" default="true"/>
-  <arg name="cbs_belief_factor_mode" default="prior"/>
-  <arg name="cbs_use_sender_conditional_odom_factors" default="true"/>
+  <arg name="cbs_use_temporary_cbs_linear_factors" default="true"/>
   <arg name="cbs_temporary_linear_already_applied_gate_enable" default="true"/>
   <arg name="cbs_temporary_linear_already_applied_metric_threshold" default="0.01"/>
   <arg name="cbs_temporary_linear_already_applied_dmu_threshold" default="0.001"/>
   <arg name="cbs_temporary_linear_already_applied_cov_rel_threshold" default="0.001"/>
   <arg name="cbs_d_reset" default="0.1"/>
-  <arg name="cbs_k2l_prior_factor_covariance_scale" default="1.0"/>
+  <arg name="cbs_k2l_odom_factor_covariance_scale" default="1.0"/>
   <arg name="cbs_belief_bridge_enable" default="true"/>
   <arg name="cbs_odom_belief_in_topic" default="liorf/cbs/odom_belief_in"/>
   <arg name="cbs_odom_belief_out_topic" default="liorf/cbs/odom_belief_out"/>
   <arg name="cbs_belief_exchange_window_size" default="30"/>
+  <arg name="cbs_odom_unmatched_retry_max_age_sec" default="5.0"/>
+  <arg name="cbs_odom_unmatched_retry_max_beliefs" default="500"/>
   <arg name="cbs_l2k_cov_audit_enable" default="false"/>
   <arg name="cbs_l2k_cov_audit_max_samples" default="20"/>
   <arg name="cbs_l2k_cov_audit_replacement_trans_variance" default="1.0"/>
@@ -45,14 +44,8 @@
          value="$(arg cbs_enable_soft_reset)"/>
   <param name="/liorf/cbsUseRawPreviousBeliefGate"
          value="$(arg cbs_use_raw_previous_belief_gate)"/>
-  <param name="/liorf/cbsUseTemporaryCbsPriorFactors"
-         value="$(arg cbs_use_temporary_cbs_prior_factors)"/>
-  <param name="/liorf/cbsUseTemporaryCbsLinearPriors"
-         value="$(arg cbs_use_temporary_cbs_linear_priors)"/>
-  <param name="/liorf/cbsBeliefFactorMode"
-         value="$(arg cbs_belief_factor_mode)"/>
-  <param name="/liorf/cbsUseSenderConditionalOdomFactors"
-         value="$(arg cbs_use_sender_conditional_odom_factors)"/>
+  <param name="/liorf/cbsUseTemporaryCbsLinearFactors"
+         value="$(arg cbs_use_temporary_cbs_linear_factors)"/>
   <param name="/liorf/cbsTemporaryLinearAlreadyAppliedGateEnable"
          value="$(arg cbs_temporary_linear_already_applied_gate_enable)"/>
   <param name="/liorf/cbsTemporaryLinearAlreadyAppliedMetricThreshold"
@@ -62,8 +55,8 @@
   <param name="/liorf/cbsTemporaryLinearAlreadyAppliedCovRelThreshold"
          value="$(arg cbs_temporary_linear_already_applied_cov_rel_threshold)"/>
   <param name="/liorf/cbsDReset" value="$(arg cbs_d_reset)"/>
-  <param name="/liorf/cbsK2LPriorFactorCovarianceScale"
-         value="$(arg cbs_k2l_prior_factor_covariance_scale)"/>
+  <param name="/liorf/cbsK2LOdomFactorCovarianceScale"
+         value="$(arg cbs_k2l_odom_factor_covariance_scale)"/>
   <param name="/liorf/cbsBeliefBridgeEnable"
          value="$(arg cbs_belief_bridge_enable)"/>
   <param name="/liorf/cbsOdomBeliefInTopic"
@@ -72,6 +65,10 @@
          value="$(arg cbs_odom_belief_out_topic)"/>
   <param name="/liorf/cbsBeliefExchangeWindowSize"
          value="$(arg cbs_belief_exchange_window_size)"/>
+  <param name="/liorf/cbsOdomUnmatchedRetryMaxAgeSec"
+         value="$(arg cbs_odom_unmatched_retry_max_age_sec)"/>
+  <param name="/liorf/cbsOdomUnmatchedRetryMaxBeliefs"
+         value="$(arg cbs_odom_unmatched_retry_max_beliefs)"/>
   <param name="/liorf/cbsL2KCovAuditEnable"
          value="$(arg cbs_l2k_cov_audit_enable)"/>
   <param name="/liorf/cbsL2KCovAuditMaxSamples"

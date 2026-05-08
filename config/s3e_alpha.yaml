@@ -60,7 +60,7 @@ liorf:
   surroundingKeyframeMapLeafSize: 0.5
   loopClosureICPSurfLeafSize: 0.5
   mappingOptimizationFrequency: 5.0
-  surroundingkeyframeAddingDistThreshold: 0.3   # meters, keyframe insertion gate
+  surroundingkeyframeAddingDistThreshold: 0.05  # meters, keyframe insertion gate
   surroundingkeyframeAddingAngleThreshold: 0.1  # radians, keyframe insertion gate
   loopClosureEnableFlag: false
 
@@ -75,5 +75,3 @@ liorf:
   cbsBeliefExchangeWindowSize: 30
   cbsBeliefMaxRootSize: 60
   cbsBeliefTimestampToleranceSec: 0.12
-  cbsBeliefInTopic: "/kimera/cbs/belief_out"
-  cbsBeliefOutTopic: "/kimera/cbs/belief_in"
