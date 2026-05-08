@@ -21,6 +21,7 @@
 #include <gtsam/nonlinear/ISAM2.h>
 #include <aria_viz/visualizer_rerun.h>
 #include <cbs/bpsam/bpsam.h>
+#include <cbs/bpsam/incremental_fixed_lag_bpsam_smoother.h>
 #include <cbs/key.h>
 #include <cbs/utils/gtsam_compat.h>
 #include <algorithm>
@@ -188,7 +189,7 @@ public:
     NonlinearFactorGraph gtSAMgraph;
     Values initialEstimate;
     Values optimizedEstimate;
-    std::unique_ptr<cbs::BPSAM> bpsam;
+    std::unique_ptr<cbs::IncrementalFixedLagBpsamSmoother> bpsam;
     Values isamCurrentEstimate;
     Eigen::MatrixXd poseCovariance = Eigen::MatrixXd::Identity(6, 6);
     cbs::AgentId selfAgentId = static_cast<cbs::AgentId>('a');
@@ -866,7 +867,7 @@ public:
                                      : localPoseKeys.front();
         *firstPoseKeyOut = firstPoseKey;
 
-        const auto& factors = bpsam->getFactorsUnsafe();
+        const auto& factors = bpsam->getFactors();
         localGraph->reserve(factors.size());
         for (size_t slot = 0u; slot < factors.size(); ++slot) {
             if (!factors.exists(slot)) {
@@ -1279,20 +1280,6 @@ public:
                 } else {
                     ++numDropped;
                     logMatchDecision(incoming, fromDiag, toDiag, "dropped_timestamp_match");
-                }
-                continue;
-            }
-            if (!isLocalIndexInBeliefWindow(fromLocalIndex) ||
-                !isLocalIndexInBeliefWindow(toLocalIndex) ||
-                fromLocalIndex >= toLocalIndex) {
-                if (shouldRetryIncomingOdomBelief(incoming, "receiver_window_or_order")) {
-                    ++numRetried;
-                    retryBeliefs.push_back(incoming);
-                    logMatchDecision(incoming, fromDiag, toDiag, "retry_receiver_window_or_order");
-                } else {
-                    ++numRejectedByBpsam;
-                    ++numRejectedInactiveWindow;
-                    logMatchDecision(incoming, fromDiag, toDiag, "dropped_receiver_window_or_order");
                 }
                 continue;
             }
@@ -1759,7 +1746,9 @@ public:
             parameters.external_factor_covariance_scale_by_source[static_cast<cbs::AgentId>('k')] =
                 cbsK2LOdomFactorCovarianceScale;
         }
-        bpsam.reset(new cbs::BPSAM(parameters));
+        bpsam = std::make_unique<cbs::IncrementalFixedLagBpsamSmoother>(
+            static_cast<double>(beliefExchangeWindowSize),
+            parameters);
 
         ROS_INFO_STREAM("LiORF BPSAM backend agent id: '" << static_cast<char>(selfAgentId) << "'");
         ROS_INFO_STREAM("LiORF mapping optimization frequency: "
@@ -2112,7 +2101,7 @@ public:
         }
 
         if (rerunFactorGraphEnable && bpsam && isamCurrentEstimate.size() > 0u) {
-            const auto& factorGraph = bpsam->getFactorsUnsafe();
+            const auto& factorGraph = bpsam->getFactors();
             if (factorGraph.size() > 0u) {
                 const Eigen::Vector4f localFactorColor(255.f, 160.f, 0.f, 180.f);
                 const Eigen::Vector4f persistentCbsFactorColor(255.f, 60.f, 220.f, 230.f);
@@ -3386,26 +3375,16 @@ public:
         // external odometry belief factors (from camera-VIO backend) are pre-matched by timestamp.
         consumeIncomingOdomBeliefsIntoBpsam();
 
-        const KeySet activeCbsFactorKeys = activeBeliefWindowKeys();
-        const FactorIndices staleCbsFactorSlots =
-            bpsam->cbsFactorSlotsOutsideKeys(activeCbsFactorKeys);
-        if (!staleCbsFactorSlots.empty()) {
-            ROS_INFO_STREAM_THROTTLE(
-                1.0,
-                "LiORF CBS pruning " << staleCbsFactorSlots.size()
-                                     << " stale external odometry factors outside the "
-                                     << beliefExchangeWindowSize
-                                     << "-pose active window.");
-        }
-
         // cout << "****************************************************" << endl;
         // gtSAMgraph.print("GTSAM Graph:\n");
 
         // update BPSAM backend
         const auto bpsamOptimizationStart = std::chrono::steady_clock::now();
-        cbs::BPSAM::UpdateParams bpsamUpdateParams;
-        bpsamUpdateParams.removeFactorIndices = staleCbsFactorSlots;
-        bpsam->update(gtSAMgraph, initialEstimate, bpsamUpdateParams);
+        gtsam::FixedLagSmoother::KeyTimestampMap keyTimestamps;
+        for (const auto& keyValue : initialEstimate) {
+            keyTimestamps[keyValue.key] = static_cast<double>(localPoseIndex);
+        }
+        bpsam->update(gtSAMgraph, initialEstimate, keyTimestamps);
         bpsam->update();
 
         if (aLoopIsClosed == true)
@@ -3419,15 +3398,15 @@ public:
         atomicAddRelaxed(&bpsamOptimizationTimeMsPerRerunFrame,
                          elapsedMs(bpsamOptimizationStart));
         cbsBpsamRootSizePerRerunFrame.store(
-            bpsam->rootFrontalKeyCount(), std::memory_order_relaxed);
+            bpsam->bpsam().rootFrontalKeyCount(), std::memory_order_relaxed);
         cbsBpsamActivePriorSlotsPerRerunFrame.store(
-            bpsam->trackedCbsFactorSlotCount(), std::memory_order_relaxed);
+            bpsam->bpsam().trackedCbsFactorSlotCount(), std::memory_order_relaxed);
         ROS_INFO_STREAM_THROTTLE(
             1.0,
-            "LiORF BPSAM root: size=" << bpsam->rootFrontalKeyCount()
-                                      << " cliques=" << bpsam->rootCliqueCount()
+            "LiORF BPSAM root: size=" << bpsam->bpsam().rootFrontalKeyCount()
+                                      << " cliques=" << bpsam->bpsam().rootCliqueCount()
                                       << " active_cbs_priors="
-                                      << bpsam->trackedCbsFactorSlotCount()
+                                      << bpsam->bpsam().trackedCbsFactorSlotCount()
                                       << " max_root=" << cbsBeliefMaxRootSize);
 
         gtSAMgraph.resize(0);
