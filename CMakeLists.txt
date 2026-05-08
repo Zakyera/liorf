@@ -25,6 +25,7 @@ find_package(OpenMP REQUIRED)
 find_package(PCL REQUIRED QUIET)
 find_package(opencv3_catkin REQUIRED QUIET)
 find_package(GTSAM REQUIRED QUIET)
+find_package(TBB 4.4 COMPONENTS tbb tbbmalloc REQUIRED)
 find_package(Eigen3 REQUIRED)
 # cbsConfig.cmake expects GTSAM_UNSTABLE; derive it from GTSAM_DIR when needed.
 if (NOT GTSAM_UNSTABLE_DIR AND DEFINED GTSAM_DIR)
@@ -109,13 +110,13 @@ target_link_libraries(${PROJECT_NAME}_imageProjection ${opencv3_catkin_LIBRARIES
 add_executable(${PROJECT_NAME}_mapOptmization src/mapOptmization.cpp ${common_lib} include/Scancontext.cpp)
 add_dependencies(${PROJECT_NAME}_mapOptmization ${catkin_EXPORTED_TARGETS} ${PROJECT_NAME}_generate_messages_cpp)
 target_compile_options(${PROJECT_NAME}_mapOptmization PRIVATE ${OpenMP_CXX_FLAGS})
-target_link_libraries(${PROJECT_NAME}_mapOptmization Boost::timer ${opencv3_catkin_LIBRARIES} ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${OpenMP_CXX_FLAGS} ${GeographicLib_LIBRARIES} gtsam cbs aria_viz)
+target_link_libraries(${PROJECT_NAME}_mapOptmization Boost::timer ${opencv3_catkin_LIBRARIES} ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${OpenMP_CXX_FLAGS} ${GeographicLib_LIBRARIES} gtsam TBB::tbb TBB::tbbmalloc cbs aria_viz)
 
 # IMU Preintegration
 add_executable(${PROJECT_NAME}_imuPreintegration src/imuPreintegration.cpp ${common_lib})
-target_link_libraries(${PROJECT_NAME}_imuPreintegration Boost::timer ${opencv3_catkin_LIBRARIES} ${catkin_LIBRARIES} ${PCL_LIBRARIES} gtsam)
+target_link_libraries(${PROJECT_NAME}_imuPreintegration Boost::timer ${opencv3_catkin_LIBRARIES} ${catkin_LIBRARIES} ${PCL_LIBRARIES} gtsam TBB::tbb TBB::tbbmalloc)
 
 # BPSAM backend smoke test
 add_executable(${PROJECT_NAME}_bpsam_smoke src/bpsamSmoke.cpp)
 add_dependencies(${PROJECT_NAME}_bpsam_smoke ${catkin_EXPORTED_TARGETS} ${PROJECT_NAME}_generate_messages_cpp)
-target_link_libraries(${PROJECT_NAME}_bpsam_smoke ${catkin_LIBRARIES} gtsam cbs)
+target_link_libraries(${PROJECT_NAME}_bpsam_smoke ${catkin_LIBRARIES} gtsam TBB::tbb TBB::tbbmalloc cbs)
