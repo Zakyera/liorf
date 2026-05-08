@@ -16,10 +16,6 @@
   <arg name="cbs_odom_belief_in_topic" default="liorf/cbs/odom_belief_in"/>
   <arg name="cbs_odom_belief_out_topic" default="liorf/cbs/odom_belief_out"/>
   <arg name="cbs_belief_exchange_window_size" default="30"/>
-  <arg name="cbs_odom_interval_mode" default="adjacent"/>
-  <arg name="cbs_odom_interval_horizons_sec" default="0.3,0.5,1.0,1.5,2.0"/>
-  <arg name="cbs_odom_interval_horizon_tolerance_sec" default="0.15"/>
-  <arg name="cbs_odom_max_outgoing_beliefs" default="80"/>
   <arg name="cbs_odom_unmatched_retry_max_age_sec" default="5.0"/>
   <arg name="cbs_odom_unmatched_retry_max_beliefs" default="500"/>
   <arg name="cbs_l2k_cov_audit_enable" default="false"/>
@@ -69,14 +65,6 @@
          value="$(arg cbs_odom_belief_out_topic)"/>
   <param name="/liorf/cbsBeliefExchangeWindowSize"
          value="$(arg cbs_belief_exchange_window_size)"/>
-  <param name="/liorf/cbsOdomIntervalMode"
-         value="$(arg cbs_odom_interval_mode)"/>
-  <param name="/liorf/cbsOdomIntervalHorizonsSec"
-         value="$(arg cbs_odom_interval_horizons_sec)"/>
-  <param name="/liorf/cbsOdomIntervalHorizonToleranceSec"
-         value="$(arg cbs_odom_interval_horizon_tolerance_sec)"/>
-  <param name="/liorf/cbsOdomMaxOutgoingBeliefs"
-         value="$(arg cbs_odom_max_outgoing_beliefs)"/>
   <param name="/liorf/cbsOdomUnmatchedRetryMaxAgeSec"
          value="$(arg cbs_odom_unmatched_retry_max_age_sec)"/>
   <param name="/liorf/cbsOdomUnmatchedRetryMaxBeliefs"

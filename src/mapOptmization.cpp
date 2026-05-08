@@ -34,7 +34,6 @@
 #include <limits>
 #include <map>
 #include <memory>
-#include <set>
 #include <sstream>
 #include <atomic>
 #include <unordered_map>
@@ -212,18 +211,6 @@ public:
         double relaxFactor;
     };
 
-    struct OutgoingOdomPair
-    {
-        Key fromKey;
-        Key toKey;
-        size_t fromPoseIndex;
-        size_t toPoseIndex;
-        double fromStampSec;
-        double toStampSec;
-        std::string source;
-        double horizonSec;
-    };
-
     struct RerunExternalOdomEdge
     {
         cbs::AgentId sourceAgent;
@@ -250,11 +237,6 @@ public:
     bool cbsBeliefBridgeEnable = true;
     std::string cbsOdomBeliefInTopic = "liorf/cbs/odom_belief_in";
     std::string cbsOdomBeliefOutTopic = "liorf/cbs/odom_belief_out";
-    std::string cbsOdomIntervalMode = "adjacent";
-    std::string cbsOdomIntervalHorizonsSecParam = "0.3,0.5,1.0,1.5,2.0";
-    std::vector<double> cbsOdomIntervalHorizonsSec{0.3, 0.5, 1.0, 1.5, 2.0};
-    double cbsOdomIntervalHorizonToleranceSec = 0.15;
-    size_t cbsOdomMaxOutgoingBeliefs = 80u;
     double cbsOdomUnmatchedRetryMaxAgeSec = 5.0;
     size_t cbsOdomUnmatchedRetryMaxBeliefs = 500u;
     std::atomic<size_t> cbsBeliefsIncomingReceivedTotal{0u};
@@ -405,11 +387,6 @@ public:
         return keys;
     }
 
-    bool useMultiHorizonOdomIntervals() const
-    {
-        return normalizeModeToken(cbsOdomIntervalMode) == "multi_horizon";
-    }
-
     double latestLocalPoseTimestampSec() const
     {
         double latest = std::numeric_limits<double>::quiet_NaN();
@@ -486,132 +463,6 @@ public:
             incomingStampedOdomBeliefs.push_back(belief);
             --remainingRetrySlots;
         }
-    }
-
-    std::vector<OutgoingOdomPair> buildOutgoingOdomPairs() const
-    {
-        struct LocalPoseStamp {
-            Key key;
-            size_t index;
-            double stampSec;
-        };
-
-        std::vector<LocalPoseStamp> poses;
-        const size_t startIndex = activeBeliefWindowStartIndex();
-        poses.reserve(localPoseKeys.size() > startIndex ? localPoseKeys.size() - startIndex : 0u);
-        for (size_t i = startIndex; i < localPoseKeys.size(); ++i) {
-            if (i >= localPoseTimestampsSec.size()) {
-                continue;
-            }
-            const double stampSec = localPoseTimestampsSec[i];
-            if (!std::isfinite(stampSec) || stampSec <= 0.0) {
-                continue;
-            }
-            poses.push_back(LocalPoseStamp{localPoseKeys[i], i, stampSec});
-        }
-
-        std::sort(poses.begin(), poses.end(),
-                  [](const LocalPoseStamp& a, const LocalPoseStamp& b) {
-                      if (std::abs(a.stampSec - b.stampSec) > 1e-9) {
-                          return a.stampSec < b.stampSec;
-                      }
-                      return a.index < b.index;
-                  });
-
-        std::vector<OutgoingOdomPair> pairs;
-        std::set<std::pair<Key, Key>> seenPairs;
-        const auto addPair = [&](const LocalPoseStamp& from,
-                                 const LocalPoseStamp& to,
-                                 const std::string& source,
-                                 const double horizonSec) {
-            if (from.index >= to.index || from.stampSec >= to.stampSec) {
-                return;
-            }
-            const auto pairKey = std::make_pair(from.key, to.key);
-            if (!seenPairs.insert(pairKey).second) {
-                return;
-            }
-            pairs.push_back(OutgoingOdomPair{
-                from.key,
-                to.key,
-                from.index,
-                to.index,
-                from.stampSec,
-                to.stampSec,
-                source,
-                horizonSec});
-        };
-
-        for (size_t i = 1u; i < poses.size(); ++i) {
-            addPair(poses[i - 1u], poses[i], "adjacent", poses[i].stampSec - poses[i - 1u].stampSec);
-        }
-
-        if (useMultiHorizonOdomIntervals()) {
-            for (size_t toIdx = 1u; toIdx < poses.size(); ++toIdx) {
-                const auto& to = poses[toIdx];
-                for (const double horizonSec : cbsOdomIntervalHorizonsSec) {
-                    const double targetStampSec = to.stampSec - horizonSec;
-                    size_t bestIdx = 0u;
-                    double bestAbsDt = std::numeric_limits<double>::max();
-                    bool hasBest = false;
-                    for (size_t fromIdx = 0u; fromIdx < toIdx; ++fromIdx) {
-                        const auto& from = poses[fromIdx];
-                        const double absDt = std::abs(from.stampSec - targetStampSec);
-                        if (absDt < bestAbsDt) {
-                            bestAbsDt = absDt;
-                            bestIdx = fromIdx;
-                            hasBest = true;
-                        }
-                    }
-                    if (hasBest && bestAbsDt <= cbsOdomIntervalHorizonToleranceSec) {
-                        addPair(poses[bestIdx], to, "horizon", horizonSec);
-                    }
-                }
-            }
-        }
-
-        std::sort(pairs.begin(), pairs.end(),
-                  [](const OutgoingOdomPair& a, const OutgoingOdomPair& b) {
-                      if (std::abs(a.toStampSec - b.toStampSec) > 1e-9) {
-                          return a.toStampSec > b.toStampSec;
-                      }
-                      if (std::abs(a.fromStampSec - b.fromStampSec) > 1e-9) {
-                          return a.fromStampSec > b.fromStampSec;
-                      }
-                      return a.toPoseIndex > b.toPoseIndex;
-                  });
-        if (pairs.size() > cbsOdomMaxOutgoingBeliefs) {
-            pairs.resize(cbsOdomMaxOutgoingBeliefs);
-        }
-        std::sort(pairs.begin(), pairs.end(),
-                  [](const OutgoingOdomPair& a, const OutgoingOdomPair& b) {
-                      if (std::abs(a.toStampSec - b.toStampSec) > 1e-9) {
-                          return a.toStampSec < b.toStampSec;
-                      }
-                      if (std::abs(a.fromStampSec - b.fromStampSec) > 1e-9) {
-                          return a.fromStampSec < b.fromStampSec;
-                      }
-                      return a.toPoseIndex < b.toPoseIndex;
-                  });
-        return pairs;
-    }
-
-    void logOutgoingIntervalRow(const OutgoingOdomPair& pair,
-                                double covarianceTrace,
-                                const std::string& status) const
-    {
-        ROS_INFO_STREAM(
-            std::fixed << std::setprecision(9)
-            << "CBS_ODOM_INTERVAL_ROW_L2K,"
-            << sanitizeCsvToken(pair.source) << ","
-            << pair.horizonSec << ","
-            << formatPoseKeyToken(selfAgentId, pair.fromPoseIndex) << "->"
-            << formatPoseKeyToken(selfAgentId, pair.toPoseIndex) << ","
-            << pair.fromStampSec << ","
-            << pair.toStampSec << ","
-            << (pair.toStampSec - pair.fromStampSec) << ","
-            << covarianceTrace << ","
-            << sanitizeCsvToken(status));
     }
 
     bool findClosestLocalIndexByTimestamp(double stampSec,
@@ -750,44 +601,6 @@ public:
     static double beliefTraceFromMatrix(const Eigen::MatrixXd& covariance)
     {
         return covariance.trace();
-    }
-
-    static std::string normalizeModeToken(std::string token)
-    {
-        std::transform(token.begin(), token.end(), token.begin(),
-                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        std::replace(token.begin(), token.end(), '-', '_');
-        return token;
-    }
-
-    static std::vector<double> parsePositiveDoubleList(
-        const std::string& values,
-        const std::vector<double>& fallback)
-    {
-        std::vector<double> parsed;
-        std::stringstream stream(values);
-        std::string token;
-        while (std::getline(stream, token, ',')) {
-            try {
-                const double value = std::stod(token);
-                if (std::isfinite(value) && value > 0.0) {
-                    parsed.push_back(value);
-                }
-            } catch (...) {
-            }
-        }
-
-        if (parsed.empty()) {
-            return fallback;
-        }
-        std::sort(parsed.begin(), parsed.end());
-        parsed.erase(std::unique(parsed.begin(),
-                                 parsed.end(),
-                                 [](double a, double b) {
-                                     return std::abs(a - b) < 1e-9;
-                                 }),
-                     parsed.end());
-        return parsed;
     }
 
     static std::string sanitizeCsvToken(std::string token)
@@ -1610,17 +1423,9 @@ public:
             return;
         }
 
-        const auto intervalPairs = buildOutgoingOdomPairs();
-        if (intervalPairs.empty()) {
+        KeySet requestKeys = activeBeliefWindowKeys();
+        if (requestKeys.empty()) {
             return;
-        }
-
-        std::vector<std::pair<Key, Key>> requestPairs;
-        requestPairs.reserve(intervalPairs.size());
-        std::map<std::pair<Key, Key>, OutgoingOdomPair> intervalPairByKeys;
-        for (const auto& pair : intervalPairs) {
-            requestPairs.emplace_back(pair.fromKey, pair.toKey);
-            intervalPairByKeys.emplace(std::make_pair(pair.fromKey, pair.toKey), pair);
         }
 
         bpsam->setMarginalizationGraph(cbs::BPSAM::MarginalizationType::LOCAL);
@@ -1629,27 +1434,34 @@ public:
             std::memory_order_relaxed);
         const auto cbsGetBeliefsStart = std::chrono::steady_clock::now();
         auto outgoing =
-            bpsam->getOdometryBeliefsForPairs(std::move(requestPairs), static_cast<cbs::AgentId>('k'));
+            bpsam->getOdometryBeliefs(requestKeys, static_cast<cbs::AgentId>('k'));
         atomicAddRelaxed(&cbsBeliefGenerationTimeMsPerRerunFrame,
                          elapsedMs(cbsGetBeliefsStart));
 
         std::vector<StampedOdomBelief> outgoingStamped;
         outgoingStamped.reserve(outgoing.size());
-        std::set<std::pair<Key, Key>> sentPairs;
         for (const auto& odom : outgoing) {
-            const auto pairKey = std::make_pair(odom.from_pose_key, odom.to_pose_key);
-            auto intervalIt = intervalPairByKeys.find(pairKey);
-            if (intervalIt == intervalPairByKeys.end()) {
+            auto fromIt = localPoseKeyToIndex.find(odom.from_pose_key);
+            auto toIt = localPoseKeyToIndex.find(odom.to_pose_key);
+            if (fromIt == localPoseKeyToIndex.end() ||
+                toIt == localPoseKeyToIndex.end()) {
                 continue;
             }
-            const auto& intervalPair = intervalIt->second;
+            const size_t fromIndex = fromIt->second;
+            const size_t toIndex = toIt->second;
+            if (fromIndex >= localPoseTimestampsSec.size() ||
+                toIndex >= localPoseTimestampsSec.size() ||
+                localPoseTimestampsSec[fromIndex] < 0.0 ||
+                localPoseTimestampsSec[toIndex] < 0.0) {
+                continue;
+            }
 
             StampedOdomBelief stampedBelief;
             stampedBelief.sourceAgent = selfAgentId;
-            stampedBelief.fromPoseIndex = intervalPair.fromPoseIndex;
-            stampedBelief.toPoseIndex = intervalPair.toPoseIndex;
-            stampedBelief.fromStampSec = intervalPair.fromStampSec;
-            stampedBelief.toStampSec = intervalPair.toStampSec;
+            stampedBelief.fromPoseIndex = fromIndex;
+            stampedBelief.toPoseIndex = toIndex;
+            stampedBelief.fromStampSec = localPoseTimestampsSec[fromIndex];
+            stampedBelief.toStampSec = localPoseTimestampsSec[toIndex];
             stampedBelief.senderTimestampNs =
                 static_cast<uint64_t>(std::llround(stampedBelief.toStampSec * 1e9));
             stampedBelief.senderFrameId = odometryFrame;
@@ -1661,16 +1473,6 @@ public:
                                  &stampedBelief.covariance);
             convertOutgoingLidarOdomBeliefToExchangeFrame(&stampedBelief);
             outgoingStamped.push_back(stampedBelief);
-            sentPairs.insert(pairKey);
-            logOutgoingIntervalRow(intervalPair, odom.covariance.trace(), "sent");
-        }
-
-        for (const auto& pair : intervalPairs) {
-            if (sentPairs.count(std::make_pair(pair.fromKey, pair.toKey)) == 0u) {
-                logOutgoingIntervalRow(pair,
-                                       std::numeric_limits<double>::quiet_NaN(),
-                                       "skipped_bpsam");
-            }
         }
 
         {
@@ -1824,36 +1626,6 @@ public:
         nh.param<std::string>("liorf/cbsOdomBeliefOutTopic",
                               cbsOdomBeliefOutTopic,
                               "liorf/cbs/odom_belief_out");
-        nh.param<std::string>("liorf/cbsOdomIntervalMode",
-                              cbsOdomIntervalMode,
-                              "adjacent");
-        cbsOdomIntervalMode = normalizeModeToken(cbsOdomIntervalMode);
-        if (cbsOdomIntervalMode != "adjacent" &&
-            cbsOdomIntervalMode != "multi_horizon") {
-            ROS_WARN_STREAM("Invalid liorf/cbsOdomIntervalMode='"
-                            << cbsOdomIntervalMode
-                            << "', falling back to adjacent.");
-            cbsOdomIntervalMode = "adjacent";
-        }
-        nh.param<std::string>("liorf/cbsOdomIntervalHorizonsSec",
-                              cbsOdomIntervalHorizonsSecParam,
-                              "0.3,0.5,1.0,1.5,2.0");
-        cbsOdomIntervalHorizonsSec =
-            parsePositiveDoubleList(cbsOdomIntervalHorizonsSecParam,
-                                    cbsOdomIntervalHorizonsSec);
-        nh.param<double>("liorf/cbsOdomIntervalHorizonToleranceSec",
-                         cbsOdomIntervalHorizonToleranceSec,
-                         0.15);
-        if (!std::isfinite(cbsOdomIntervalHorizonToleranceSec) ||
-            cbsOdomIntervalHorizonToleranceSec < 0.0) {
-            cbsOdomIntervalHorizonToleranceSec = 0.15;
-        }
-        int cbsOdomMaxOutgoingBeliefsParam = 80;
-        nh.param<int>("liorf/cbsOdomMaxOutgoingBeliefs",
-                      cbsOdomMaxOutgoingBeliefsParam,
-                      80);
-        cbsOdomMaxOutgoingBeliefs =
-            static_cast<size_t>(std::max(1, cbsOdomMaxOutgoingBeliefsParam));
         nh.param<double>("liorf/cbsOdomUnmatchedRetryMaxAgeSec",
                          cbsOdomUnmatchedRetryMaxAgeSec,
                          5.0);
@@ -2007,12 +1779,7 @@ public:
         ROS_INFO_STREAM("LiORF CBS belief window: " << beliefExchangeWindowSize
                         << " poses, max iSAM2 root size="
                         << cbsBeliefMaxRootSize);
-        ROS_INFO_STREAM("LiORF CBS odometry interval mode: "
-                        << cbsOdomIntervalMode
-                        << " horizons='" << cbsOdomIntervalHorizonsSecParam
-                        << "' parsed=" << cbsOdomIntervalHorizonsSec.size()
-                        << " tolerance=" << cbsOdomIntervalHorizonToleranceSec
-                        << " max_outgoing=" << cbsOdomMaxOutgoingBeliefs
+        ROS_INFO_STREAM("LiORF CBS outgoing odometry mode: adjacent-only"
                         << " retry_max_age="
                         << cbsOdomUnmatchedRetryMaxAgeSec
                         << " retry_max_beliefs="
@@ -2330,6 +2097,18 @@ public:
                 trajectory,
                 Eigen::Vector4f(255.f, 160.f, 0.f, 255.f),
                 3.f);
+            if (trajectory.size() >= 2u) {
+                std::vector<std::pair<Point3, Point3>> trajectorySegments;
+                trajectorySegments.reserve(trajectory.size() - 1u);
+                for (size_t i = 1u; i < trajectory.size(); ++i) {
+                    trajectorySegments.emplace_back(trajectory[i - 1u], trajectory[i]);
+                }
+                rerunVisualizer->drawLines(
+                    "liorf/trajectory_line",
+                    trajectorySegments,
+                    {Eigen::Vector4f(255.f, 190.f, 0.f, 255.f)},
+                    1.5f);
+            }
         }
 
         if (rerunFactorGraphEnable && bpsam && isamCurrentEstimate.size() > 0u) {
