@@ -2,6 +2,7 @@
   <arg name="project" default="liorf"/>
   <arg name="config_file" default="$(find liorf)/config/s3e_alpha.yaml"/>
   <arg name="initial_yaw_sigma" default="3.141592653589793"/>
+  <arg name="cbs_backend_mode" default="map_optimization"/>
   <arg name="cbs_belief_timestamp_tolerance_sec" default="0.12"/>
   <arg name="cbs_belief_reject_first_message" default="true"/>
   <arg name="cbs_enable_soft_reset" default="true"/>
@@ -40,6 +41,7 @@
 
   <rosparam file="$(arg config_file)" command="load" />
   <param name="/liorf/initialYawSigma" value="$(arg initial_yaw_sigma)"/>
+  <param name="/liorf/cbsBackendMode" value="$(arg cbs_backend_mode)"/>
   <param name="/liorf/cbsBeliefTimestampToleranceSec"
          value="$(arg cbs_belief_timestamp_tolerance_sec)"/>
   <param name="/liorf/cbsBeliefRejectFirstMessage"

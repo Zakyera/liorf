@@ -1,5 +1,9 @@
 #include "utility.h"
 
+#include "liorf/pose_odom_belief_array.h"
+
+#include <cbs/bpsam/incremental_fixed_lag_bpsam_smoother.h>
+#include <cbs/key.h>
 #include <gtsam/geometry/Rot3.h>
 #include <gtsam/geometry/Pose3.h>
 #include <gtsam/slam/PriorFactor.h>
@@ -15,12 +19,134 @@
 
 #include <gtsam/nonlinear/ISAM2.h>
 #include <gtsam/nonlinear/IncrementalFixedLagSmoother.h>
+#include <rosgraph_msgs/Clock.h>
 
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cctype>
+#include <cmath>
+#include <deque>
+#include <iomanip>
+#include <limits>
+#include <map>
 #include <memory>
+#include <mutex>
+#include <set>
+#include <sstream>
+#include <string>
+#include <vector>
 
 using gtsam::symbol_shorthand::X; // Pose3 (x,y,z,r,p,y)
 using gtsam::symbol_shorthand::V; // Vel   (xdot,ydot,zdot)
 using gtsam::symbol_shorthand::B; // Bias  (ax,ay,az,gx,gy,gz)
+
+namespace {
+
+struct ImuCbsStampedOdomBelief
+{
+    cbs::AgentId sourceAgent = 0;
+    size_t fromPoseIndex = 0;
+    size_t toPoseIndex = 0;
+    double fromStampSec = -1.0;
+    double toStampSec = -1.0;
+    std::array<double, 6> relativeMu{};
+    std::array<double, 36> covariance{};
+    double relaxFactor = 0.0;
+    double receivedWallTimeSec = 0.0;
+};
+
+cbs::AgentId resolveCbsAgentId(const std::string& id, cbs::AgentId fallback)
+{
+    if (id.size() == 1u) {
+        return static_cast<cbs::AgentId>(id[0]);
+    }
+    try {
+        const int numeric = std::stoi(id);
+        if (numeric >= 0 && numeric <= std::numeric_limits<uint8_t>::max()) {
+            return static_cast<cbs::AgentId>(numeric);
+        }
+    } catch (...) {
+    }
+    return fallback;
+}
+
+gtsam::Vector6 vector6FromArray(const std::array<double, 6>& values)
+{
+    gtsam::Vector6 vector;
+    for (size_t i = 0; i < values.size(); ++i) {
+        vector(static_cast<Eigen::Index>(i)) = values[i];
+    }
+    return vector;
+}
+
+void vector6ToArray(const gtsam::Vector6& vector, std::array<double, 6>* values)
+{
+    if (!values) {
+        return;
+    }
+    for (size_t i = 0; i < values->size(); ++i) {
+        (*values)[i] = vector(static_cast<Eigen::Index>(i));
+    }
+}
+
+gtsam::Matrix6 matrix6FromArray(const std::array<double, 36>& values)
+{
+    gtsam::Matrix6 matrix;
+    for (size_t r = 0; r < 6u; ++r) {
+        for (size_t c = 0; c < 6u; ++c) {
+            matrix(static_cast<Eigen::Index>(r), static_cast<Eigen::Index>(c)) =
+                values[r * 6u + c];
+        }
+    }
+    return matrix;
+}
+
+void matrix6ToArray(const gtsam::Matrix& matrix, std::array<double, 36>* values)
+{
+    if (!values) {
+        return;
+    }
+    values->fill(std::numeric_limits<double>::quiet_NaN());
+    if (matrix.rows() != 6 || matrix.cols() != 6) {
+        return;
+    }
+    for (size_t r = 0; r < 6u; ++r) {
+        for (size_t c = 0; c < 6u; ++c) {
+            (*values)[r * 6u + c] =
+                matrix(static_cast<Eigen::Index>(r), static_cast<Eigen::Index>(c));
+        }
+    }
+}
+
+bool finiteArray(const std::array<double, 6>& values)
+{
+    for (const double value : values) {
+        if (!std::isfinite(value)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool finiteArray(const std::array<double, 36>& values)
+{
+    for (const double value : values) {
+        if (!std::isfinite(value)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::string cbsPoseToken(cbs::AgentId agent, size_t index)
+{
+    std::ostringstream ss;
+    ss << static_cast<char>(agent) << index;
+    return ss.str();
+}
+
+} // namespace
 
 class TransformFusion : public ParamServer
 {
@@ -163,7 +289,10 @@ public:
 
     ros::Subscriber subImu;
     ros::Subscriber subOdometry;
+    ros::Subscriber subPoseOdomBeliefsIn;
+    ros::Subscriber subCbsBeliefReceiveClock;
     ros::Publisher pubImuOdometry;
+    ros::Publisher pubPoseOdomBeliefsOut;
 
     bool systemInitialized = false;
 
@@ -194,12 +323,48 @@ public:
     double lastImuT_opt = -1;
 
     gtsam::ISAM2 optimizer;
+    std::unique_ptr<cbs::IncrementalFixedLagBpsamSmoother> cbsSmoother;
     gtsam::NonlinearFactorGraph graphFactors;
     gtsam::Values graphValues;
 
     const double delta_t = 0;
 
     int key = 1;
+
+    bool cbsBeliefBridgeEnable = true;
+    bool cbsImuBackendEnable = false;
+    bool cbsBeliefRejectFirstMessage = true;
+    bool cbsEnableSoftReset = true;
+    bool cbsUseRawPreviousBeliefGate = false;
+    bool cbsUseTemporaryCbsLinearFactors = true;
+    bool cbsTemporaryLinearAlreadyAppliedGateEnable = true;
+    double cbsTemporaryLinearAlreadyAppliedMetricThreshold = 0.01;
+    double cbsTemporaryLinearAlreadyAppliedDmuThreshold = 1e-3;
+    double cbsTemporaryLinearAlreadyAppliedCovRelThreshold = 1e-3;
+    double cbsDReset = 0.1;
+    double cbsK2LOdomFactorCovarianceScale = 1.0;
+    double cbsBeliefReceiveStartDelaySec = 0.0;
+    bool cbsBeliefReceiveGateReferenceSet = false;
+    double cbsBeliefReceiveGateReferenceStampSec = 0.0;
+    double cbsBeliefTimestampToleranceSec = 0.12;
+    int cbsBeliefExchangeWindowSize = 30;
+    double cbsOdomUnmatchedRetryMaxAgeSec = 5.0;
+    size_t cbsOdomUnmatchedRetryMaxBeliefs = 500u;
+    std::string cbsBackendMode = "map_optimization";
+    std::string cbsOdomBeliefInTopic = "liorf/cbs/odom_belief_in";
+    std::string cbsOdomBeliefOutTopic = "liorf/cbs/odom_belief_out";
+    cbs::AgentId selfAgentId = static_cast<cbs::AgentId>('l');
+    cbs::AgentId kimeraAgentId = static_cast<cbs::AgentId>('k');
+
+    std::mutex mtxCbsBeliefs;
+    std::deque<ImuCbsStampedOdomBelief> incomingCbsOdomBeliefs;
+    std::vector<double> cbsPoseTimestampsSec;
+    std::atomic<size_t> cbsIncomingReceivedTotal{0u};
+    std::atomic<size_t> cbsIncomingMatchedTotal{0u};
+    std::atomic<size_t> cbsIncomingDroppedTotal{0u};
+    std::atomic<size_t> cbsIncomingAddedTotal{0u};
+    std::atomic<size_t> cbsIncomingRejectedTotal{0u};
+    std::atomic<size_t> cbsOutgoingPublishedTotal{0u};
     
     // T_bl: tramsform points from lidar frame to imu frame 
     gtsam::Pose3 imu2Lidar = gtsam::Pose3(gtsam::Rot3(1, 0, 0, 0), gtsam::Point3(-extTrans.x(), -extTrans.y(), -extTrans.z()));
@@ -208,10 +373,34 @@ public:
 
     IMUPreintegration()
     {
+        configureCbsBackend();
+
         subImu      = nh.subscribe<sensor_msgs::Imu>  (imuTopic,                   2000, &IMUPreintegration::imuHandler,      this, ros::TransportHints().tcpNoDelay());
         subOdometry = nh.subscribe<nav_msgs::Odometry>("liorf/mapping/odometry_incremental", 5,    &IMUPreintegration::odometryHandler, this, ros::TransportHints().tcpNoDelay());
 
         pubImuOdometry = nh.advertise<nav_msgs::Odometry> (odomTopic+"_incremental", 2000);
+
+        if (cbsImuBackendEnable && cbsBeliefBridgeEnable) {
+            subPoseOdomBeliefsIn =
+                nh.subscribe<liorf::pose_odom_belief_array>(
+                    cbsOdomBeliefInTopic,
+                    50,
+                    &IMUPreintegration::poseOdomBeliefInHandler,
+                    this,
+                    ros::TransportHints().tcpNoDelay());
+            pubPoseOdomBeliefsOut =
+                nh.advertise<liorf::pose_odom_belief_array>(
+                    cbsOdomBeliefOutTopic, 50);
+            if (cbsBeliefReceiveStartDelaySec > 0.0) {
+                subCbsBeliefReceiveClock =
+                    nh.subscribe<rosgraph_msgs::Clock>(
+                        "/clock",
+                        10,
+                        &IMUPreintegration::cbsBeliefReceiveClockHandler,
+                        this,
+                        ros::TransportHints().tcpNoDelay());
+            }
+        }
 
         std::shared_ptr<gtsam::PreintegrationParams> p = gtsam::PreintegrationParams::MakeSharedU(imuGravity);
         p->accelerometerCovariance  = gtsam::Matrix33::Identity(3,3) * pow(imuAccNoise, 2); // acc white noise in continuous
@@ -240,18 +429,582 @@ public:
         imuIntegratorOpt_ = new gtsam::PreintegratedImuMeasurements(p, prior_imu_bias); // setting up the IMU integration for optimization        
     }
 
+    void configureCbsBackend()
+    {
+        nh.param<std::string>("liorf/cbsBackendMode",
+                              cbsBackendMode,
+                              "map_optimization");
+        std::transform(cbsBackendMode.begin(),
+                       cbsBackendMode.end(),
+                       cbsBackendMode.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        if (cbsBackendMode != "map_optimization" &&
+            cbsBackendMode != "imu_preintegration" &&
+            cbsBackendMode != "off") {
+            ROS_WARN_STREAM("Unknown LiORF CBS backend mode '"
+                            << cbsBackendMode
+                            << "'; falling back to map_optimization");
+            cbsBackendMode = "map_optimization";
+        }
+        cbsImuBackendEnable = cbsBackendMode == "imu_preintegration";
+
+        nh.param<bool>("liorf/cbsBeliefBridgeEnable", cbsBeliefBridgeEnable, true);
+        if (cbsBackendMode == "off") {
+            cbsBeliefBridgeEnable = false;
+        }
+        nh.param<bool>("liorf/cbsBeliefRejectFirstMessage",
+                       cbsBeliefRejectFirstMessage,
+                       true);
+        nh.param<bool>("liorf/cbsEnableSoftReset", cbsEnableSoftReset, true);
+        nh.param<bool>("liorf/cbsUseRawPreviousBeliefGate",
+                       cbsUseRawPreviousBeliefGate,
+                       false);
+        nh.param<bool>("liorf/cbsUseTemporaryCbsLinearFactors",
+                       cbsUseTemporaryCbsLinearFactors,
+                       true);
+        nh.param<bool>("liorf/cbsTemporaryLinearAlreadyAppliedGateEnable",
+                       cbsTemporaryLinearAlreadyAppliedGateEnable,
+                       true);
+        nh.param<double>("liorf/cbsTemporaryLinearAlreadyAppliedMetricThreshold",
+                         cbsTemporaryLinearAlreadyAppliedMetricThreshold,
+                         0.01);
+        nh.param<double>("liorf/cbsTemporaryLinearAlreadyAppliedDmuThreshold",
+                         cbsTemporaryLinearAlreadyAppliedDmuThreshold,
+                         1e-3);
+        nh.param<double>("liorf/cbsTemporaryLinearAlreadyAppliedCovRelThreshold",
+                         cbsTemporaryLinearAlreadyAppliedCovRelThreshold,
+                         1e-3);
+        nh.param<double>("liorf/cbsDReset", cbsDReset, 0.1);
+        nh.param<double>("liorf/cbsK2LOdomFactorCovarianceScale",
+                         cbsK2LOdomFactorCovarianceScale,
+                         1.0);
+        nh.param<double>("liorf/cbsBeliefReceiveStartDelaySec",
+                         cbsBeliefReceiveStartDelaySec,
+                         0.0);
+        nh.param<double>("liorf/cbsBeliefTimestampToleranceSec",
+                         cbsBeliefTimestampToleranceSec,
+                         0.12);
+        nh.param<int>("liorf/cbsBeliefExchangeWindowSize",
+                      cbsBeliefExchangeWindowSize,
+                      30);
+        nh.param<double>("liorf/cbsOdomUnmatchedRetryMaxAgeSec",
+                         cbsOdomUnmatchedRetryMaxAgeSec,
+                         5.0);
+        int cbsOdomUnmatchedRetryMaxBeliefsParam = 500;
+        nh.param<int>("liorf/cbsOdomUnmatchedRetryMaxBeliefs",
+                      cbsOdomUnmatchedRetryMaxBeliefsParam,
+                      500);
+        nh.param<std::string>("liorf/cbsOdomBeliefInTopic",
+                              cbsOdomBeliefInTopic,
+                              "liorf/cbs/odom_belief_in");
+        nh.param<std::string>("liorf/cbsOdomBeliefOutTopic",
+                              cbsOdomBeliefOutTopic,
+                              "liorf/cbs/odom_belief_out");
+
+        std::string cbsAgentId = "l";
+        nh.param<std::string>("liorf/cbsAgentId", cbsAgentId, "l");
+        selfAgentId = resolveCbsAgentId(cbsAgentId, static_cast<cbs::AgentId>('l'));
+
+        if (!std::isfinite(cbsBeliefTimestampToleranceSec) ||
+            cbsBeliefTimestampToleranceSec <= 0.0) {
+            cbsBeliefTimestampToleranceSec = 0.12;
+        }
+        if (!std::isfinite(cbsBeliefReceiveStartDelaySec) ||
+            cbsBeliefReceiveStartDelaySec < 0.0) {
+            cbsBeliefReceiveStartDelaySec = 0.0;
+        }
+        cbsBeliefExchangeWindowSize = std::max(1, cbsBeliefExchangeWindowSize);
+        if (!std::isfinite(cbsOdomUnmatchedRetryMaxAgeSec) ||
+            cbsOdomUnmatchedRetryMaxAgeSec < 0.0) {
+            cbsOdomUnmatchedRetryMaxAgeSec = 5.0;
+        }
+        cbsOdomUnmatchedRetryMaxBeliefs =
+            static_cast<size_t>(std::max(0, cbsOdomUnmatchedRetryMaxBeliefsParam));
+        if (!std::isfinite(cbsK2LOdomFactorCovarianceScale) ||
+            cbsK2LOdomFactorCovarianceScale <= 0.0) {
+            cbsK2LOdomFactorCovarianceScale = 1.0;
+        }
+
+        ROS_INFO_STREAM("LiORF IMU CBS backend mode: " << cbsBackendMode
+                        << " bridge="
+                        << (cbsBeliefBridgeEnable ? "enabled" : "disabled")
+                        << " imu_backend="
+                        << (cbsImuBackendEnable ? "enabled" : "disabled"));
+    }
+
+    cbs::BPSAM::Params makeCbsParams() const
+    {
+        cbs::BPSAM::Params params;
+        params.robot_id = selfAgentId;
+        params.sam_params_.relinearizeThreshold = 0.1;
+        params.sam_params_.relinearizeSkip = 1;
+        gtsam::ISAM2GaussNewtonParams gaussNewtonParams;
+        params.sam_params_.optimizationParams = gaussNewtonParams;
+        params.reject_first_message = cbsBeliefRejectFirstMessage;
+        params.gbp_update_params.enable_soft_reset = cbsEnableSoftReset;
+        params.gbp_update_params.d_reset = cbsDReset;
+        params.use_raw_previous_belief_gate = cbsUseRawPreviousBeliefGate;
+        params.use_temporary_cbs_linear_factors = cbsUseTemporaryCbsLinearFactors;
+        params.temporary_linear_already_applied_gate_enable =
+            cbsTemporaryLinearAlreadyAppliedGateEnable;
+        params.temporary_linear_already_applied_metric_threshold =
+            cbsTemporaryLinearAlreadyAppliedMetricThreshold;
+        params.temporary_linear_already_applied_dmu_threshold =
+            cbsTemporaryLinearAlreadyAppliedDmuThreshold;
+        params.temporary_linear_already_applied_cov_rel_threshold =
+            cbsTemporaryLinearAlreadyAppliedCovRelThreshold;
+        params.external_factor_covariance_scale_by_source[kimeraAgentId] =
+            cbsK2LOdomFactorCovarianceScale;
+        return params;
+    }
+
+    gtsam::FixedLagSmoother::KeyTimestampMap makeCbsStateTimestamps(int stateIndex) const
+    {
+        gtsam::FixedLagSmoother::KeyTimestampMap timestamps;
+        const double timestamp = static_cast<double>(stateIndex);
+        timestamps[X(stateIndex)] = timestamp;
+        timestamps[V(stateIndex)] = timestamp;
+        timestamps[B(stateIndex)] = timestamp;
+        return timestamps;
+    }
+
+    void recordCbsPoseTimestamp(size_t index, double stampSec)
+    {
+        if (!cbsImuBackendEnable || !std::isfinite(stampSec)) {
+            return;
+        }
+        if (cbsPoseTimestampsSec.size() <= index) {
+            cbsPoseTimestampsSec.resize(index + 1u, -1.0);
+        }
+        cbsPoseTimestampsSec[index] = stampSec;
+    }
+
     void resetOptimization()
     {
         gtsam::ISAM2Params optParameters;
         optParameters.relinearizeThreshold = 0.1;
         optParameters.relinearizeSkip = 1;
-        optimizer = gtsam::ISAM2(optParameters);
+
+        if (cbsImuBackendEnable) {
+            cbsSmoother = std::make_unique<cbs::IncrementalFixedLagBpsamSmoother>(
+                static_cast<double>(cbsBeliefExchangeWindowSize),
+                makeCbsParams());
+            cbsPoseTimestampsSec.clear();
+            {
+                std::lock_guard<std::mutex> lock(mtxCbsBeliefs);
+                incomingCbsOdomBeliefs.clear();
+            }
+            cbsBeliefReceiveGateReferenceSet = false;
+        } else {
+            cbsSmoother.reset();
+            optimizer = gtsam::ISAM2(optParameters);
+        }
 
         gtsam::NonlinearFactorGraph newGraphFactors;
         graphFactors = newGraphFactors;
 
         gtsam::Values NewGraphValues;
         graphValues = NewGraphValues;
+    }
+
+    void updateBackend(
+        const gtsam::FixedLagSmoother::KeyTimestampMap& timestamps =
+            gtsam::FixedLagSmoother::KeyTimestampMap())
+    {
+        if (cbsImuBackendEnable) {
+            cbsSmoother->update(graphFactors, graphValues, timestamps);
+        } else {
+            optimizer.update(graphFactors, graphValues);
+        }
+    }
+
+    void updateBackendEmpty()
+    {
+        if (cbsImuBackendEnable) {
+            cbsSmoother->update();
+        } else {
+            optimizer.update();
+        }
+    }
+
+    gtsam::Values calculateBackendEstimate() const
+    {
+        if (cbsImuBackendEnable) {
+            return cbsSmoother->calculateEstimate();
+        }
+        return optimizer.calculateEstimate();
+    }
+
+    gtsam::Matrix marginalCovarianceForKey(gtsam::Key key) const
+    {
+        if (cbsImuBackendEnable) {
+            return cbsSmoother->marginalCovariance(key);
+        }
+        return optimizer.marginalCovariance(key);
+    }
+
+    double cbsGateStamp(const ImuCbsStampedOdomBelief& belief) const
+    {
+        if (std::isfinite(belief.toStampSec) && belief.toStampSec > 0.0) {
+            return belief.toStampSec;
+        }
+        return belief.fromStampSec;
+    }
+
+    void initializeCbsReceiveGateFromMessage(const liorf::pose_odom_belief_array& msg)
+    {
+        if (cbsBeliefReceiveStartDelaySec <= 0.0 ||
+            cbsBeliefReceiveGateReferenceSet) {
+            return;
+        }
+        const double stampSec = msg.header.stamp.toSec();
+        if (!std::isfinite(stampSec) || stampSec <= 0.0) {
+            return;
+        }
+        cbsBeliefReceiveGateReferenceStampSec = stampSec;
+        cbsBeliefReceiveGateReferenceSet = true;
+        ROS_INFO_STREAM(std::fixed << std::setprecision(9)
+                        << "LiORF IMU CBS receive gate reference stamp="
+                        << cbsBeliefReceiveGateReferenceStampSec
+                        << ", accepting belief odometry after "
+                        << (cbsBeliefReceiveGateReferenceStampSec +
+                            cbsBeliefReceiveStartDelaySec));
+    }
+
+    bool isBeforeCbsReceiveGate(const ImuCbsStampedOdomBelief& belief) const
+    {
+        if (cbsBeliefReceiveStartDelaySec <= 0.0 ||
+            !cbsBeliefReceiveGateReferenceSet) {
+            return false;
+        }
+        const double stampSec = cbsGateStamp(belief);
+        if (!std::isfinite(stampSec) || stampSec <= 0.0) {
+            return true;
+        }
+        return stampSec <
+               cbsBeliefReceiveGateReferenceStampSec +
+                   cbsBeliefReceiveStartDelaySec;
+    }
+
+    void cbsBeliefReceiveClockHandler(const rosgraph_msgs::ClockConstPtr& msg)
+    {
+        if (!msg || cbsBeliefReceiveStartDelaySec <= 0.0 ||
+            cbsBeliefReceiveGateReferenceSet) {
+            return;
+        }
+        const double stampSec = msg->clock.toSec();
+        if (!std::isfinite(stampSec) || stampSec <= 0.0) {
+            return;
+        }
+        cbsBeliefReceiveGateReferenceStampSec = stampSec;
+        cbsBeliefReceiveGateReferenceSet = true;
+        subCbsBeliefReceiveClock.shutdown();
+        ROS_INFO_STREAM(std::fixed << std::setprecision(9)
+                        << "LiORF IMU CBS receive gate reference stamp="
+                        << cbsBeliefReceiveGateReferenceStampSec
+                        << " from /clock, accepting belief odometry after "
+                        << (cbsBeliefReceiveGateReferenceStampSec +
+                            cbsBeliefReceiveStartDelaySec));
+    }
+
+    void poseOdomBeliefInHandler(const liorf::pose_odom_belief_arrayConstPtr& msg)
+    {
+        if (!msg || !cbsImuBackendEnable || !cbsBeliefBridgeEnable) {
+            return;
+        }
+
+        initializeCbsReceiveGateFromMessage(*msg);
+        size_t droppedByGate = 0u;
+        size_t enqueued = 0u;
+        std::deque<ImuCbsStampedOdomBelief> newBeliefs;
+
+        for (const auto& beliefMsg : msg->beliefs) {
+            ImuCbsStampedOdomBelief belief;
+            belief.sourceAgent = static_cast<cbs::AgentId>(beliefMsg.source_agent);
+            if (belief.sourceAgent == selfAgentId) {
+                continue;
+            }
+            belief.fromPoseIndex = static_cast<size_t>(beliefMsg.from_pose_index);
+            belief.toPoseIndex = static_cast<size_t>(beliefMsg.to_pose_index);
+            belief.fromStampSec = beliefMsg.from_stamp_sec;
+            belief.toStampSec = beliefMsg.to_stamp_sec > 0.0
+                                    ? beliefMsg.to_stamp_sec
+                                    : beliefMsg.header.stamp.toSec();
+            belief.relaxFactor = beliefMsg.relax_factor;
+            belief.receivedWallTimeSec = ros::WallTime::now().toSec();
+            for (size_t i = 0; i < belief.relativeMu.size(); ++i) {
+                belief.relativeMu[i] = beliefMsg.relative_mu[i];
+            }
+            for (size_t i = 0; i < belief.covariance.size(); ++i) {
+                belief.covariance[i] = beliefMsg.covariance[i];
+            }
+            if (!finiteArray(belief.relativeMu) || !finiteArray(belief.covariance) ||
+                isBeforeCbsReceiveGate(belief)) {
+                ++droppedByGate;
+                continue;
+            }
+            newBeliefs.push_back(belief);
+            ++enqueued;
+        }
+
+        if (!newBeliefs.empty()) {
+            std::lock_guard<std::mutex> lock(mtxCbsBeliefs);
+            for (const auto& belief : newBeliefs) {
+                incomingCbsOdomBeliefs.push_back(belief);
+            }
+        }
+        cbsIncomingReceivedTotal.fetch_add(enqueued, std::memory_order_relaxed);
+        cbsIncomingDroppedTotal.fetch_add(droppedByGate, std::memory_order_relaxed);
+    }
+
+    bool findClosestCbsPoseIndexByTimestamp(double stampSec,
+                                            size_t* index,
+                                            double* absDt) const
+    {
+        if (!std::isfinite(stampSec) || stampSec <= 0.0 ||
+            cbsPoseTimestampsSec.empty()) {
+            return false;
+        }
+
+        double bestDt = std::numeric_limits<double>::infinity();
+        size_t bestIndex = 0u;
+        for (size_t i = 0; i < cbsPoseTimestampsSec.size(); ++i) {
+            const double candidate = cbsPoseTimestampsSec[i];
+            if (!std::isfinite(candidate) || candidate <= 0.0) {
+                continue;
+            }
+            const double dt = std::abs(candidate - stampSec);
+            if (dt < bestDt) {
+                bestDt = dt;
+                bestIndex = i;
+            }
+        }
+
+        if (!std::isfinite(bestDt) || bestDt > cbsBeliefTimestampToleranceSec) {
+            return false;
+        }
+        if (index) {
+            *index = bestIndex;
+        }
+        if (absDt) {
+            *absDt = bestDt;
+        }
+        return true;
+    }
+
+    bool shouldRetryCbsBelief(const ImuCbsStampedOdomBelief& belief) const
+    {
+        if (cbsOdomUnmatchedRetryMaxBeliefs == 0u ||
+            cbsPoseTimestampsSec.empty()) {
+            return false;
+        }
+        double latestStamp = -1.0;
+        for (auto it = cbsPoseTimestampsSec.rbegin();
+             it != cbsPoseTimestampsSec.rend();
+             ++it) {
+            if (std::isfinite(*it) && *it > 0.0) {
+                latestStamp = *it;
+                break;
+            }
+        }
+        if (latestStamp <= 0.0) {
+            return true;
+        }
+        const double stampSec = cbsGateStamp(belief);
+        if (!std::isfinite(stampSec) || stampSec <= 0.0) {
+            return false;
+        }
+        return latestStamp - stampSec <= cbsOdomUnmatchedRetryMaxAgeSec;
+    }
+
+    size_t consumeIncomingCbsOdomBeliefs()
+    {
+        if (!cbsImuBackendEnable || !cbsSmoother) {
+            return 0u;
+        }
+
+        std::deque<ImuCbsStampedOdomBelief> pending;
+        {
+            std::lock_guard<std::mutex> lock(mtxCbsBeliefs);
+            pending.swap(incomingCbsOdomBeliefs);
+        }
+        if (pending.empty()) {
+            return 0u;
+        }
+
+        size_t matched = 0u;
+        size_t dropped = 0u;
+        size_t retried = 0u;
+        size_t accepted = 0u;
+        size_t rejected = 0u;
+        std::vector<ImuCbsStampedOdomBelief> retryBeliefs;
+
+        for (const auto& incoming : pending) {
+            size_t fromIndex = 0u;
+            size_t toIndex = 0u;
+            double fromAbsDt = std::numeric_limits<double>::quiet_NaN();
+            double toAbsDt = std::numeric_limits<double>::quiet_NaN();
+            const bool fromMatched = findClosestCbsPoseIndexByTimestamp(
+                incoming.fromStampSec, &fromIndex, &fromAbsDt);
+            const bool toMatched = findClosestCbsPoseIndexByTimestamp(
+                incoming.toStampSec, &toIndex, &toAbsDt);
+            if (!fromMatched || !toMatched || fromIndex == toIndex) {
+                if (shouldRetryCbsBelief(incoming)) {
+                    retryBeliefs.push_back(incoming);
+                    ++retried;
+                } else {
+                    ++dropped;
+                }
+                continue;
+            }
+            ++matched;
+
+            cbs::BPSAM::CbsOdometryBelief odomBelief;
+            odomBelief.source_agent = incoming.sourceAgent;
+            odomBelief.from_pose_key = X(static_cast<int>(fromIndex));
+            odomBelief.to_pose_key = X(static_cast<int>(toIndex));
+            odomBelief.sender_from_pose_key =
+                cbs::toPoseKey(incoming.sourceAgent, incoming.fromPoseIndex);
+            odomBelief.sender_to_pose_key =
+                cbs::toPoseKey(incoming.sourceAgent, incoming.toPoseIndex);
+            odomBelief.measured_from_to =
+                gtsam::Pose3::Expmap(vector6FromArray(incoming.relativeMu));
+            odomBelief.covariance = matrix6FromArray(incoming.covariance);
+            odomBelief.relax_factor = incoming.relaxFactor;
+
+            std::vector<cbs::BPSAM::CbsOdometryBelief> singleBelief;
+            singleBelief.push_back(std::move(odomBelief));
+            const auto addResult =
+                cbsSmoother->addOdometryBeliefsDetailed(std::move(singleBelief));
+            accepted += addResult.accepted;
+            accepted += addResult.accepted_but_skipped_already_applied;
+            rejected += addResult.rejected();
+            for (const auto& detail : addResult.details) {
+                ROS_INFO_STREAM(
+                    "LIORF_IMU_CBS_ODOM_ADD_ROW,"
+                    << cbsPoseToken(incoming.sourceAgent, incoming.fromPoseIndex)
+                    << "->"
+                    << cbsPoseToken(incoming.sourceAgent, incoming.toPoseIndex)
+                    << ","
+                    << cbsPoseToken(selfAgentId, fromIndex)
+                    << "->"
+                    << cbsPoseToken(selfAgentId, toIndex)
+                    << ","
+                    << fromAbsDt << ","
+                    << toAbsDt << ","
+                    << static_cast<int>(detail.status) << ","
+                    << detail.covariance_trace << ","
+                    << detail.message);
+            }
+        }
+
+        if (!retryBeliefs.empty()) {
+            std::lock_guard<std::mutex> lock(mtxCbsBeliefs);
+            for (const auto& belief : retryBeliefs) {
+                incomingCbsOdomBeliefs.push_back(belief);
+            }
+            while (incomingCbsOdomBeliefs.size() >
+                   cbsOdomUnmatchedRetryMaxBeliefs) {
+                incomingCbsOdomBeliefs.pop_front();
+                ++dropped;
+            }
+        }
+
+        cbsIncomingMatchedTotal.fetch_add(matched, std::memory_order_relaxed);
+        cbsIncomingDroppedTotal.fetch_add(dropped, std::memory_order_relaxed);
+        cbsIncomingAddedTotal.fetch_add(accepted, std::memory_order_relaxed);
+        cbsIncomingRejectedTotal.fetch_add(rejected, std::memory_order_relaxed);
+        ROS_INFO_STREAM_THROTTLE(
+            1.0,
+            "LiORF IMU CBS incoming odometry flow: dequeued="
+                << pending.size() << " matched=" << matched
+                << " accepted=" << accepted << " rejected=" << rejected
+                << " dropped=" << dropped << " retried=" << retried);
+        return accepted;
+    }
+
+    void refreshOutgoingCbsBeliefs(const ros::Time& stamp)
+    {
+        if (!cbsImuBackendEnable || !cbsBeliefBridgeEnable || !cbsSmoother ||
+            pubPoseOdomBeliefsOut.getNumSubscribers() == 0 ||
+            cbsPoseTimestampsSec.size() < 2u) {
+            return;
+        }
+
+        gtsam::KeySet requestKeys;
+        const size_t lastIndex = cbsPoseTimestampsSec.size() - 1u;
+        const size_t firstIndex = lastIndex > static_cast<size_t>(cbsBeliefExchangeWindowSize)
+                                      ? lastIndex - static_cast<size_t>(cbsBeliefExchangeWindowSize)
+                                      : 0u;
+        for (size_t i = firstIndex; i <= lastIndex; ++i) {
+            if (std::isfinite(cbsPoseTimestampsSec[i]) &&
+                cbsPoseTimestampsSec[i] > 0.0) {
+                requestKeys.insert(X(static_cast<int>(i)));
+            }
+        }
+        if (requestKeys.size() < 2u) {
+            return;
+        }
+
+        std::vector<cbs::BPSAM::CbsOdometryBelief> outgoing;
+        try {
+            cbsSmoother->setMarginalizationGraph(cbs::BPSAM::MarginalizationType::LOCAL);
+            outgoing = cbsSmoother->getOdometryBeliefs(requestKeys, kimeraAgentId);
+        } catch (const std::exception& e) {
+            ROS_WARN_STREAM_THROTTLE(
+                1.0,
+                "LiORF IMU CBS failed to create outgoing odometry beliefs: "
+                    << e.what());
+            return;
+        }
+
+        liorf::pose_odom_belief_array msg;
+        msg.header.stamp = stamp;
+        msg.header.frame_id = odometryFrame;
+        msg.beliefs.reserve(outgoing.size());
+        for (const auto& odom : outgoing) {
+            const size_t fromIndex = gtsam::Symbol(odom.from_pose_key).index();
+            const size_t toIndex = gtsam::Symbol(odom.to_pose_key).index();
+            if (fromIndex >= cbsPoseTimestampsSec.size() ||
+                toIndex >= cbsPoseTimestampsSec.size()) {
+                continue;
+            }
+            if (cbsPoseTimestampsSec[fromIndex] <= 0.0 ||
+                cbsPoseTimestampsSec[toIndex] <= 0.0) {
+                continue;
+            }
+
+            liorf::pose_odom_belief beliefMsg;
+            beliefMsg.header = msg.header;
+            beliefMsg.source_agent = static_cast<uint8_t>(selfAgentId);
+            beliefMsg.from_pose_index = static_cast<uint32_t>(fromIndex);
+            beliefMsg.to_pose_index = static_cast<uint32_t>(toIndex);
+            beliefMsg.from_stamp_sec = cbsPoseTimestampsSec[fromIndex];
+            beliefMsg.to_stamp_sec = cbsPoseTimestampsSec[toIndex];
+            beliefMsg.relax_factor = odom.relax_factor;
+            std::array<double, 6> relativeMu;
+            std::array<double, 36> covariance;
+            vector6ToArray(gtsam::Pose3::Logmap(odom.measured_from_to),
+                           &relativeMu);
+            matrix6ToArray(odom.covariance, &covariance);
+            for (size_t i = 0; i < relativeMu.size(); ++i) {
+                beliefMsg.relative_mu[i] = relativeMu[i];
+            }
+            for (size_t i = 0; i < covariance.size(); ++i) {
+                beliefMsg.covariance[i] = covariance[i];
+            }
+            msg.beliefs.push_back(beliefMsg);
+        }
+
+        pubPoseOdomBeliefsOut.publish(msg);
+        cbsOutgoingPublishedTotal.fetch_add(msg.beliefs.size(),
+                                            std::memory_order_relaxed);
+        ROS_INFO_STREAM_THROTTLE(
+            1.0,
+            "LiORF IMU CBS outgoing odometry flow: published="
+                << msg.beliefs.size()
+                << " total="
+                << cbsOutgoingPublishedTotal.load(std::memory_order_relaxed));
     }
 
     void resetParams()
@@ -315,7 +1068,11 @@ public:
             graphValues.insert(V(0), prevVel_);
             graphValues.insert(B(0), prevBias_);
             // optimize once
-            optimizer.update(graphFactors, graphValues);
+            prevState_ = gtsam::NavState(prevPose_, prevVel_);
+            recordCbsPoseTimestamp(0u, currentCorrectionTime);
+            updateBackend(cbsImuBackendEnable
+                              ? makeCbsStateTimestamps(0)
+                              : gtsam::FixedLagSmoother::KeyTimestampMap());
             graphFactors.resize(0);
             graphValues.clear();
 
@@ -329,12 +1086,12 @@ public:
 
 
         // reset graph for speed
-        if (key == 100)
+        if (!cbsImuBackendEnable && key == 100)
         {
             // get updated noise before reset
-            gtsam::noiseModel::Gaussian::shared_ptr updatedPoseNoise = gtsam::noiseModel::Gaussian::Covariance(optimizer.marginalCovariance(X(key-1)));
-            gtsam::noiseModel::Gaussian::shared_ptr updatedVelNoise  = gtsam::noiseModel::Gaussian::Covariance(optimizer.marginalCovariance(V(key-1)));
-            gtsam::noiseModel::Gaussian::shared_ptr updatedBiasNoise = gtsam::noiseModel::Gaussian::Covariance(optimizer.marginalCovariance(B(key-1)));
+            gtsam::noiseModel::Gaussian::shared_ptr updatedPoseNoise = gtsam::noiseModel::Gaussian::Covariance(marginalCovarianceForKey(X(key-1)));
+            gtsam::noiseModel::Gaussian::shared_ptr updatedVelNoise  = gtsam::noiseModel::Gaussian::Covariance(marginalCovarianceForKey(V(key-1)));
+            gtsam::noiseModel::Gaussian::shared_ptr updatedBiasNoise = gtsam::noiseModel::Gaussian::Covariance(marginalCovarianceForKey(B(key-1)));
             // reset graph
             resetOptimization();
             // add pose
@@ -351,7 +1108,7 @@ public:
             graphValues.insert(V(0), prevVel_);
             graphValues.insert(B(0), prevBias_);
             // optimize once
-            optimizer.update(graphFactors, graphValues);
+            updateBackend();
             graphFactors.resize(0);
             graphValues.clear();
 
@@ -395,18 +1152,25 @@ public:
         graphValues.insert(V(key), propState_.v());
         graphValues.insert(B(key), prevBias_);
         // optimize
-        optimizer.update(graphFactors, graphValues);
-        optimizer.update();
+        recordCbsPoseTimestamp(static_cast<size_t>(key), currentCorrectionTime);
+        updateBackend(cbsImuBackendEnable
+                          ? makeCbsStateTimestamps(key)
+                          : gtsam::FixedLagSmoother::KeyTimestampMap());
+        updateBackendEmpty();
         graphFactors.resize(0);
         graphValues.clear();
+        if (consumeIncomingCbsOdomBeliefs() > 0u) {
+            updateBackendEmpty();
+        }
         // Overwrite the beginning of the preintegration for the next step.
-        gtsam::Values result = optimizer.calculateEstimate();
+        gtsam::Values result = calculateBackendEstimate();
         prevPose_  = result.at<gtsam::Pose3>(X(key));
         prevVel_   = result.at<gtsam::Vector3>(V(key));
         prevState_ = gtsam::NavState(prevPose_, prevVel_);
         prevBias_  = result.at<gtsam::imuBias::ConstantBias>(B(key));
         // Reset the optimization preintegration object.
         imuIntegratorOpt_->resetIntegrationAndSetBias(prevBias_);
+        refreshOutgoingCbsBeliefs(odomMsg->header.stamp);
         // check optimization
         if (failureDetection(prevVel_, prevBias_))
         {

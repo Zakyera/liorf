@@ -266,6 +266,7 @@ public:
     double cbsTemporaryLinearAlreadyAppliedCovRelThreshold = 1e-3;
     bool cbsK2LDebugVisualizationEnable = false;
     bool cbsBeliefBridgeEnable = true;
+    std::string cbsBackendMode = "map_optimization";
     double cbsBeliefReceiveStartDelaySec = 0.0;
     bool cbsBeliefReceiveGateReferenceSet = false;
     double cbsBeliefReceiveGateReferenceStampSec = 0.0;
@@ -1820,6 +1821,9 @@ public:
 
     void refreshOutgoingBeliefs()
     {
+        if (!cbsBeliefBridgeEnable) {
+            return;
+        }
         if (localPoseKeys.empty()) {
             return;
         }
@@ -2030,7 +2034,15 @@ public:
         nh.param<double>("liorf/cbsK2LOdomFactorCovarianceScale",
                          cbsK2LOdomFactorCovarianceScale,
                          1.0);
+        nh.param<std::string>("liorf/cbsBackendMode",
+                              cbsBackendMode,
+                              "map_optimization");
         nh.param<bool>("liorf/cbsBeliefBridgeEnable", cbsBeliefBridgeEnable, true);
+        if (cbsBackendMode != "map_optimization") {
+            cbsBeliefBridgeEnable = false;
+            ROS_INFO_STREAM("LiORF mapOptimization CBS belief bridge disabled because "
+                            << "liorf/cbsBackendMode='" << cbsBackendMode << "'");
+        }
         nh.param<double>("liorf/cbsBeliefReceiveStartDelaySec",
                          cbsBeliefReceiveStartDelaySec,
                          0.0);

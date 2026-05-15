@@ -116,7 +116,8 @@ target_link_libraries(${PROJECT_NAME}_mapOptmization Boost::timer ${opencv3_catk
 
 # IMU Preintegration
 add_executable(${PROJECT_NAME}_imuPreintegration src/imuPreintegration.cpp ${common_lib})
-target_link_libraries(${PROJECT_NAME}_imuPreintegration Boost::timer ${opencv3_catkin_LIBRARIES} ${catkin_LIBRARIES} ${PCL_LIBRARIES} gtsam TBB::tbb TBB::tbbmalloc)
+add_dependencies(${PROJECT_NAME}_imuPreintegration ${catkin_EXPORTED_TARGETS} ${PROJECT_NAME}_generate_messages_cpp)
+target_link_libraries(${PROJECT_NAME}_imuPreintegration Boost::timer ${opencv3_catkin_LIBRARIES} ${catkin_LIBRARIES} ${PCL_LIBRARIES} gtsam TBB::tbb TBB::tbbmalloc cbs)
 
 # BPSAM backend smoke test
 add_executable(${PROJECT_NAME}_bpsam_smoke src/bpsamSmoke.cpp)
