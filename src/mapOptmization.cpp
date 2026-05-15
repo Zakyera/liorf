@@ -4,6 +4,7 @@
 #include "liorf/pose_odom_belief_array.h"
 #include "liorf/save_map.h"
 // <!-- liorf_yjz_lucky_boy -->
+#include <rosgraph_msgs/Clock.h>
 #include <sensor_msgs/NavSatFix.h>
 #include <gtsam/geometry/Rot3.h>
 #include <gtsam/geometry/Pose3.h>
@@ -193,6 +194,7 @@ public:
     Values isamCurrentEstimate;
     Eigen::MatrixXd poseCovariance = Eigen::MatrixXd::Identity(6, 6);
     cbs::AgentId selfAgentId = static_cast<cbs::AgentId>('a');
+    double initialYawSigma = M_PI;
     std::vector<Key> localPoseKeys;
     std::unordered_map<Key, size_t> localPoseKeyToIndex;
     std::vector<double> localPoseTimestampsSec;
@@ -219,11 +221,38 @@ public:
         Key toPoseKey;
     };
 
+    struct RerunK2LPreInjectionDiagnostic
+    {
+        cbs::AgentId sourceAgent;
+        size_t senderFromPoseIndex;
+        size_t senderToPoseIndex;
+        size_t receiverFromPoseIndex;
+        size_t receiverToPoseIndex;
+        double fromStampSec;
+        double toStampSec;
+        Key fromPoseKey;
+        Key toPoseKey;
+        Pose3 receiverFromPosePre;
+        Pose3 receiverToPosePre;
+        Pose3 beliefPredictedToPose;
+        Pose3 receiverDelta;
+        Pose3 beliefDelta;
+        double residualNorm;
+        double rotationalResidualNorm;
+        double translationalResidualNorm;
+        double yawErrorDeg;
+        double translationHeadingErrorDeg;
+        double pullDistance;
+        double mahalanobisDistance;
+        double covarianceTrace;
+    };
+
     std::mutex mtxBeliefExchange;
     std::mutex mtxRerunCbsVisualization;
     std::deque<StampedOdomBelief> incomingStampedOdomBeliefs;
     std::vector<StampedOdomBelief> outgoingStampedOdomBeliefs;
     std::vector<RerunExternalOdomEdge> rerunExternalOdomEdges;
+    std::vector<RerunK2LPreInjectionDiagnostic> rerunK2LPreInjectionDiagnostics;
     size_t beliefExchangeWindowSize = 30;
     size_t cbsBeliefMaxRootSize = 60;
     double beliefTimestampToleranceSec = 0.05;
@@ -235,7 +264,11 @@ public:
     double cbsTemporaryLinearAlreadyAppliedMetricThreshold = 0.01;
     double cbsTemporaryLinearAlreadyAppliedDmuThreshold = 1e-3;
     double cbsTemporaryLinearAlreadyAppliedCovRelThreshold = 1e-3;
+    bool cbsK2LDebugVisualizationEnable = false;
     bool cbsBeliefBridgeEnable = true;
+    double cbsBeliefReceiveStartDelaySec = 0.0;
+    bool cbsBeliefReceiveGateReferenceSet = false;
+    double cbsBeliefReceiveGateReferenceStampSec = 0.0;
     std::string cbsOdomBeliefInTopic = "liorf/cbs/odom_belief_in";
     std::string cbsOdomBeliefOutTopic = "liorf/cbs/odom_belief_out";
     double cbsOdomUnmatchedRetryMaxAgeSec = 5.0;
@@ -261,6 +294,7 @@ public:
     std::atomic<size_t> cbsBeliefsIncomingRejectedUpdateStatusPerRerunFrame{0u};
     std::atomic<size_t> cbsBeliefsIncomingRejectedShapePerRerunFrame{0u};
     std::atomic<size_t> cbsBeliefsIncomingRejectedExceptionPerRerunFrame{0u};
+    std::atomic<size_t> cbsBeliefsIncomingReceiveGateDroppedPerRerunFrame{0u};
     std::atomic<size_t> cbsBeliefsOutgoingPublishedPerRerunFrame{0u};
     std::atomic<double> bpsamOptimizationTimeMsPerRerunFrame{0.0};
     std::atomic<double> cbsBeliefGenerationTimeMsPerRerunFrame{0.0};
@@ -366,6 +400,38 @@ public:
             localPoseTimestampsSec.resize(localIndex + 1, -1.0);
         }
         localPoseTimestampsSec[localIndex] = stampSec;
+    }
+
+    bool getPoseEstimateBeforeK2LInjection(Key key,
+                                           size_t localIndex,
+                                           Pose3* pose,
+                                           std::string* source)
+    {
+        if (!pose) {
+            return false;
+        }
+        if (initialEstimate.exists(key)) {
+            *pose = initialEstimate.at<Pose3>(key);
+            if (source) {
+                *source = "initial_estimate";
+            }
+            return true;
+        }
+        if (isamCurrentEstimate.exists(key)) {
+            *pose = isamCurrentEstimate.at<Pose3>(key);
+            if (source) {
+                *source = "isam_current_estimate";
+            }
+            return true;
+        }
+        if (cloudKeyPoses6D && localIndex < cloudKeyPoses6D->size()) {
+            *pose = pclPointTogtsamPose3(cloudKeyPoses6D->points[localIndex]);
+            if (source) {
+                *source = "cloud_key_pose";
+            }
+            return true;
+        }
+        return false;
     }
 
     size_t activeBeliefWindowStartIndex() const
@@ -774,31 +840,140 @@ public:
         return (muB - muA).norm();
     }
 
+    static double wrapAngleRad(double angle)
+    {
+        return std::remainder(angle, 2.0 * M_PI);
+    }
+
+    static double headingErrorDeg(const gtsam::Point3& from,
+                                  const gtsam::Point3& lhsTo,
+                                  const gtsam::Point3& rhsTo)
+    {
+        const double lhsDx = lhsTo.x() - from.x();
+        const double lhsDy = lhsTo.y() - from.y();
+        const double rhsDx = rhsTo.x() - from.x();
+        const double rhsDy = rhsTo.y() - from.y();
+        const double lhsNorm = std::hypot(lhsDx, lhsDy);
+        const double rhsNorm = std::hypot(rhsDx, rhsDy);
+        if (lhsNorm < 1e-9 || rhsNorm < 1e-9) {
+            return std::numeric_limits<double>::quiet_NaN();
+        }
+        const double lhsHeading = std::atan2(lhsDy, lhsDx);
+        const double rhsHeading = std::atan2(rhsDy, rhsDx);
+        return wrapAngleRad(lhsHeading - rhsHeading) * 180.0 / M_PI;
+    }
+
+    static double pointDistance(const gtsam::Point3& lhs,
+                                const gtsam::Point3& rhs)
+    {
+        const double dx = lhs.x() - rhs.x();
+        const double dy = lhs.y() - rhs.y();
+        const double dz = lhs.z() - rhs.z();
+        return std::sqrt(dx * dx + dy * dy + dz * dz);
+    }
+
+    static double safeMahalanobisResidual(const gtsam::Vector6& residual,
+                                          const gtsam::Matrix6& covariance)
+    {
+        try {
+            const gtsam::Matrix6 symCovariance =
+                0.5 * (covariance + covariance.transpose());
+            Eigen::LDLT<gtsam::Matrix6> ldlt(symCovariance);
+            if (ldlt.info() != Eigen::Success) {
+                return std::numeric_limits<double>::quiet_NaN();
+            }
+            const gtsam::Vector6 whitened = ldlt.solve(residual);
+            const double value =
+                static_cast<double>(residual.transpose() * whitened);
+            return std::isfinite(value) ? value
+                                        : std::numeric_limits<double>::quiet_NaN();
+        } catch (...) {
+            return std::numeric_limits<double>::quiet_NaN();
+        }
+    }
+
+    static void appendPoseCsv(std::ostream& os, const gtsam::Pose3& pose)
+    {
+        os << pose.translation().x() << ","
+           << pose.translation().y() << ","
+           << pose.translation().z() << ","
+           << pose.rotation().roll() << ","
+           << pose.rotation().pitch() << ","
+           << pose.rotation().yaw();
+    }
+
     static gtsam::Matrix6 beliefCovarianceRaw(const gtsam::Matrix6& covariance)
     {
         return covariance;
     }
 
-    static Eigen::Matrix3d sanitizeTranslationCovariance(const Eigen::MatrixXd& poseCovariance)
+    static void drawRawPoseCovariance6x6(aria::viz::VisualizerRerun* visualizer,
+                                         const std::string& basePath,
+                                         const Eigen::MatrixXd& sourceCovariance)
     {
-        Eigen::Matrix3d covariance = Eigen::Matrix3d::Identity() * 1e-3;
+        if (!visualizer) {
+            return;
+        }
+
+        const bool has6x6 = sourceCovariance.rows() >= 6 && sourceCovariance.cols() >= 6;
+        visualizer->drawScalar(basePath + "/valid/has_6x6", has6x6 ? 1.0 : 0.0);
+        if (!has6x6) {
+            return;
+        }
+
+        const gtsam::Matrix6 poseCovariance = sourceCovariance.block<6, 6>(0, 0);
+        const char* labels[6] = {"rot_x", "rot_y", "rot_z", "trans_x", "trans_y", "trans_z"};
+
+        bool allFinite = true;
+        for (size_t row = 0u; row < 6u; ++row) {
+            for (size_t col = 0u; col < 6u; ++col) {
+                const double value = poseCovariance(row, col);
+                allFinite = allFinite && std::isfinite(value);
+                visualizer->drawScalar(
+                    basePath + "/matrix/" + labels[row] + "__" + labels[col],
+                    value);
+            }
+            visualizer->drawScalar(basePath + "/diag/" + labels[row],
+                                   poseCovariance(row, row));
+        }
+
+        const gtsam::Matrix6 symmetricCovariance =
+            0.5 * (poseCovariance + poseCovariance.transpose());
+        visualizer->drawScalar(basePath + "/valid/all_finite", allFinite ? 1.0 : 0.0);
+        visualizer->drawScalar(basePath + "/summary/trace", poseCovariance.trace());
+        visualizer->drawScalar(basePath + "/summary/frobenius_norm", poseCovariance.norm());
+        visualizer->drawScalar(
+            basePath + "/summary/asymmetry_frobenius_norm",
+            (poseCovariance - poseCovariance.transpose()).norm());
+        visualizer->drawScalar(basePath + "/block_norm/rotation_3x3",
+                               poseCovariance.block<3, 3>(0, 0).norm());
+        visualizer->drawScalar(basePath + "/block_norm/translation_3x3",
+                               poseCovariance.block<3, 3>(3, 3).norm());
+        visualizer->drawScalar(basePath + "/block_norm/rotation_translation_3x3",
+                               poseCovariance.block<3, 3>(0, 3).norm());
+
+        Eigen::SelfAdjointEigenSolver<gtsam::Matrix6> eig(symmetricCovariance);
+        if (eig.info() != Eigen::Success) {
+            visualizer->drawScalar(basePath + "/valid/eigen_success", 0.0);
+            return;
+        }
+        visualizer->drawScalar(basePath + "/valid/eigen_success", 1.0);
+        const gtsam::Vector6 eigenvalues = eig.eigenvalues();
+        for (size_t i = 0u; i < 6u; ++i) {
+            visualizer->drawScalar(basePath + "/eigenvalues/lambda_" + std::to_string(i),
+                                   eigenvalues(i));
+        }
+        visualizer->drawScalar(basePath + "/eigenvalues/min", eigenvalues.minCoeff());
+        visualizer->drawScalar(basePath + "/eigenvalues/max", eigenvalues.maxCoeff());
+    }
+
+    static Eigen::Matrix3d translationCovarianceFromPoseCovariance(const Eigen::MatrixXd& poseCovariance)
+    {
+        Eigen::Matrix3d covariance = Eigen::Matrix3d::Zero();
         if (poseCovariance.rows() >= 6 && poseCovariance.cols() >= 6) {
             covariance = poseCovariance.block<3, 3>(3, 3);
         }
-
-        covariance = 0.5 * (covariance + covariance.transpose());
-        if (!covariance.allFinite()) {
-            return Eigen::Matrix3d::Identity() * 1e-3;
-        }
-
-        Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> eig(covariance);
-        if (eig.info() != Eigen::Success) {
-            return Eigen::Matrix3d::Identity() * 1e-3;
-        }
-
-        const Eigen::Vector3d eigenvalues =
-            eig.eigenvalues().array().max(1e-9).matrix();
-        return eig.eigenvectors() * eigenvalues.asDiagonal() * eig.eigenvectors().transpose();
+        return covariance;
     }
 
     struct L2KOutgoingCovAuditResult
@@ -1175,11 +1350,107 @@ public:
         incomingStampedOdomBeliefs.push_back(queuedBelief);
     }
 
+    double incomingOdomBeliefGateStampSec(const liorf::pose_odom_belief& beliefMsg) const
+    {
+        const double toStampSec =
+            beliefMsg.to_stamp_sec > 0.0 ? beliefMsg.to_stamp_sec : beliefMsg.header.stamp.toSec();
+        if (std::isfinite(toStampSec) && toStampSec > 0.0) {
+            return toStampSec;
+        }
+        const double fromStampSec = beliefMsg.from_stamp_sec;
+        if (std::isfinite(fromStampSec) && fromStampSec > 0.0) {
+            return fromStampSec;
+        }
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+
+    void initializeIncomingOdomBeliefReceiveGate(const liorf::pose_odom_belief_array& msg)
+    {
+        if (cbsBeliefReceiveStartDelaySec <= 0.0 || cbsBeliefReceiveGateReferenceSet) {
+            return;
+        }
+
+        double earliestStampSec = std::numeric_limits<double>::infinity();
+        for (const auto& beliefMsg : msg.beliefs) {
+            const cbs::AgentId sourceAgent = static_cast<cbs::AgentId>(beliefMsg.source_agent);
+            if (sourceAgent == selfAgentId) {
+                continue;
+            }
+            const double stampSec = incomingOdomBeliefGateStampSec(beliefMsg);
+            if (std::isfinite(stampSec) && stampSec > 0.0) {
+                earliestStampSec = std::min(earliestStampSec, stampSec);
+            }
+        }
+
+        if (!std::isfinite(earliestStampSec)) {
+            return;
+        }
+
+        cbsBeliefReceiveGateReferenceStampSec = earliestStampSec;
+        cbsBeliefReceiveGateReferenceSet = true;
+        ROS_INFO_STREAM(std::fixed << std::setprecision(9)
+                        << "LiORF CBS incoming belief receive gate reference stamp="
+                        << cbsBeliefReceiveGateReferenceStampSec
+                        << " from first incoming belief, accepting belief odometry with to_stamp >= "
+                        << (cbsBeliefReceiveGateReferenceStampSec +
+                            cbsBeliefReceiveStartDelaySec)
+                        << " (delay=" << cbsBeliefReceiveStartDelaySec << " s)");
+    }
+
+    bool isIncomingOdomBeliefBeforeReceiveGate(const liorf::pose_odom_belief& beliefMsg) const
+    {
+        if (cbsBeliefReceiveStartDelaySec <= 0.0 || !cbsBeliefReceiveGateReferenceSet) {
+            return false;
+        }
+
+        const double stampSec = incomingOdomBeliefGateStampSec(beliefMsg);
+        if (!std::isfinite(stampSec) || stampSec <= 0.0) {
+            return true;
+        }
+        return stampSec <
+               cbsBeliefReceiveGateReferenceStampSec + cbsBeliefReceiveStartDelaySec;
+    }
+
+    void cbsBeliefReceiveClockHandler(const rosgraph_msgs::ClockConstPtr& msg)
+    {
+        if (!msg || cbsBeliefReceiveStartDelaySec <= 0.0 ||
+            cbsBeliefReceiveGateReferenceSet) {
+            return;
+        }
+
+        const double stampSec = msg->clock.toSec();
+        if (!std::isfinite(stampSec) || stampSec <= 0.0) {
+            return;
+        }
+
+        cbsBeliefReceiveGateReferenceStampSec = stampSec;
+        cbsBeliefReceiveGateReferenceSet = true;
+        subCbsBeliefReceiveClock.shutdown();
+        ROS_INFO_STREAM(std::fixed << std::setprecision(9)
+                        << "LiORF CBS incoming belief receive gate reference stamp="
+                        << cbsBeliefReceiveGateReferenceStampSec
+                        << " from /clock, accepting belief odometry with to_stamp >= "
+                        << (cbsBeliefReceiveGateReferenceStampSec +
+                            cbsBeliefReceiveStartDelaySec)
+                        << " (delay=" << cbsBeliefReceiveStartDelaySec << " s)");
+    }
+
     void poseOdomBeliefInHandler(const liorf::pose_odom_belief_arrayConstPtr& msg)
     {
+        if (!msg) {
+            return;
+        }
+
+        initializeIncomingOdomBeliefReceiveGate(*msg);
+        size_t droppedByReceiveGate = 0u;
+
         for (const auto& beliefMsg : msg->beliefs) {
             const cbs::AgentId sourceAgent = static_cast<cbs::AgentId>(beliefMsg.source_agent);
             if (sourceAgent == selfAgentId) {
+                continue;
+            }
+            if (isIncomingOdomBeliefBeforeReceiveGate(beliefMsg)) {
+                ++droppedByReceiveGate;
                 continue;
             }
 
@@ -1206,6 +1477,126 @@ public:
             cbsBeliefsIncomingReceivedTotal.fetch_add(1u, std::memory_order_relaxed);
             cbsBeliefsIncomingReceivedPerRerunFrame.fetch_add(1u, std::memory_order_relaxed);
         }
+
+        if (droppedByReceiveGate > 0u) {
+            cbsBeliefsIncomingReceiveGateDroppedPerRerunFrame.fetch_add(
+                droppedByReceiveGate,
+                std::memory_order_relaxed);
+            ROS_INFO_STREAM_THROTTLE(
+                1.0,
+                "LiORF CBS incoming belief receive gate dropped "
+                    << droppedByReceiveGate
+                    << " belief(s) before delay="
+                    << cbsBeliefReceiveStartDelaySec << " s");
+        }
+    }
+
+    bool makeK2LPreInjectionDiagnostic(const StampedOdomBelief& incoming,
+                                       size_t fromLocalIndex,
+                                       size_t toLocalIndex,
+                                       Key fromPoseKey,
+                                       Key toPoseKey,
+                                       const Pose3& beliefDelta,
+                                       const Matrix6& covariance,
+                                       RerunK2LPreInjectionDiagnostic* diagnostic)
+    {
+        if (!diagnostic) {
+            return false;
+        }
+
+        Pose3 receiverFromPose;
+        Pose3 receiverToPose;
+        std::string fromPoseSource;
+        std::string toPoseSource;
+        if (!getPoseEstimateBeforeK2LInjection(
+                fromPoseKey, fromLocalIndex, &receiverFromPose, &fromPoseSource) ||
+            !getPoseEstimateBeforeK2LInjection(
+                toPoseKey, toLocalIndex, &receiverToPose, &toPoseSource)) {
+            ROS_WARN_STREAM_THROTTLE(
+                1.0,
+                "Skipping K2L pre-injection diagnostic for "
+                    << formatPoseKeyToken(incoming.sourceAgent, incoming.fromPoseIndex)
+                    << "->"
+                    << formatPoseKeyToken(incoming.sourceAgent, incoming.toPoseIndex)
+                    << ": missing receiver pose estimate for "
+                    << formatPoseKeyToken(selfAgentId, fromLocalIndex)
+                    << "->"
+                    << formatPoseKeyToken(selfAgentId, toLocalIndex));
+            return false;
+        }
+
+        const Pose3 receiverDelta = receiverFromPose.between(receiverToPose);
+        const Pose3 beliefPredictedToPose = receiverFromPose.compose(beliefDelta);
+        const Vector6 residual =
+            Pose3::Logmap(beliefDelta.inverse().compose(receiverDelta));
+
+        diagnostic->sourceAgent = incoming.sourceAgent;
+        diagnostic->senderFromPoseIndex = incoming.fromPoseIndex;
+        diagnostic->senderToPoseIndex = incoming.toPoseIndex;
+        diagnostic->receiverFromPoseIndex = fromLocalIndex;
+        diagnostic->receiverToPoseIndex = toLocalIndex;
+        diagnostic->fromStampSec = incoming.fromStampSec;
+        diagnostic->toStampSec = incoming.toStampSec;
+        diagnostic->fromPoseKey = fromPoseKey;
+        diagnostic->toPoseKey = toPoseKey;
+        diagnostic->receiverFromPosePre = receiverFromPose;
+        diagnostic->receiverToPosePre = receiverToPose;
+        diagnostic->beliefPredictedToPose = beliefPredictedToPose;
+        diagnostic->receiverDelta = receiverDelta;
+        diagnostic->beliefDelta = beliefDelta;
+        diagnostic->residualNorm = residual.norm();
+        diagnostic->rotationalResidualNorm = residual.head<3>().norm();
+        diagnostic->translationalResidualNorm = residual.tail<3>().norm();
+        diagnostic->yawErrorDeg =
+            wrapAngleRad(receiverDelta.rotation().yaw() -
+                         beliefDelta.rotation().yaw()) *
+            180.0 / M_PI;
+        diagnostic->translationHeadingErrorDeg =
+            headingErrorDeg(receiverFromPose.translation(),
+                            receiverToPose.translation(),
+                            beliefPredictedToPose.translation());
+        diagnostic->pullDistance =
+            pointDistance(receiverToPose.translation(),
+                          beliefPredictedToPose.translation());
+        diagnostic->mahalanobisDistance =
+            safeMahalanobisResidual(residual, covariance);
+        diagnostic->covarianceTrace = covariance.trace();
+
+        std::ostringstream row;
+        row << std::fixed << std::setprecision(9)
+            << "CBS_K2L_PREINJECTION_DIAGNOSTIC_ROW,"
+            << formatPoseKeyToken(incoming.sourceAgent, incoming.fromPoseIndex)
+            << "->"
+            << formatPoseKeyToken(incoming.sourceAgent, incoming.toPoseIndex)
+            << ","
+            << formatPoseKeyToken(selfAgentId, fromLocalIndex)
+            << "->"
+            << formatPoseKeyToken(selfAgentId, toLocalIndex)
+            << ","
+            << incoming.fromStampSec << ","
+            << incoming.toStampSec << ","
+            << sanitizeCsvToken(fromPoseSource) << ","
+            << sanitizeCsvToken(toPoseSource) << ","
+            << diagnostic->residualNorm << ","
+            << diagnostic->rotationalResidualNorm << ","
+            << diagnostic->translationalResidualNorm << ","
+            << diagnostic->yawErrorDeg << ","
+            << diagnostic->translationHeadingErrorDeg << ","
+            << diagnostic->pullDistance << ","
+            << diagnostic->mahalanobisDistance << ","
+            << diagnostic->covarianceTrace << ",";
+        appendPoseCsv(row, diagnostic->receiverFromPosePre);
+        row << ",";
+        appendPoseCsv(row, diagnostic->receiverToPosePre);
+        row << ",";
+        appendPoseCsv(row, diagnostic->beliefPredictedToPose);
+        row << ",";
+        appendPoseCsv(row, diagnostic->receiverDelta);
+        row << ",";
+        appendPoseCsv(row, diagnostic->beliefDelta);
+        ROS_INFO_STREAM(row.str());
+
+        return true;
     }
 
     void consumeIncomingOdomBeliefsIntoBpsam()
@@ -1232,6 +1623,7 @@ public:
         size_t numRetried = 0u;
         std::vector<StampedOdomBelief> retryBeliefs;
         std::vector<RerunExternalOdomEdge> acceptedRerunExternalOdomEdges;
+        std::vector<RerunK2LPreInjectionDiagnostic> acceptedK2LPreInjectionDiagnostics;
         const auto logMatchDecision =
             [this](const StampedOdomBelief& incoming,
                    const LocalTimestampMatchDiagnostics& fromDiag,
@@ -1289,10 +1681,16 @@ public:
             odomBelief.source_agent = incoming.sourceAgent;
             odomBelief.from_pose_key = ensurePoseKeyForLocalIndex(fromLocalIndex);
             odomBelief.to_pose_key = ensurePoseKeyForLocalIndex(toLocalIndex);
-            odomBelief.measured_from_to =
+            odomBelief.sender_from_pose_key =
+                cbs::toPoseKey(incoming.sourceAgent, incoming.fromPoseIndex);
+            odomBelief.sender_to_pose_key =
+                cbs::toPoseKey(incoming.sourceAgent, incoming.toPoseIndex);
+            const Pose3 incomingBeliefDelta =
                 gtsam::Pose3::Expmap(beliefArrayToVector6(incoming.relativeMu));
-            odomBelief.covariance =
+            const Matrix6 incomingBeliefCovariance =
                 beliefCovarianceRaw(beliefArrayToMatrix6(incoming.covariance));
+            odomBelief.measured_from_to = incomingBeliefDelta;
+            odomBelief.covariance = incomingBeliefCovariance;
             odomBelief.relax_factor = incoming.relaxFactor;
 
             std::vector<cbs::BPSAM::CbsOdometryBelief> singleBelief;
@@ -1313,6 +1711,20 @@ public:
                             detail.source_agent,
                             detail.from_pose_key,
                             detail.to_pose_key});
+                    if (cbsK2LDebugVisualizationEnable) {
+                        RerunK2LPreInjectionDiagnostic diagnostic;
+                        if (makeK2LPreInjectionDiagnostic(incoming,
+                                                          fromLocalIndex,
+                                                          toLocalIndex,
+                                                          detail.from_pose_key,
+                                                          detail.to_pose_key,
+                                                          incomingBeliefDelta,
+                                                          incomingBeliefCovariance,
+                                                          &diagnostic)) {
+                            acceptedK2LPreInjectionDiagnostics.push_back(
+                                std::move(diagnostic));
+                        }
+                    }
                 }
                 logMatchDecision(incoming, fromDiag, toDiag, detail.message);
                 ROS_INFO_STREAM(
@@ -1330,6 +1742,8 @@ public:
         {
             std::lock_guard<std::mutex> lock(mtxRerunCbsVisualization);
             rerunExternalOdomEdges = std::move(acceptedRerunExternalOdomEdges);
+            rerunK2LPreInjectionDiagnostics =
+                std::move(acceptedK2LPreInjectionDiagnostics);
         }
 
         requeueIncomingOdomBeliefsForRetry(retryBeliefs);
@@ -1492,6 +1906,7 @@ public:
     ros::Subscriber subGPS;
     ros::Subscriber subLoop;
     ros::Subscriber subPoseOdomBeliefsIn;
+    ros::Subscriber subCbsBeliefReceiveClock;
 
     ros::ServiceServer srvSaveMap;
 
@@ -1579,6 +1994,12 @@ public:
         double cbsK2LOdomFactorCovarianceScale = 1.0;
         int cbsBeliefWindow = 30;
         int cbsBeliefMaxRootSizeParam = 60;
+        nh.param<double>("liorf/initialYawSigma", initialYawSigma, M_PI);
+        if (!std::isfinite(initialYawSigma) || initialYawSigma <= 0.0) {
+            ROS_WARN_STREAM("Invalid LiORF initial yaw sigma "
+                            << initialYawSigma << "; falling back to pi radians");
+            initialYawSigma = M_PI;
+        }
         nh.param<bool>("liorf/cbsEnableBeliefDcs", cbsEnableBeliefDcs, false);
         nh.param<double>("liorf/cbsBeliefSimilarityThreshold", cbsBeliefSimilarityThreshold, 0.01);
         nh.param<int>("liorf/cbsBeliefExchangeWindowSize", cbsBeliefWindow, 30);
@@ -1602,11 +2023,24 @@ public:
         nh.param<double>("liorf/cbsTemporaryLinearAlreadyAppliedCovRelThreshold",
                          cbsTemporaryLinearAlreadyAppliedCovRelThreshold,
                          1e-3);
+        nh.param<bool>("liorf/cbsK2LDebugVisualizationEnable",
+                       cbsK2LDebugVisualizationEnable,
+                       false);
         nh.param<double>("liorf/cbsDReset", cbsDReset, 0.1);
         nh.param<double>("liorf/cbsK2LOdomFactorCovarianceScale",
                          cbsK2LOdomFactorCovarianceScale,
                          1.0);
         nh.param<bool>("liorf/cbsBeliefBridgeEnable", cbsBeliefBridgeEnable, true);
+        nh.param<double>("liorf/cbsBeliefReceiveStartDelaySec",
+                         cbsBeliefReceiveStartDelaySec,
+                         0.0);
+        if (!std::isfinite(cbsBeliefReceiveStartDelaySec) ||
+            cbsBeliefReceiveStartDelaySec < 0.0) {
+            ROS_WARN_STREAM("Invalid LiORF CBS belief receive start delay "
+                            << cbsBeliefReceiveStartDelaySec
+                            << "; falling back to 0");
+            cbsBeliefReceiveStartDelaySec = 0.0;
+        }
         nh.param<std::string>("liorf/cbsOdomBeliefInTopic",
                               cbsOdomBeliefInTopic,
                               "liorf/cbs/odom_belief_in");
@@ -1762,9 +2196,15 @@ public:
                         << (cbsUseRawPreviousBeliefGate ? "ON" : "OFF"));
         ROS_INFO_STREAM("LiORF BPSAM temporary CBS linear odometry factors: "
                         << (cbsUseTemporaryCbsLinearFactors ? "ON" : "OFF"));
+        ROS_INFO_STREAM("LiORF initial yaw prior sigma: " << initialYawSigma
+                        << " rad, variance=" << initialYawSigma * initialYawSigma);
         ROS_INFO_STREAM("LiORF BPSAM d_reset: " << cbsDReset);
         ROS_INFO_STREAM("LiORF K2L final odometry covariance scale: "
                         << cbsK2LOdomFactorCovarianceScale);
+        ROS_INFO_STREAM("LiORF K2L pre-injection debug visualization: "
+                        << (cbsK2LDebugVisualizationEnable ? "ON" : "OFF"));
+        ROS_INFO_STREAM("LiORF CBS incoming belief receive start delay: "
+                        << cbsBeliefReceiveStartDelaySec << " s");
         ROS_INFO_STREAM("LiORF CBS belief window: " << beliefExchangeWindowSize
                         << " poses, max iSAM2 root size="
                         << cbsBeliefMaxRootSize);
@@ -1798,6 +2238,14 @@ public:
         if (cbsBeliefBridgeEnable) {
             subPoseOdomBeliefsIn = nh.subscribe<liorf::pose_odom_belief_array>(cbsOdomBeliefInTopic, 50, &mapOptimization::poseOdomBeliefInHandler, this, ros::TransportHints().tcpNoDelay());
             pubPoseOdomBeliefsOut = nh.advertise<liorf::pose_odom_belief_array>(cbsOdomBeliefOutTopic, 50);
+            if (cbsBeliefReceiveStartDelaySec > 0.0) {
+                subCbsBeliefReceiveClock = nh.subscribe<rosgraph_msgs::Clock>(
+                    "/clock",
+                    10,
+                    &mapOptimization::cbsBeliefReceiveClockHandler,
+                    this,
+                    ros::TransportHints().tcpNoDelay());
+            }
         }
 
         srvSaveMap  = nh.advertiseService("liorf/save_map", &mapOptimization::saveMapService, this);
@@ -1830,6 +2278,8 @@ public:
         localPoseKeys.clear();
         localPoseKeyToIndex.clear();
         localPoseTimestampsSec.clear();
+        cbsBeliefReceiveGateReferenceSet = false;
+        cbsBeliefReceiveGateReferenceStampSec = 0.0;
         cbsBeliefsIncomingReceivedTotal.store(0u, std::memory_order_relaxed);
         cbsBeliefsIncomingDequeuedTotal.store(0u, std::memory_order_relaxed);
         cbsBeliefsIncomingMatchedByIndexTotal.store(0u, std::memory_order_relaxed);
@@ -1851,6 +2301,7 @@ public:
         cbsBeliefsIncomingRejectedUpdateStatusPerRerunFrame.store(0u, std::memory_order_relaxed);
         cbsBeliefsIncomingRejectedShapePerRerunFrame.store(0u, std::memory_order_relaxed);
         cbsBeliefsIncomingRejectedExceptionPerRerunFrame.store(0u, std::memory_order_relaxed);
+        cbsBeliefsIncomingReceiveGateDroppedPerRerunFrame.store(0u, std::memory_order_relaxed);
         cbsBeliefsOutgoingPublishedPerRerunFrame.store(0u, std::memory_order_relaxed);
         bpsamOptimizationTimeMsPerRerunFrame.store(0.0, std::memory_order_relaxed);
         cbsBeliefGenerationTimeMsPerRerunFrame.store(0.0, std::memory_order_relaxed);
@@ -2030,7 +2481,7 @@ public:
         rerunVisualizer->drawTf(
             "liorf/lidar_link", pclPointTogtsamPose3(thisPose6D), 0.75f);
         const Eigen::Matrix3d currentPoseCovariance =
-            sanitizeTranslationCovariance(poseCovariance);
+            translationCovarianceFromPoseCovariance(poseCovariance);
         rerunVisualizer->drawUncertainty(
             "liorf/current_pose/uncertainty",
             pclPointTogtsamPose3(thisPose6D),
@@ -2040,6 +2491,10 @@ public:
         rerunVisualizer->drawScalar(
             "liorf/current_pose/liorf_uncertainty_frobenius_norm",
             currentPoseCovariance.norm());
+        drawRawPoseCovariance6x6(
+            rerunVisualizer.get(),
+            "liorf/current_pose/raw_pose_covariance_6x6",
+            poseCovariance);
         rerunVisualizer->drawScalar(
             "liorf/timing/optimization_ms",
             bpsamOptimizationTimeMsPerRerunFrame.exchange(0.0, std::memory_order_relaxed));
@@ -2050,6 +2505,9 @@ public:
             rerunVisualizer->drawScalar(
                 "liorf/cbs/beliefs/received_per_update",
                 cbsBeliefsIncomingReceivedPerRerunFrame.exchange(0u, std::memory_order_relaxed));
+            rerunVisualizer->drawScalar(
+                "liorf/cbs/beliefs/dropped_by_receive_gate_per_update",
+                cbsBeliefsIncomingReceiveGateDroppedPerRerunFrame.exchange(0u, std::memory_order_relaxed));
             rerunVisualizer->drawScalar(
                 "liorf/cbs/beliefs/added_to_factor_graph_per_update",
                 cbsBeliefsIncomingAddedToBpsamPerRerunFrame.exchange(0u, std::memory_order_relaxed));
@@ -2160,6 +2618,125 @@ public:
             }
             rerunVisualizer->drawScalar("liorf/cbs/external_odom_factors/visible",
                                         externalOdomLines.size());
+        }
+
+        if (cbsK2LDebugVisualizationEnable) {
+            std::vector<RerunK2LPreInjectionDiagnostic> k2lDiagnostics;
+            {
+                std::lock_guard<std::mutex> lock(mtxRerunCbsVisualization);
+                k2lDiagnostics = rerunK2LPreInjectionDiagnostics;
+            }
+
+            rerunVisualizer->drawScalar(
+                "liorf/cbs/k2l_debug/accepted_preinjection_edges",
+                k2lDiagnostics.size());
+
+            std::vector<std::pair<Point3, Point3>> liorfPreEdges;
+            std::vector<std::pair<Point3, Point3>> beliefImpliedEdges;
+            std::vector<std::pair<Point3, Point3>> pullVectors;
+            std::vector<std::string> labels;
+            liorfPreEdges.reserve(k2lDiagnostics.size());
+            beliefImpliedEdges.reserve(k2lDiagnostics.size());
+            pullVectors.reserve(k2lDiagnostics.size());
+            labels.reserve(k2lDiagnostics.size());
+
+            double maxResidual = 0.0;
+            double maxYawErrorAbsDeg = 0.0;
+            double maxHeadingErrorAbsDeg = 0.0;
+            double maxPullDistance = 0.0;
+            double maxMahalanobisDistance = 0.0;
+            const auto updateMaxFinite = [](double value, double* target) {
+                if (target && std::isfinite(value)) {
+                    *target = std::max(*target, value);
+                }
+            };
+            const auto updateMaxAbsFinite = [](double value, double* target) {
+                if (target && std::isfinite(value)) {
+                    *target = std::max(*target, std::abs(value));
+                }
+            };
+
+            for (const auto& diagnostic : k2lDiagnostics) {
+                const Point3 from = diagnostic.receiverFromPosePre.translation();
+                const Point3 receiverTo =
+                    diagnostic.receiverToPosePre.translation();
+                const Point3 beliefTo =
+                    diagnostic.beliefPredictedToPose.translation();
+                liorfPreEdges.emplace_back(from, receiverTo);
+                beliefImpliedEdges.emplace_back(from, beliefTo);
+                pullVectors.emplace_back(receiverTo, beliefTo);
+
+                std::ostringstream label;
+                label << formatPoseKeyToken(diagnostic.sourceAgent,
+                                             diagnostic.senderFromPoseIndex)
+                      << "->"
+                      << formatPoseKeyToken(diagnostic.sourceAgent,
+                                             diagnostic.senderToPoseIndex)
+                      << " / "
+                      << formatPoseKeyToken(selfAgentId,
+                                             diagnostic.receiverFromPoseIndex)
+                      << "->"
+                      << formatPoseKeyToken(selfAgentId,
+                                             diagnostic.receiverToPoseIndex);
+                labels.push_back(label.str());
+
+                updateMaxFinite(diagnostic.residualNorm, &maxResidual);
+                updateMaxAbsFinite(diagnostic.yawErrorDeg, &maxYawErrorAbsDeg);
+                updateMaxAbsFinite(diagnostic.translationHeadingErrorDeg,
+                                   &maxHeadingErrorAbsDeg);
+                updateMaxFinite(diagnostic.pullDistance, &maxPullDistance);
+                updateMaxFinite(diagnostic.mahalanobisDistance,
+                                &maxMahalanobisDistance);
+            }
+
+            rerunVisualizer->drawScalar(
+                "liorf/cbs/k2l_debug/max_residual_norm", maxResidual);
+            rerunVisualizer->drawScalar(
+                "liorf/cbs/k2l_debug/max_abs_yaw_error_deg",
+                maxYawErrorAbsDeg);
+            rerunVisualizer->drawScalar(
+                "liorf/cbs/k2l_debug/max_abs_translation_heading_error_deg",
+                maxHeadingErrorAbsDeg);
+            rerunVisualizer->drawScalar(
+                "liorf/cbs/k2l_debug/max_pull_distance_m", maxPullDistance);
+            rerunVisualizer->drawScalar(
+                "liorf/cbs/k2l_debug/max_mahalanobis_distance",
+                maxMahalanobisDistance);
+
+            if (!liorfPreEdges.empty()) {
+                rerunVisualizer->drawLines(
+                    "liorf/cbs/k2l_debug/liorf_pre_injection_edges",
+                    liorfPreEdges,
+                    {Eigen::Vector4f(255.f, 160.f, 0.f, 255.f)},
+                    3.0f,
+                    labels);
+                rerunVisualizer->drawLines(
+                    "liorf/cbs/k2l_debug/kimera_belief_implied_edges",
+                    beliefImpliedEdges,
+                    {Eigen::Vector4f(0.f, 255.f, 255.f, 255.f)},
+                    3.0f,
+                    labels);
+                rerunVisualizer->drawLines(
+                    "liorf/cbs/k2l_debug/pull_vectors",
+                    pullVectors,
+                    {Eigen::Vector4f(255.f, 0.f, 255.f, 255.f)},
+                    3.0f,
+                    labels);
+
+                const auto& latest = k2lDiagnostics.back();
+                rerunVisualizer->drawTf(
+                    "liorf/cbs/k2l_debug/latest/liorf_from_pre",
+                    latest.receiverFromPosePre,
+                    0.45f);
+                rerunVisualizer->drawTf(
+                    "liorf/cbs/k2l_debug/latest/liorf_to_pre",
+                    latest.receiverToPosePre,
+                    0.45f);
+                rerunVisualizer->drawTf(
+                    "liorf/cbs/k2l_debug/latest/kimera_belief_predicted_to",
+                    latest.beliefPredictedToPose,
+                    0.45f);
+            }
         }
 
         if (laserCloudSurfFromMapDS && !laserCloudSurfFromMapDS->empty()) {
@@ -3224,11 +3801,12 @@ public:
 
         if (localPoseIndex == 0)
         {
-            noiseModel::Diagonal::shared_ptr priorNoise = noiseModel::Diagonal::Variances((Vector(6) << 1e-2, 1e-2, M_PI*M_PI, 1e-10, 1e-10, 1e-10).finished()); // rad*rad, meter*meter
+            const double initialYawVariance = initialYawSigma * initialYawSigma;
+            noiseModel::Diagonal::shared_ptr priorNoise = noiseModel::Diagonal::Variances((gtsam::Vector(6) << 1e-2, 1e-2, initialYawVariance, 1e-10, 1e-10, 1e-10).finished()); // rad*rad, meter*meter
             gtSAMgraph.add(PriorFactor<Pose3>(currentKey, poseTo, priorNoise));
             initialEstimate.insert(currentKey, poseTo);
         }else{
-            noiseModel::Diagonal::shared_ptr odometryNoise = noiseModel::Diagonal::Variances((Vector(6) << 1e-6, 1e-6, 1e-6, 1e-4, 1e-4, 1e-4).finished());
+            noiseModel::Diagonal::shared_ptr odometryNoise = noiseModel::Diagonal::Variances((gtsam::Vector(6) << 1e-6, 1e-6, 1e-6, 1e-4, 1e-4, 1e-4).finished());
             const Key previousKey = ensurePoseKeyForLocalIndex(localPoseIndex - 1);
             gtsam::Pose3 poseFrom = pclPointTogtsamPose3(cloudKeyPoses6D->points.back());
             gtSAMgraph.add(BetweenFactor<Pose3>(previousKey, currentKey, poseFrom.between(poseTo), odometryNoise));

@@ -1,6 +1,7 @@
 <launch>
   <arg name="project" default="liorf"/>
   <arg name="config_file" default="$(find liorf)/config/s3e_alpha.yaml"/>
+  <arg name="initial_yaw_sigma" default="3.141592653589793"/>
   <arg name="cbs_belief_timestamp_tolerance_sec" default="0.12"/>
   <arg name="cbs_belief_reject_first_message" default="true"/>
   <arg name="cbs_enable_soft_reset" default="true"/>
@@ -12,7 +13,9 @@
   <arg name="cbs_temporary_linear_already_applied_cov_rel_threshold" default="0.001"/>
   <arg name="cbs_d_reset" default="0.1"/>
   <arg name="cbs_k2l_odom_factor_covariance_scale" default="1.0"/>
+  <arg name="cbs_k2l_debug_visualization_enable" default="false"/>
   <arg name="cbs_belief_bridge_enable" default="true"/>
+  <arg name="cbs_belief_receive_start_delay_sec" default="0.0"/>
   <arg name="cbs_odom_belief_in_topic" default="liorf/cbs/odom_belief_in"/>
   <arg name="cbs_odom_belief_out_topic" default="liorf/cbs/odom_belief_out"/>
   <arg name="cbs_belief_exchange_window_size" default="30"/>
@@ -36,6 +39,7 @@
   <arg name="publish_static_tf" default="true"/>
 
   <rosparam file="$(arg config_file)" command="load" />
+  <param name="/liorf/initialYawSigma" value="$(arg initial_yaw_sigma)"/>
   <param name="/liorf/cbsBeliefTimestampToleranceSec"
          value="$(arg cbs_belief_timestamp_tolerance_sec)"/>
   <param name="/liorf/cbsBeliefRejectFirstMessage"
@@ -57,8 +61,12 @@
   <param name="/liorf/cbsDReset" value="$(arg cbs_d_reset)"/>
   <param name="/liorf/cbsK2LOdomFactorCovarianceScale"
          value="$(arg cbs_k2l_odom_factor_covariance_scale)"/>
+  <param name="/liorf/cbsK2LDebugVisualizationEnable"
+         value="$(arg cbs_k2l_debug_visualization_enable)"/>
   <param name="/liorf/cbsBeliefBridgeEnable"
          value="$(arg cbs_belief_bridge_enable)"/>
+  <param name="/liorf/cbsBeliefReceiveStartDelaySec"
+         value="$(arg cbs_belief_receive_start_delay_sec)"/>
   <param name="/liorf/cbsOdomBeliefInTopic"
          value="$(arg cbs_odom_belief_in_topic)"/>
   <param name="/liorf/cbsOdomBeliefOutTopic"

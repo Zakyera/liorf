@@ -36,9 +36,9 @@ void addPoseChain(cbs::BPSAM &sam, cbs::AgentId robot_id, size_t n_poses) {
   Values values;
 
   const auto prior_noise = noiseModel::Diagonal::Variances(
-      (Vector(6) << 1e-6, 1e-6, 1e-6, 1e-4, 1e-4, 1e-4).finished());
+      (gtsam::Vector(6) << 1e-6, 1e-6, 1e-6, 1e-4, 1e-4, 1e-4).finished());
   const auto odom_noise = noiseModel::Diagonal::Variances(
-      (Vector(6) << 1e-6, 1e-6, 1e-6, 1e-4, 1e-4, 1e-4).finished());
+      (gtsam::Vector(6) << 1e-6, 1e-6, 1e-6, 1e-4, 1e-4, 1e-4).finished());
 
   Key key0 = cbs::toPoseKey(robot_id, 0);
   graph.add(PriorFactor<Pose3>(key0, Pose3(), prior_noise));
