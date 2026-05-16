@@ -71,6 +71,27 @@ cbs::AgentId resolveCbsAgentId(const std::string& id, cbs::AgentId fallback)
     return fallback;
 }
 
+std::string normalizeCbsOdomSenderMode(std::string mode)
+{
+    std::transform(mode.begin(), mode.end(), mode.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    std::replace(mode.begin(), mode.end(), '-', '_');
+    if (mode == "adjacent" || mode == "adjacent_only") {
+        return "adjacent_window";
+    }
+    if (mode == "latest" || mode == "latest_only") {
+        return "latest_edge";
+    }
+    return mode;
+}
+
+bool isValidCbsOdomSenderMode(const std::string& mode)
+{
+    return mode == "adjacent_window" ||
+           mode == "latest_edge" ||
+           mode == "new_edge_once";
+}
+
 gtsam::Vector6 vector6FromArray(const std::array<double, 6>& values)
 {
     gtsam::Vector6 vector;
@@ -351,10 +372,14 @@ public:
     double cbsOdomUnmatchedRetryMaxAgeSec = 5.0;
     size_t cbsOdomUnmatchedRetryMaxBeliefs = 500u;
     std::string cbsBackendMode = "map_optimization";
+    std::string cbsOdomSenderMode = "adjacent_window";
     std::string cbsOdomBeliefInTopic = "liorf/cbs/odom_belief_in";
     std::string cbsOdomBeliefOutTopic = "liorf/cbs/odom_belief_out";
     cbs::AgentId selfAgentId = static_cast<cbs::AgentId>('l');
     cbs::AgentId kimeraAgentId = static_cast<cbs::AgentId>('k');
+    bool cbsLastOutgoingOdomPairValid = false;
+    gtsam::Key cbsLastOutgoingOdomFromKey = 0u;
+    gtsam::Key cbsLastOutgoingOdomToKey = 0u;
 
     std::mutex mtxCbsBeliefs;
     std::deque<ImuCbsStampedOdomBelief> incomingCbsOdomBeliefs;
@@ -487,6 +512,9 @@ public:
         nh.param<int>("liorf/cbsBeliefExchangeWindowSize",
                       cbsBeliefExchangeWindowSize,
                       30);
+        nh.param<std::string>("liorf/cbsOdomSenderMode",
+                              cbsOdomSenderMode,
+                              "adjacent_window");
         nh.param<double>("liorf/cbsOdomUnmatchedRetryMaxAgeSec",
                          cbsOdomUnmatchedRetryMaxAgeSec,
                          5.0);
@@ -514,6 +542,13 @@ public:
             cbsBeliefReceiveStartDelaySec = 0.0;
         }
         cbsBeliefExchangeWindowSize = std::max(1, cbsBeliefExchangeWindowSize);
+        cbsOdomSenderMode = normalizeCbsOdomSenderMode(cbsOdomSenderMode);
+        if (!isValidCbsOdomSenderMode(cbsOdomSenderMode)) {
+            ROS_WARN_STREAM("Invalid liorf/cbsOdomSenderMode='"
+                            << cbsOdomSenderMode
+                            << "', falling back to adjacent_window.");
+            cbsOdomSenderMode = "adjacent_window";
+        }
         if (!std::isfinite(cbsOdomUnmatchedRetryMaxAgeSec) ||
             cbsOdomUnmatchedRetryMaxAgeSec < 0.0) {
             cbsOdomUnmatchedRetryMaxAgeSec = 5.0;
@@ -530,6 +565,12 @@ public:
                         << (cbsBeliefBridgeEnable ? "enabled" : "disabled")
                         << " imu_backend="
                         << (cbsImuBackendEnable ? "enabled" : "disabled"));
+        ROS_INFO_STREAM("LiORF IMU CBS outgoing odometry mode: "
+                        << cbsOdomSenderMode
+                        << " window=" << cbsBeliefExchangeWindowSize
+                        << " retry_max_age=" << cbsOdomUnmatchedRetryMaxAgeSec
+                        << " retry_max_beliefs="
+                        << cbsOdomUnmatchedRetryMaxBeliefs);
     }
 
     cbs::BPSAM::Params makeCbsParams() const
@@ -936,11 +977,37 @@ public:
         const size_t firstIndex = lastIndex > static_cast<size_t>(cbsBeliefExchangeWindowSize)
                                       ? lastIndex - static_cast<size_t>(cbsBeliefExchangeWindowSize)
                                       : 0u;
+        std::vector<gtsam::Key> latestCandidateKeys;
         for (size_t i = firstIndex; i <= lastIndex; ++i) {
             if (std::isfinite(cbsPoseTimestampsSec[i]) &&
                 cbsPoseTimestampsSec[i] > 0.0) {
-                requestKeys.insert(X(static_cast<int>(i)));
+                const gtsam::Key poseKey = X(static_cast<int>(i));
+                if (cbsOdomSenderMode == "adjacent_window") {
+                    requestKeys.insert(poseKey);
+                } else if (cbsSmoother->valueExists(poseKey)) {
+                    latestCandidateKeys.push_back(poseKey);
+                }
             }
+        }
+        bool latestPairValid = false;
+        gtsam::Key latestFromKey = 0u;
+        gtsam::Key latestToKey = 0u;
+        if (cbsOdomSenderMode == "latest_edge" ||
+            cbsOdomSenderMode == "new_edge_once") {
+            if (latestCandidateKeys.size() < 2u) {
+                return;
+            }
+            latestFromKey = latestCandidateKeys[latestCandidateKeys.size() - 2u];
+            latestToKey = latestCandidateKeys.back();
+            latestPairValid = true;
+            if (cbsOdomSenderMode == "new_edge_once" &&
+                cbsLastOutgoingOdomPairValid &&
+                latestFromKey == cbsLastOutgoingOdomFromKey &&
+                latestToKey == cbsLastOutgoingOdomToKey) {
+                return;
+            }
+            requestKeys.insert(latestFromKey);
+            requestKeys.insert(latestToKey);
         }
         if (requestKeys.size() < 2u) {
             return;
@@ -994,6 +1061,11 @@ public:
                 beliefMsg.covariance[i] = covariance[i];
             }
             msg.beliefs.push_back(beliefMsg);
+        }
+        if (latestPairValid && !msg.beliefs.empty()) {
+            cbsLastOutgoingOdomPairValid = true;
+            cbsLastOutgoingOdomFromKey = latestFromKey;
+            cbsLastOutgoingOdomToKey = latestToKey;
         }
 
         pubPoseOdomBeliefsOut.publish(msg);

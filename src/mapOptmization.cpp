@@ -130,6 +130,27 @@ void atomicAddRelaxed(std::atomic<double>* target, double value)
     }
 }
 
+std::string normalizeCbsOdomSenderMode(std::string mode)
+{
+    std::transform(mode.begin(), mode.end(), mode.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    std::replace(mode.begin(), mode.end(), '-', '_');
+    if (mode == "adjacent" || mode == "adjacent_only") {
+        return "adjacent_window";
+    }
+    if (mode == "latest" || mode == "latest_only") {
+        return "latest_edge";
+    }
+    return mode;
+}
+
+bool isValidCbsOdomSenderMode(const std::string& mode)
+{
+    return mode == "adjacent_window" ||
+           mode == "latest_edge" ||
+           mode == "new_edge_once";
+}
+
 template <typename PointCloudT>
 std::vector<gtsam::Point3> toRerunPoints(const PointCloudT& cloud, size_t max_points)
 {
@@ -254,6 +275,10 @@ public:
     std::vector<RerunExternalOdomEdge> rerunExternalOdomEdges;
     std::vector<RerunK2LPreInjectionDiagnostic> rerunK2LPreInjectionDiagnostics;
     size_t beliefExchangeWindowSize = 30;
+    std::string cbsOdomSenderMode = "adjacent_window";
+    bool lastOutgoingOdomPairValid = false;
+    Key lastOutgoingOdomFromKey = 0u;
+    Key lastOutgoingOdomToKey = 0u;
     size_t cbsBeliefMaxRootSize = 60;
     double beliefTimestampToleranceSec = 0.05;
     bool cbsBeliefRejectFirstMessage = true;
@@ -453,6 +478,37 @@ public:
             keys.insert(localPoseKeys[i]);
         }
         return keys;
+    }
+
+    bool latestBeliefWindowEdgeKeys(KeySet* keys,
+                                    std::pair<Key, Key>* latestPair) const
+    {
+        if (!keys || !latestPair || !bpsam) {
+            return false;
+        }
+        std::vector<Key> candidates;
+        const size_t startIndex = activeBeliefWindowStartIndex();
+        for (size_t i = startIndex; i < localPoseKeys.size(); ++i) {
+            if (i >= localPoseTimestampsSec.size()) {
+                continue;
+            }
+            const double stampSec = localPoseTimestampsSec[i];
+            if (!std::isfinite(stampSec) || stampSec <= 0.0) {
+                continue;
+            }
+            const Key poseKey = localPoseKeys[i];
+            if (bpsam->valueExists(poseKey)) {
+                candidates.push_back(poseKey);
+            }
+        }
+        if (candidates.size() < 2u) {
+            return false;
+        }
+        latestPair->first = candidates[candidates.size() - 2u];
+        latestPair->second = candidates.back();
+        keys->insert(latestPair->first);
+        keys->insert(latestPair->second);
+        return true;
     }
 
     double latestLocalPoseTimestampSec() const
@@ -1828,7 +1884,24 @@ public:
             return;
         }
 
-        KeySet requestKeys = activeBeliefWindowKeys();
+        KeySet requestKeys;
+        std::pair<Key, Key> latestPair{0u, 0u};
+        bool latestPairValid = false;
+        if (cbsOdomSenderMode == "adjacent_window") {
+            requestKeys = activeBeliefWindowKeys();
+        } else {
+            latestPairValid =
+                latestBeliefWindowEdgeKeys(&requestKeys, &latestPair);
+            if (!latestPairValid) {
+                return;
+            }
+            if (cbsOdomSenderMode == "new_edge_once" &&
+                lastOutgoingOdomPairValid &&
+                latestPair.first == lastOutgoingOdomFromKey &&
+                latestPair.second == lastOutgoingOdomToKey) {
+                return;
+            }
+        }
         if (requestKeys.empty()) {
             return;
         }
@@ -1878,6 +1951,11 @@ public:
                                  &stampedBelief.covariance);
             convertOutgoingLidarOdomBeliefToExchangeFrame(&stampedBelief);
             outgoingStamped.push_back(stampedBelief);
+        }
+        if (latestPairValid && !outgoingStamped.empty()) {
+            lastOutgoingOdomPairValid = true;
+            lastOutgoingOdomFromKey = latestPair.first;
+            lastOutgoingOdomToKey = latestPair.second;
         }
 
         {
@@ -2007,6 +2085,9 @@ public:
         nh.param<bool>("liorf/cbsEnableBeliefDcs", cbsEnableBeliefDcs, false);
         nh.param<double>("liorf/cbsBeliefSimilarityThreshold", cbsBeliefSimilarityThreshold, 0.01);
         nh.param<int>("liorf/cbsBeliefExchangeWindowSize", cbsBeliefWindow, 30);
+        nh.param<std::string>("liorf/cbsOdomSenderMode",
+                              cbsOdomSenderMode,
+                              "adjacent_window");
         nh.param<int>("liorf/cbsBeliefMaxRootSize", cbsBeliefMaxRootSizeParam, 60);
         nh.param<double>("liorf/cbsBeliefTimestampToleranceSec", beliefTimestampToleranceSec, 0.05);
         nh.param<bool>("liorf/cbsBeliefRejectFirstMessage", cbsBeliefRejectFirstMessage, true);
@@ -2106,6 +2187,13 @@ public:
         cbsL2KOutgoingCovAnchorMode = covAnchorMode;
         cbsL2KCovAuditMaxSamples = static_cast<size_t>(std::max(1, cbsL2KCovAuditMaxSamplesInt));
         beliefExchangeWindowSize = std::max(1, cbsBeliefWindow);
+        cbsOdomSenderMode = normalizeCbsOdomSenderMode(cbsOdomSenderMode);
+        if (!isValidCbsOdomSenderMode(cbsOdomSenderMode)) {
+            ROS_WARN_STREAM("Invalid liorf/cbsOdomSenderMode='"
+                            << cbsOdomSenderMode
+                            << "', falling back to adjacent_window.");
+            cbsOdomSenderMode = "adjacent_window";
+        }
         cbsBeliefMaxRootSize =
             static_cast<size_t>(std::max(0, cbsBeliefMaxRootSizeParam));
 
@@ -2220,7 +2308,9 @@ public:
         ROS_INFO_STREAM("LiORF CBS belief window: " << beliefExchangeWindowSize
                         << " poses, max iSAM2 root size="
                         << cbsBeliefMaxRootSize);
-        ROS_INFO_STREAM("LiORF CBS outgoing odometry mode: adjacent-only"
+        ROS_INFO_STREAM("LiORF CBS outgoing odometry mode: "
+                        << cbsOdomSenderMode
+                        << " window=" << beliefExchangeWindowSize
                         << " retry_max_age="
                         << cbsOdomUnmatchedRetryMaxAgeSec
                         << " retry_max_beliefs="
@@ -4156,6 +4246,17 @@ public:
         laserOdometryROS.pose.pose.position.y = transformTobeMapped[4];
         laserOdometryROS.pose.pose.position.z = transformTobeMapped[5];
         laserOdometryROS.pose.pose.orientation = tf::createQuaternionMsgFromRollPitchYaw(transformTobeMapped[0], transformTobeMapped[1], transformTobeMapped[2]);
+        if (poseCovariance.rows() >= 6 && poseCovariance.cols() >= 6)
+        {
+            static const int remapping[6] = {3, 4, 5, 0, 1, 2};
+            for (int i = 0; i < 6; ++i)
+            {
+                for (int j = 0; j < 6; ++j)
+                {
+                    laserOdometryROS.pose.covariance[remapping[i] * 6 + remapping[j]] = poseCovariance(i, j);
+                }
+            }
+        }
         pubLaserOdometryGlobal.publish(laserOdometryROS);
         
         // Publish TF
