@@ -92,6 +92,25 @@ bool isValidCbsOdomSenderMode(const std::string& mode)
            mode == "new_edge_once";
 }
 
+std::string normalizeImuCorrectionFactorMode(std::string mode)
+{
+    std::transform(mode.begin(), mode.end(), mode.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    std::replace(mode.begin(), mode.end(), '-', '_');
+    if (mode == "prior" || mode == "absolute" || mode == "absolute_pose") {
+        return "absolute_prior";
+    }
+    if (mode == "relative" || mode == "between") {
+        return "relative_between";
+    }
+    return mode;
+}
+
+bool isValidImuCorrectionFactorMode(const std::string& mode)
+{
+    return mode == "absolute_prior" || mode == "relative_between";
+}
+
 gtsam::Vector6 vector6FromArray(const std::array<double, 6>& values)
 {
     gtsam::Vector6 vector;
@@ -313,6 +332,7 @@ public:
     ros::Subscriber subPoseOdomBeliefsIn;
     ros::Subscriber subCbsBeliefReceiveClock;
     ros::Publisher pubImuOdometry;
+    ros::Publisher pubCbsImuOdometry;
     ros::Publisher pubPoseOdomBeliefsOut;
 
     bool systemInitialized = false;
@@ -320,6 +340,8 @@ public:
     gtsam::noiseModel::Diagonal::shared_ptr priorPoseNoise;
     gtsam::noiseModel::Diagonal::shared_ptr priorVelNoise;
     gtsam::noiseModel::Diagonal::shared_ptr priorBiasNoise;
+    gtsam::Vector6 correctionNoiseSigmas;
+    gtsam::Vector6 correctionNoise2Sigmas;
     gtsam::noiseModel::Diagonal::shared_ptr correctionNoise;
     gtsam::noiseModel::Diagonal::shared_ptr correctionNoise2;
     gtsam::Vector noiseModelBetweenBias;
@@ -338,6 +360,8 @@ public:
 
     gtsam::NavState prevStateOdom;
     gtsam::imuBias::ConstantBias prevBiasOdom;
+    gtsam::Pose3 previousImuCorrectionPose;
+    bool previousImuCorrectionPoseValid = false;
 
     bool doneFirstOpt = false;
     double lastImuT_imu = -1;
@@ -375,6 +399,10 @@ public:
     std::string cbsOdomSenderMode = "adjacent_window";
     std::string cbsOdomBeliefInTopic = "liorf/cbs/odom_belief_in";
     std::string cbsOdomBeliefOutTopic = "liorf/cbs/odom_belief_out";
+    std::string cbsImuOdometryTopic = "liorf/cbs/imu_preintegration/odometry";
+    bool cbsImuOdometryPublishEnable = true;
+    std::string imuCorrectionFactorMode = "absolute_prior";
+    double imuRelativeCorrectionNoiseScale = 1.0;
     cbs::AgentId selfAgentId = static_cast<cbs::AgentId>('l');
     cbs::AgentId kimeraAgentId = static_cast<cbs::AgentId>('k');
     bool cbsLastOutgoingOdomPairValid = false;
@@ -404,6 +432,10 @@ public:
         subOdometry = nh.subscribe<nav_msgs::Odometry>("liorf/mapping/odometry_incremental", 5,    &IMUPreintegration::odometryHandler, this, ros::TransportHints().tcpNoDelay());
 
         pubImuOdometry = nh.advertise<nav_msgs::Odometry> (odomTopic+"_incremental", 2000);
+        if (cbsImuBackendEnable && cbsImuOdometryPublishEnable) {
+            pubCbsImuOdometry =
+                nh.advertise<nav_msgs::Odometry>(cbsImuOdometryTopic, 50);
+        }
 
         if (cbsImuBackendEnable && cbsBeliefBridgeEnable) {
             subPoseOdomBeliefsIn =
@@ -446,8 +478,12 @@ public:
              imuInitialGyrBiasSigma, imuInitialGyrBiasSigma,
              imuInitialGyrBiasSigma)
                 .finished());
-        correctionNoise = gtsam::noiseModel::Diagonal::Sigmas((gtsam::Vector(6) << 0.05, 0.05, 0.05, 0.1, 0.1, 0.1).finished()); // rad,rad,rad,m, m, m
-        correctionNoise2 = gtsam::noiseModel::Diagonal::Sigmas((gtsam::Vector(6) << 1, 1, 1, 1, 1, 1).finished()); // rad,rad,rad,m, m, m
+        correctionNoiseSigmas =
+            (gtsam::Vector(6) << 0.05, 0.05, 0.05, 0.1, 0.1, 0.1).finished(); // rad,rad,rad,m, m, m
+        correctionNoise2Sigmas =
+            (gtsam::Vector(6) << 1, 1, 1, 1, 1, 1).finished(); // rad,rad,rad,m, m, m
+        correctionNoise = gtsam::noiseModel::Diagonal::Sigmas(correctionNoiseSigmas);
+        correctionNoise2 = gtsam::noiseModel::Diagonal::Sigmas(correctionNoise2Sigmas);
         noiseModelBetweenBias = (gtsam::Vector(6) << imuAccBiasN, imuAccBiasN, imuAccBiasN, imuGyrBiasN, imuGyrBiasN, imuGyrBiasN).finished();
         
         imuIntegratorImu_ = new gtsam::PreintegratedImuMeasurements(p, prior_imu_bias); // setting up the IMU integration for IMU message thread
@@ -528,6 +564,18 @@ public:
         nh.param<std::string>("liorf/cbsOdomBeliefOutTopic",
                               cbsOdomBeliefOutTopic,
                               "liorf/cbs/odom_belief_out");
+        nh.param<std::string>("liorf/cbsImuOdometryTopic",
+                              cbsImuOdometryTopic,
+                              "liorf/cbs/imu_preintegration/odometry");
+        nh.param<bool>("liorf/cbsImuOdometryPublishEnable",
+                       cbsImuOdometryPublishEnable,
+                       true);
+        nh.param<std::string>("liorf/imuCorrectionFactorMode",
+                              imuCorrectionFactorMode,
+                              "absolute_prior");
+        nh.param<double>("liorf/imuRelativeCorrectionNoiseScale",
+                         imuRelativeCorrectionNoiseScale,
+                         1.0);
 
         std::string cbsAgentId = "l";
         nh.param<std::string>("liorf/cbsAgentId", cbsAgentId, "l");
@@ -559,6 +607,18 @@ public:
             cbsK2LOdomFactorCovarianceScale <= 0.0) {
             cbsK2LOdomFactorCovarianceScale = 1.0;
         }
+        imuCorrectionFactorMode =
+            normalizeImuCorrectionFactorMode(imuCorrectionFactorMode);
+        if (!isValidImuCorrectionFactorMode(imuCorrectionFactorMode)) {
+            ROS_WARN_STREAM("Invalid liorf/imuCorrectionFactorMode='"
+                            << imuCorrectionFactorMode
+                            << "', falling back to absolute_prior.");
+            imuCorrectionFactorMode = "absolute_prior";
+        }
+        if (!std::isfinite(imuRelativeCorrectionNoiseScale) ||
+            imuRelativeCorrectionNoiseScale <= 0.0) {
+            imuRelativeCorrectionNoiseScale = 1.0;
+        }
 
         ROS_INFO_STREAM("LiORF IMU CBS backend mode: " << cbsBackendMode
                         << " bridge="
@@ -571,6 +631,14 @@ public:
                         << " retry_max_age=" << cbsOdomUnmatchedRetryMaxAgeSec
                         << " retry_max_beliefs="
                         << cbsOdomUnmatchedRetryMaxBeliefs);
+        ROS_INFO_STREAM("LiORF IMU CBS odometry covariance topic: "
+                        << cbsImuOdometryTopic
+                        << " publish="
+                        << (cbsImuOdometryPublishEnable ? "enabled" : "disabled"));
+        ROS_INFO_STREAM("LiORF IMU map correction factor mode: "
+                        << imuCorrectionFactorMode
+                        << " relative_noise_scale="
+                        << imuRelativeCorrectionNoiseScale);
     }
 
     cbs::BPSAM::Params makeCbsParams() const
@@ -625,6 +693,7 @@ public:
         gtsam::ISAM2Params optParameters;
         optParameters.relinearizeThreshold = 0.1;
         optParameters.relinearizeSkip = 1;
+        resetPreviousImuCorrectionPose();
 
         if (cbsImuBackendEnable) {
             cbsSmoother = std::make_unique<cbs::IncrementalFixedLagBpsamSmoother>(
@@ -682,6 +751,134 @@ public:
             return cbsSmoother->marginalCovariance(key);
         }
         return optimizer.marginalCovariance(key);
+    }
+
+    gtsam::noiseModel::Diagonal::shared_ptr mapCorrectionNoise(
+        bool degenerate,
+        bool scaleForRelativeCorrection) const
+    {
+        if (!scaleForRelativeCorrection ||
+            std::abs(imuRelativeCorrectionNoiseScale - 1.0) <
+                std::numeric_limits<double>::epsilon()) {
+            return degenerate ? correctionNoise2 : correctionNoise;
+        }
+
+        const gtsam::Vector6& baseSigmas =
+            degenerate ? correctionNoise2Sigmas : correctionNoiseSigmas;
+        return gtsam::noiseModel::Diagonal::Sigmas(
+            imuRelativeCorrectionNoiseScale * baseSigmas);
+    }
+
+    void addMapCorrectionFactor(int stateIndex,
+                                const gtsam::Pose3& currentCorrectionPose,
+                                bool degenerate)
+    {
+        if (imuCorrectionFactorMode == "relative_between" && stateIndex > 0 &&
+            previousImuCorrectionPoseValid) {
+            const gtsam::Pose3 relativeCorrection =
+                previousImuCorrectionPose.between(currentCorrectionPose);
+            graphFactors.add(gtsam::BetweenFactor<gtsam::Pose3>(
+                X(stateIndex - 1),
+                X(stateIndex),
+                relativeCorrection,
+                mapCorrectionNoise(degenerate, true)));
+            return;
+        }
+
+        if (imuCorrectionFactorMode == "relative_between") {
+            ROS_WARN_STREAM_THROTTLE(
+                1.0,
+                "LiORF IMU relative correction mode has no previous correction "
+                "pose; adding one absolute correction prior to keep the graph "
+                "anchored after reset.");
+        }
+        graphFactors.add(gtsam::PriorFactor<gtsam::Pose3>(
+            X(stateIndex),
+            currentCorrectionPose,
+            mapCorrectionNoise(degenerate, false)));
+    }
+
+    void resetPreviousImuCorrectionPose()
+    {
+        previousImuCorrectionPoseValid = false;
+    }
+
+    void setPreviousImuCorrectionPose(const gtsam::Pose3& correctionPose)
+    {
+        previousImuCorrectionPose = correctionPose;
+        previousImuCorrectionPoseValid = true;
+    }
+
+    void writePoseCovarianceToOdometry(const gtsam::Matrix& covariance,
+                                       nav_msgs::Odometry* odometry) const
+    {
+        if (!odometry) {
+            return;
+        }
+        std::fill(odometry->pose.covariance.begin(),
+                  odometry->pose.covariance.end(),
+                  0.0);
+        if (covariance.rows() < 6 || covariance.cols() < 6) {
+            return;
+        }
+        static const int remapping[6] = {3, 4, 5, 0, 1, 2};
+        for (int i = 0; i < 6; ++i) {
+            for (int j = 0; j < 6; ++j) {
+                odometry->pose.covariance[remapping[i] * 6 + remapping[j]] =
+                    covariance(i, j);
+            }
+        }
+    }
+
+    void publishCbsImuOdometry(const ros::Time& stamp,
+                               int poseIndex,
+                               const gtsam::Pose3& imuPose,
+                               const gtsam::Vector3& velocity)
+    {
+        if (!cbsImuBackendEnable || !cbsImuOdometryPublishEnable ||
+            !pubCbsImuOdometry || pubCbsImuOdometry.getNumSubscribers() == 0) {
+            return;
+        }
+
+        nav_msgs::Odometry odometry;
+        odometry.header.stamp = stamp;
+        odometry.header.frame_id = odometryFrame;
+        odometry.child_frame_id = "lidar_link";
+
+        const gtsam::Pose3 lidarPose = imuPose.compose(imu2Lidar);
+        odometry.pose.pose.position.x = lidarPose.translation().x();
+        odometry.pose.pose.position.y = lidarPose.translation().y();
+        odometry.pose.pose.position.z = lidarPose.translation().z();
+        odometry.pose.pose.orientation.x = lidarPose.rotation().toQuaternion().x();
+        odometry.pose.pose.orientation.y = lidarPose.rotation().toQuaternion().y();
+        odometry.pose.pose.orientation.z = lidarPose.rotation().toQuaternion().z();
+        odometry.pose.pose.orientation.w = lidarPose.rotation().toQuaternion().w();
+
+        odometry.twist.twist.linear.x = velocity.x();
+        odometry.twist.twist.linear.y = velocity.y();
+        odometry.twist.twist.linear.z = velocity.z();
+
+        try {
+            const gtsam::Matrix poseCovarianceImu =
+                marginalCovarianceForKey(X(poseIndex));
+            if (poseCovarianceImu.rows() >= 6 && poseCovarianceImu.cols() >= 6) {
+                const gtsam::Matrix6 poseCovarianceImu6 =
+                    poseCovarianceImu.block<6, 6>(0, 0);
+                const gtsam::Matrix6 imuLocalToLidarLocal =
+                    imu2Lidar.inverse().AdjointMap();
+                const gtsam::Matrix6 poseCovarianceLidar =
+                    imuLocalToLidarLocal * poseCovarianceImu6 *
+                    imuLocalToLidarLocal.transpose();
+                writePoseCovarianceToOdometry(poseCovarianceLidar, &odometry);
+            }
+        } catch (const std::exception& e) {
+            ROS_WARN_STREAM_THROTTLE(
+                1.0,
+                "LiORF IMU CBS failed to publish marginal covariance for X"
+                    << poseIndex << ": " << e.what());
+        }
+
+        pubCbsImuOdometry.publish(odometry);
     }
 
     double cbsGateStamp(const ImuCbsStampedOdomBelief& belief) const
@@ -1084,6 +1281,7 @@ public:
         lastImuT_imu = -1;
         doneFirstOpt = false;
         systemInitialized = false;
+        resetPreviousImuCorrectionPose();
     }
 
     void odometryHandler(const nav_msgs::Odometry::ConstPtr& odomMsg)
@@ -1145,6 +1343,8 @@ public:
             updateBackend(cbsImuBackendEnable
                               ? makeCbsStateTimestamps(0)
                               : gtsam::FixedLagSmoother::KeyTimestampMap());
+            setPreviousImuCorrectionPose(prevPose_);
+            publishCbsImuOdometry(odomMsg->header.stamp, 0, prevPose_, prevVel_);
             graphFactors.resize(0);
             graphValues.clear();
 
@@ -1216,8 +1416,7 @@ public:
                          gtsam::noiseModel::Diagonal::Sigmas(sqrt(imuIntegratorOpt_->deltaTij()) * noiseModelBetweenBias)));
         // add pose factor
         gtsam::Pose3 curPose = lidarPose.compose(lidar2Imu);
-        gtsam::PriorFactor<gtsam::Pose3> pose_factor(X(key), curPose, degenerate ? correctionNoise2 : correctionNoise);
-        graphFactors.add(pose_factor);
+        addMapCorrectionFactor(key, curPose, degenerate);
         // insert predicted values
         gtsam::NavState propState_ = imuIntegratorOpt_->predict(prevState_, prevBias_);
         graphValues.insert(X(key), propState_.pose());
@@ -1240,6 +1439,8 @@ public:
         prevVel_   = result.at<gtsam::Vector3>(V(key));
         prevState_ = gtsam::NavState(prevPose_, prevVel_);
         prevBias_  = result.at<gtsam::imuBias::ConstantBias>(B(key));
+        setPreviousImuCorrectionPose(curPose);
+        publishCbsImuOdometry(odomMsg->header.stamp, key, prevPose_, prevVel_);
         // Reset the optimization preintegration object.
         imuIntegratorOpt_->resetIntegrationAndSetBias(prevBias_);
         refreshOutgoingCbsBeliefs(odomMsg->header.stamp);

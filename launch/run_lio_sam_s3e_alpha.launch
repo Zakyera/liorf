@@ -19,6 +19,11 @@
   <arg name="cbs_belief_receive_start_delay_sec" default="0.0"/>
   <arg name="cbs_odom_belief_in_topic" default="liorf/cbs/odom_belief_in"/>
   <arg name="cbs_odom_belief_out_topic" default="liorf/cbs/odom_belief_out"/>
+  <arg name="cbs_imu_odometry_topic"
+       default="/liorf/cbs/imu_preintegration/odometry"/>
+  <arg name="cbs_imu_odometry_publish_enable" default="true"/>
+  <arg name="imu_correction_factor_mode" default="absolute_prior"/>
+  <arg name="imu_relative_correction_noise_scale" default="1.0"/>
   <arg name="cbs_belief_exchange_window_size" default="30"/>
   <arg name="cbs_odom_sender_mode" default="adjacent_window"/>
   <arg name="cbs_odom_unmatched_retry_max_age_sec" default="5.0"/>
@@ -74,6 +79,14 @@
          value="$(arg cbs_odom_belief_in_topic)"/>
   <param name="/liorf/cbsOdomBeliefOutTopic"
          value="$(arg cbs_odom_belief_out_topic)"/>
+  <param name="/liorf/cbsImuOdometryTopic"
+         value="$(arg cbs_imu_odometry_topic)"/>
+  <param name="/liorf/cbsImuOdometryPublishEnable"
+         value="$(arg cbs_imu_odometry_publish_enable)"/>
+  <param name="/liorf/imuCorrectionFactorMode"
+         value="$(arg imu_correction_factor_mode)"/>
+  <param name="/liorf/imuRelativeCorrectionNoiseScale"
+         value="$(arg imu_relative_correction_noise_scale)"/>
   <param name="/liorf/cbsBeliefExchangeWindowSize"
          value="$(arg cbs_belief_exchange_window_size)"/>
   <param name="/liorf/cbsOdomSenderMode"
