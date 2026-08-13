@@ -1,0 +1,15 @@
+# Per-VGICP-resolution support and matching-quality summaries.
+int32 factor_index
+float64 resolution
+uint32 sample_count
+uint32 valid_sample_count
+liorf/DcregNumericSummary source_point_count
+liorf/DcregNumericSummary inlier_count
+liorf/DcregNumericSummary inlier_fraction
+liorf/DcregNumericSummary initial_cost
+liorf/DcregNumericSummary final_cost
+liorf/DcregNumericSummary cost_reduction
+liorf/DcregNumericSummary hessian_trace
+liorf/DcregNumericSummary hessian_scale
+liorf/DcregNumericSummary hessian_rank
+liorf/DcregNumericSummary hessian_condition

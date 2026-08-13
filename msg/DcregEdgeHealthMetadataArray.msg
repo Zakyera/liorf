@@ -1,0 +1,16 @@
+# Separate optional Stage 2A topic. It never modifies the belief message.
+std_msgs/Header header
+uint32 schema_version
+uint32 semantics_version
+string sender_session_uuid
+uint8 source_agent
+uint64 belief_publication_sequence
+time belief_array_header_stamp
+string belief_array_frame_id
+uint32 source_health_schema_version
+uint8[16] configuration_fingerprint
+uint64 cumulative_dropped_metadata_array_count
+uint64 cumulative_dropped_health_record_count
+uint64 cumulative_orphan_health_record_count
+uint64 cumulative_cache_anomaly_count
+liorf/DcregEdgeHealthMetadata[] entries

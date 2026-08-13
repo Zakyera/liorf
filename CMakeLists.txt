@@ -47,6 +47,10 @@ add_message_files(
   DIRECTORY msg
   FILES
   cloud_info.msg
+  DcregNumericSummary.msg
+  DcregResolutionSupportSummary.msg
+  DcregEdgeHealthMetadata.msg
+  DcregEdgeHealthMetadataArray.msg
   pose_odom_belief.msg
   pose_odom_belief_array.msg
 )

@@ -1,0 +1,134 @@
+# Passive conservative summary for one already-published G->K belief instance.
+# Fractions are descriptive occupancy, never probabilities or covariance.
+
+# Association/invalid reason bits.
+uint32 REASON_NO_EXPECTED_SAMPLES=1
+uint32 REASON_NO_OBSERVED_SAMPLES=2
+uint32 REASON_ONLY_INVALID_SAMPLES=4
+uint32 REASON_TIMESTAMP_MISMATCH=8
+uint32 REASON_NON_MONOTONIC_TIMESTAMPS=16
+uint32 REASON_CONFLICTING_DUPLICATE=32
+uint32 REASON_SAMPLE_LIMIT_EXCEEDED=64
+uint32 REASON_MISSING_REFERENCE=128
+uint32 REASON_INCONSISTENT_REFERENCE_LINEAGE=256
+uint32 REASON_HEALTH_QUEUE_OVERFLOW=512
+uint32 REASON_CACHE_ANOMALY=1024
+uint32 REASON_UNRESOLVED_AT_SHUTDOWN=2048
+uint32 REASON_DIGEST_MISMATCH=4096
+
+# Reference source codes.
+uint8 REFERENCE_NONE=0
+uint8 REFERENCE_SESSION=1
+uint8 REFERENCE_OFFLINE=2
+uint8 REFERENCE_HYBRID_OFFLINE=3
+uint8 REFERENCE_HYBRID_SESSION_ADAPTED=4
+uint8 REFERENCE_MIXED_COMPATIBLE=5
+
+# Belief-instance identity.
+uint32 belief_ordinal
+uint32 from_pose_index
+uint32 to_pose_index
+float64 from_stamp_sec
+float64 to_stamp_sec
+uint8[16] stable_edge_digest
+uint8[16] belief_payload_digest
+
+# Exact association accounting.
+bool association_valid
+bool association_complete
+bool contiguous_pose_keys
+uint32 pose_index_span
+uint32 expected_sample_count
+uint32 observed_sample_count
+uint32 valid_hessian_sample_count
+uint32 health_available_sample_count
+uint32 unavailable_sample_count
+uint32 duplicate_sample_count
+uint32 conflicting_duplicate_count
+uint32 late_sample_count
+uint32 overflowed_sample_count
+uint32 reason_mask
+
+# Reference state and lineage.
+bool reference_ready
+bool reference_consistent
+uint8 reference_source
+uint8[16] reference_lineage_digest
+uint32 reference_none_count
+uint32 reference_session_count
+uint32 reference_offline_count
+uint32 reference_hybrid_count
+
+# Relative health. Group validity is explicit; unavailable values are NaN.
+bool relative_health_valid
+float64 rotational_health_minimum
+float64 rotational_health_median
+float64 rotational_health_lower_quantile
+bool rotational_lower_quantile_valid
+float64 translational_health_minimum
+float64 translational_health_median
+float64 translational_health_lower_quantile
+bool translational_lower_quantile_valid
+uint32 rotational_degraded_count
+uint32 rotational_degraded_denominator
+float64 rotational_degraded_fraction
+uint32 translational_degraded_count
+uint32 translational_degraded_denominator
+float64 translational_degraded_fraction
+uint32 longest_rotational_degraded_run
+uint32 longest_translational_degraded_run
+float64 worst_rotational_sample_stamp_sec
+float64 worst_translational_sample_stamp_sec
+
+# Absolute DCReg occupancy.
+bool absolute_degeneracy_valid
+uint32 rotational_absolute_degenerate_count
+uint32 rotational_absolute_degenerate_denominator
+float64 rotational_absolute_degenerate_fraction
+uint32 translational_absolute_degenerate_count
+uint32 translational_absolute_degenerate_denominator
+float64 translational_absolute_degenerate_fraction
+float64 worst_rotational_condition_ratio
+float64 worst_translational_condition_ratio
+
+# Interpretation ambiguity. No directions or axis labels are included.
+bool ambiguity_valid
+uint32 clustered_rotation_count
+uint32 clustered_rotation_denominator
+float64 clustered_rotation_fraction
+uint32 clustered_translation_count
+uint32 clustered_translation_denominator
+float64 clustered_translation_fraction
+uint32 low_rotation_alignment_count
+uint32 low_rotation_alignment_denominator
+float64 low_rotation_alignment_fraction
+uint32 low_translation_alignment_count
+uint32 low_translation_alignment_denominator
+float64 low_translation_alignment_fraction
+bool directions_included
+
+# Matching state and aggregate Hessian summaries remain separate from health.
+uint32 registration_converged_count
+uint32 registration_converged_denominator
+float64 registration_converged_fraction
+uint32 linear_solve_success_count
+uint32 linear_solve_success_denominator
+float64 linear_solve_success_fraction
+liorf/DcregNumericSummary aggregate_source_point_count
+liorf/DcregNumericSummary aggregate_inlier_count
+liorf/DcregNumericSummary aggregate_inlier_fraction
+liorf/DcregNumericSummary aggregate_initial_cost
+liorf/DcregNumericSummary aggregate_final_cost
+liorf/DcregNumericSummary aggregate_cost_reduction
+liorf/DcregNumericSummary aggregate_hessian_trace
+liorf/DcregNumericSummary aggregate_hessian_scale
+liorf/DcregNumericSummary aggregate_hessian_rank
+liorf/DcregNumericSummary aggregate_hessian_condition
+liorf/DcregResolutionSupportSummary[] resolution_summaries
+
+# Operational identity and counters.
+time metadata_creation_stamp
+uint64 metadata_sequence
+uint64 cumulative_dropped_metadata_array_count
+uint64 cumulative_dropped_health_record_count
+uint32 source_health_schema_version
