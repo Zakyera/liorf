@@ -51,6 +51,8 @@ add_message_files(
   DcregResolutionSupportSummary.msg
   DcregEdgeHealthMetadata.msg
   DcregEdgeHealthMetadataArray.msg
+  DcregBeliefShadowAnalysis.msg
+  DcregBeliefShadowAnalysisArray.msg
   pose_odom_belief.msg
   pose_odom_belief_array.msg
 )

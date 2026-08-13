@@ -1,0 +1,14 @@
+# Versioned passive Stage 2B output. Unknown versions are safely ignorable.
+std_msgs/Header header
+uint32 schema_version
+uint32 semantics_version
+string receiver_session_uuid
+string sender_session_uuid
+uint64 belief_publication_sequence
+uint32 source_metadata_schema_version
+uint32 source_metadata_semantics_version
+uint64 cumulative_dropped_shadow_array_count
+uint64 cumulative_orphan_belief_count
+uint64 cumulative_orphan_metadata_count
+uint64 cumulative_orphan_receiver_observation_count
+liorf/DcregBeliefShadowAnalysis[] entries

@@ -1,0 +1,108 @@
+# Passive receiver-side analysis for one exact G->K belief instance.
+# This message is descriptive only and must never control an estimator.
+
+# Invalid/association reason bits.
+uint32 REASON_NONE=0
+uint32 REASON_BELIEF_MISSING=1
+uint32 REASON_METADATA_MISSING=2
+uint32 REASON_METADATA_SCHEMA_UNSUPPORTED=4
+uint32 REASON_PAYLOAD_DIGEST_MISMATCH=8
+uint32 REASON_METADATA_IDENTITY_CONFLICT=16
+uint32 REASON_RECEIVER_MATCH_MISSING=32
+uint32 REASON_RECEIVER_MATCH_REJECTED=64
+uint32 REASON_RECEIVER_POSE_UNAVAILABLE=128
+uint32 REASON_FRAME_CONVERSION_UNAVAILABLE=256
+uint32 REASON_INVALID_POSE=512
+uint32 REASON_INVALID_COVARIANCE=1024
+uint32 REASON_NORMALIZED_DIAGNOSTIC_UNAVAILABLE=2048
+uint32 REASON_EXPIRED=4096
+uint32 REASON_CONFLICTING_DUPLICATE=8192
+uint32 REASON_WORKER_FAILURE=16384
+uint32 REASON_RECEIVE_GATE_REJECTED=32768
+
+# Descriptive sender LiDAR-health labels. These are never trust commands.
+uint8 HEALTH_INVALID=0
+uint8 HEALTH_HEALTHY=1
+uint8 HEALTH_DEGRADED=2
+uint8 HEALTH_ABSOLUTELY_DEGENERATE=3
+uint8 HEALTH_REFERENCE_UNAVAILABLE=4
+uint8 HEALTH_METADATA_UNAVAILABLE=5
+
+# Exact active-receiver matching outcome.
+uint8 RECEIVER_MATCH_UNAVAILABLE=0
+uint8 RECEIVER_MATCH_ACCEPTED=1
+uint8 RECEIVER_MATCH_ALREADY_APPLIED=2
+uint8 RECEIVER_MATCH_REJECTED=3
+uint8 RECEIVER_MATCH_RETRY_PENDING=4
+uint8 RECEIVER_MATCH_SUPERSEDED=5
+
+# Timestamp match kind for each endpoint.
+uint8 TIMESTAMP_MATCH_UNAVAILABLE=0
+uint8 TIMESTAMP_MATCH_EXACT=1
+uint8 TIMESTAMP_MATCH_NEAREST=2
+
+# Exact Stage 2A belief-instance identity.
+string sender_session_uuid
+uint64 belief_publication_sequence
+uint32 belief_ordinal
+uint8[16] stable_edge_digest
+uint8[16] belief_payload_digest
+string receiver_session_uuid
+uint64 receiver_belief_receipt_sequence
+
+# Association and active-receiver status.
+bool belief_metadata_match_valid
+bool receiver_state_match_valid
+bool active_factor_accepted
+uint8 receiver_match_status
+uint32 invalid_reason_mask
+uint32 sender_from_pose_index
+uint32 sender_to_pose_index
+float64 sender_from_stamp_sec
+float64 sender_to_stamp_sec
+uint64 receiver_from_pose_index
+uint64 receiver_to_pose_index
+float64 receiver_from_stamp_sec
+float64 receiver_to_stamp_sec
+float64 start_timestamp_error_sec
+float64 end_timestamp_error_sec
+float64 sender_interval_duration_sec
+float64 receiver_interval_duration_sec
+float64 interval_duration_error_sec
+uint8 start_timestamp_match_type
+uint8 end_timestamp_match_type
+uint32 start_ambiguous_match_count
+uint32 end_ambiguous_match_count
+
+# Motions and disagreement use GTSAM Pose3 Logmap ordering [rotation,translation].
+bool raw_disagreement_available
+float64[6] sender_relative_mu_base
+float64[6] receiver_relative_mu
+float64[6] disagreement_residual
+float64 rotational_disagreement_norm_rad
+float64 translational_disagreement_norm_m
+
+# Covariance diagnostics are optional and descriptive. No decision is emitted.
+bool sender_covariance_available
+float64[36] sender_covariance_base
+bool receiver_relative_covariance_available
+float64[36] receiver_relative_covariance
+bool normalized_disagreement_available
+float64 normalized_disagreement
+uint32 diagnostic_covariance_rank
+float64 diagnostic_covariance_condition
+float64 diagnostic_regularization
+
+# Frozen Stage 2A fields are retained without reinterpretation.
+uint8 sender_lidar_health_state
+bool stage2a_metadata_available
+liorf/DcregEdgeHealthMetadata stage2a_metadata
+
+# Operational diagnostics.
+time creation_stamp
+uint64 shadow_sequence
+uint64 cumulative_dropped_shadow_array_count
+uint64 cumulative_orphan_belief_count
+uint64 cumulative_orphan_metadata_count
+uint64 cumulative_orphan_receiver_observation_count
+float64 processing_latency_ms
